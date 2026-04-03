@@ -1,0 +1,14 @@
+.env
+.claude/
+.venv/
+fraud_plan.md
+context.md
+fraud_notebook_plan.md
+fraud_notebook_plan.md
+__pycache__/
+.ipynb_checkpoints/
+notebook/.ipynb_checkpoints/
+data_cache/
+notebook/data_cache/
+*.parquet
+*.pyc
