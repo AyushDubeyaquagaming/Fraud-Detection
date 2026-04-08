@@ -1,5 +1,7 @@
 # Byte-compiled / optimized / DLL files
 ROULET CHEATING DATA.csv
+feature_modeling_plan.md
+eda_findings.md
 __pycache__/
 *.py[codz]
 *$py.class
