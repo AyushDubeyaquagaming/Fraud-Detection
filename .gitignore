@@ -5,6 +5,13 @@ eda_findings.md
 __pycache__/
 *.py[codz]
 *$py.class
+fraud-data-no-cheat.csv
+fraud_no_cheat_modeling_plan.md
+profile_no_cheat_dataset.py
+fraud_no_cheat_eda_and_baseline.ipynb
+analysis_readme.md
+hybrid_detection_plan.md
+hybrid_detection_plan_v2.md
 
 # C extensions
 *.so
