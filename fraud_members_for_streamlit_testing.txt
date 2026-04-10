@@ -1,0 +1,29 @@
+Fraud-labeled members for Streamlit testing
+Updated: 2026-04-10
+
+Source:
+- data_cache/hybrid_scored_players.parquet
+- Filter: event_fraud_flag == 1
+
+How to use:
+- Open the Streamlit demo.
+- Paste any one of the member IDs below into the search box.
+- You can also test them with hybrid_inference.py from the terminal.
+
+Fraud member IDs:
+GK00104578
+GK00114361
+GK00114634
+GK00114789
+GK00120916
+GK00123072
+GK00225074
+GK00229746
+GK00279118
+GK00281187
+GK00310549
+GK00521891
+GK00521903
+GK00551451
+
+Count: 14

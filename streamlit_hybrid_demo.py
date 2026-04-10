@@ -381,18 +381,26 @@ def main() -> None:
             st.warning(note)
 
     if validation_mode:
-        st.info(
-            f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
-            f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
-        )
+        if selected_source == "mongo_live":
+            st.info(
+                f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
+                "Evaluation-only scores are not available for one-off live scoring."
+            )
+        else:
+            st.info(
+                f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
+                f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
+            )
 
     tab1, tab2, tab3, tab4 = st.tabs(["Player Summary", "Feature Profile", "Behaviour Map", "Alert Queue"])
 
     with tab1:
         st.subheader(f"Member {selected_member}")
         summary_cols = DISPLAY_COLUMNS.copy()
-        if validation_mode:
+        if validation_mode and selected_source != "mongo_live":
             summary_cols += ["event_fraud_flag", "risk_score_eval", "supervised_score_eval"]
+        elif validation_mode:
+            summary_cols += ["event_fraud_flag"]
         if selected_source == "mongo_live":
             summary_cols += ["raw_history_rows", "history_rows_used", "matched_fraud_rows", "score_reliability", "source"]
         summary_df = pd.DataFrame(

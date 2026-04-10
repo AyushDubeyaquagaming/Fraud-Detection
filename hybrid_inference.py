@@ -157,6 +157,9 @@ class ScoreResult:
     notes: list[str]
 
 
+LIVE_OUTPUT_EXCLUDE_FIELDS = {"supervised_score_eval", "risk_score_eval"}
+
+
 def validate_member_id(member_id: str) -> str:
     normalized = str(member_id).strip().upper()
     if not VALID_MEMBER_ID.match(normalized):
@@ -308,12 +311,18 @@ def apply_pre_fraud_cutoff(member_df: pd.DataFrame, fraud_csv: pd.DataFrame) -> 
             matched_fraud_rows=("draw_id", "size"),
         )
     )
-    df = df.merge(first_fraud[["member_id", "first_fraud_ts", "first_fraud_draw_id"]], on="member_id", how="left")
-    pre_fraud_mask = (
+    df = df.merge(
+        first_fraud[["member_id", "first_fraud_ts", "first_fraud_draw_id"]].assign(is_fraud_player=1),
+        on="member_id",
+        how="left",
+    )
+    df["is_fraud_player"] = df["is_fraud_player"].fillna(0).astype(int)
+    pre_fraud_mask = df["is_fraud_player"].eq(1) & (
         (df["ts"].notna() & df["first_fraud_ts"].notna() & (df["ts"] < df["first_fraud_ts"]))
         | (df["first_fraud_ts"].isna() & df["first_fraud_draw_id"].notna() & (df["draw_id"] < df["first_fraud_draw_id"]))
     )
-    history_df = df.loc[pre_fraud_mask].copy()
+    non_fraud_mask = df["is_fraud_player"].eq(0)
+    history_df = df.loc[pre_fraud_mask | non_fraud_mask].copy()
     return history_df, int(df["event_label"].sum())
 
 
@@ -496,6 +505,9 @@ def build_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
     style_pca = PCA(n_components=2, random_state=RANDOM_SEED)
     style_pca.fit(style_scaled)
 
+    full_pca = PCA(n_components=2, random_state=RANDOM_SEED)
+    full_pca.fit(X_scaled)
+
     artifacts = {
         "feature_columns": FEATURE_COLUMNS,
         "style_columns": STYLE_COLUMNS,
@@ -516,6 +528,7 @@ def build_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
         "lr_operational": lr_operational,
         "risk_p80": float(reference["risk_score"].quantile(0.80)),
         "risk_p95": float(reference["risk_score"].quantile(0.95)),
+        "full_pca": full_pca,
         "style_scaler": style_scaler,
         "style_pca": style_pca,
         "reference_size": int(len(reference)),
@@ -559,15 +572,14 @@ def normalize_component(value: float, min_value: float, max_value: float) -> flo
 
 
 def append_reference_rank_fields(reference: pd.DataFrame, row: dict[str, Any]) -> dict[str, Any]:
-    augmented = pd.concat([reference, pd.DataFrame([row])], ignore_index=True, sort=False)
-    risk_scores = augmented["risk_score"].astype(float)
-    anomaly_scores = augmented["anomaly_score"].astype(float)
-    supervised_scores = augmented["supervised_score"].astype(float)
-    member_mask = augmented["member_id"].astype(str).eq(str(row["member_id"]))
-    row["risk_rank"] = int(risk_scores.rank(ascending=False, method="min")[member_mask].iloc[0])
-    row["risk_percentile"] = float(risk_scores.rank(pct=True)[member_mask].iloc[0])
-    row["anomaly_percentile"] = float(anomaly_scores.rank(pct=True)[member_mask].iloc[0])
-    row["supervised_percentile"] = float(supervised_scores.rank(pct=True)[member_mask].iloc[0])
+    risk_scores = reference["risk_score"].astype(float)
+    anomaly_scores = reference["anomaly_score"].astype(float)
+    supervised_scores = reference["supervised_score"].astype(float)
+
+    row["risk_rank"] = int((risk_scores > float(row["risk_score"])).sum() + 1)
+    row["risk_percentile"] = float((risk_scores <= float(row["risk_score"])).mean())
+    row["anomaly_percentile"] = float((anomaly_scores <= float(row["anomaly_score"])).mean())
+    row["supervised_percentile"] = float((supervised_scores <= float(row["supervised_score"])).mean())
     return row
 
 
@@ -609,12 +621,14 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
     else:
         risk_tier = "HIGH"
 
+    full_coords = artifacts["full_pca"].transform(X_unsup)[0] if "full_pca" in artifacts else [np.nan, np.nan]
     style_coords = artifacts["style_pca"].transform(artifacts["style_scaler"].transform(style_frame))[0]
     draws_played = int(player_features.loc[0, "draws_played"])
     reliability, notes = reliability_label(draws_played=draws_played, raw_rows=len(raw_history))
     notes.append("Risk tier is relative to the current analysis cohort and is not an absolute fraud probability.")
     if matched_fraud_rows:
         notes.append("Pre-fraud cutoff was applied because this member matches existing fraud labels.")
+    notes.append("Evaluation-only fields are not available for one-off live scoring.")
 
     row = player_features.iloc[0].to_dict()
     row.update(
@@ -630,12 +644,12 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
             "cluster_distance_norm": cluster_norm,
             "anomaly_score": anomaly_score,
             "supervised_score": supervised_score,
-            "supervised_score_eval": np.nan,
+            "supervised_score_eval": None,
             "risk_score": risk_score,
-            "risk_score_eval": np.nan,
+            "risk_score_eval": None,
             "risk_tier": risk_tier,
-            "pc1": np.nan,
-            "pc2": np.nan,
+            "pc1": float(full_coords[0]),
+            "pc2": float(full_coords[1]),
             "style_pc1": float(style_coords[0]),
             "style_pc2": float(style_coords[1]),
             "raw_history_rows": int(len(raw_history)),
@@ -663,7 +677,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Score a roulette member ID with the hybrid inference pipeline.")
     parser.add_argument("member_id", help="Member ID to score from live MongoDB history")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild saved inference artifacts before scoring")
+    parser.add_argument("--full-json", action="store_true", help="Include evaluation-only fields in the printed JSON output")
     args = parser.parse_args()
 
     result = score_member_id(args.member_id, force_rebuild_artifacts=args.rebuild)
-    print(json.dumps(result.scored_row, indent=2, default=str))
+    output_row = result.scored_row.copy()
+    if not args.full_json:
+        for field in LIVE_OUTPUT_EXCLUDE_FIELDS:
+            output_row.pop(field, None)
+    print(json.dumps(output_row, indent=2, default=str))

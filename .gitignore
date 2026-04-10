@@ -3,6 +3,7 @@ ROULET CHEATING DATA.csv
 feature_modeling_plan.md
 eda_findings.md
 semi_supervised_plan.md
+demo_commands_and_steps.txt
 __pycache__/
 *.py[codz]
 *$py.class
