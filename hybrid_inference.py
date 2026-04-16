@@ -23,10 +23,23 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data_cache"
-SCORED_PATH = DATA_DIR / "hybrid_scored_players.parquet"
+CURRENT_DIR = ROOT / "artifacts" / "current"
+
+# Prefer artifacts/current/ (MLOps pipeline output); fall back to data_cache/ legacy paths
+def _resolve_scored_path() -> Path:
+    new_path = CURRENT_DIR / "hybrid_scored_players.parquet"
+    legacy_path = DATA_DIR / "hybrid_scored_players.parquet"
+    return new_path if new_path.exists() else legacy_path
+
+def _resolve_artifact_path() -> Path:
+    new_path = CURRENT_DIR / "model_bundle.joblib"
+    legacy_path = DATA_DIR / "hybrid_inference_artifacts.joblib"
+    return new_path if new_path.exists() else legacy_path
+
+SCORED_PATH = _resolve_scored_path()
 FRAUD_CSV = ROOT / "ROULET CHEATING DATA.csv"
 ENV_PATH = ROOT / ".env"
-ARTIFACT_PATH = DATA_DIR / "hybrid_inference_artifacts.joblib"
+ARTIFACT_PATH = _resolve_artifact_path()
 
 RANDOM_SEED = 42
 ANOMALY_WEIGHT = 0.60
@@ -420,18 +433,30 @@ def aggregate_member_features(history_df: pd.DataFrame) -> pd.DataFrame:
     return player_agg
 
 
-def make_model_frame(player_features: pd.DataFrame) -> pd.DataFrame:
-    frame = player_features[FEATURE_COLUMNS].copy()
-    for column in LOG1P_COLUMNS:
+def make_model_frame(
+    player_features: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    log1p_columns: list[str] | set[str] | None = None,
+) -> pd.DataFrame:
+    active_feature_columns = feature_columns or FEATURE_COLUMNS
+    active_log1p_columns = log1p_columns or LOG1P_COLUMNS
+    frame = player_features[active_feature_columns].copy()
+    for column in active_log1p_columns:
         if column in frame.columns:
             frame[column] = np.log1p(frame[column].clip(lower=0))
     frame = frame.replace([np.inf, -np.inf], np.nan).fillna(0)
     return frame
 
 
-def make_style_frame(player_features: pd.DataFrame) -> pd.DataFrame:
-    frame = player_features[STYLE_COLUMNS].copy()
-    for column in STYLE_LOG1P_COLUMNS:
+def make_style_frame(
+    player_features: pd.DataFrame,
+    style_columns: list[str] | None = None,
+    style_log1p_columns: list[str] | set[str] | None = None,
+) -> pd.DataFrame:
+    active_style_columns = style_columns or STYLE_COLUMNS
+    active_style_log1p_columns = style_log1p_columns or STYLE_LOG1P_COLUMNS
+    frame = player_features[active_style_columns].copy()
+    for column in active_style_log1p_columns:
         if column in frame.columns:
             frame[column] = np.log1p(frame[column].clip(lower=0))
     frame = frame.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -450,9 +475,15 @@ def reliability_label(draws_played: int, raw_rows: int) -> tuple[str, list[str]]
 
 
 def load_reference_scored() -> pd.DataFrame:
-    scored = pd.read_parquet(SCORED_PATH).copy()
+    path = _resolve_scored_path()
+    scored = pd.read_parquet(path).copy()
     scored["member_id"] = scored["member_id"].astype(str).str.upper().str.strip()
     return scored
+
+
+def _is_new_bundle(artifacts: dict[str, Any]) -> bool:
+    """True if artifacts came from the MLOps model_bundle (v1 pipeline), not the legacy format."""
+    return "anomaly_weight" in artifacts and "mahal_stats" in artifacts
 
 
 def build_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
@@ -513,6 +544,11 @@ def build_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
         "style_columns": STYLE_COLUMNS,
         "log1p_columns": sorted(LOG1P_COLUMNS),
         "style_log1p_columns": sorted(STYLE_LOG1P_COLUMNS),
+        "anomaly_component_weights": {
+            "iso_forest_score_norm": 0.40,
+            "mahalanobis_norm": 0.30,
+            "cluster_distance_norm": 0.30,
+        },
         "scaler_unsup": scaler_unsup,
         "iso_forest": iso_forest,
         "iso_min": float(iso_raw.min()),
@@ -538,6 +574,10 @@ def build_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
 
 
 def ensure_artifacts(force_rebuild: bool = False) -> dict[str, Any]:
+    artifact_path = _resolve_artifact_path()
+    # If the new MLOps model_bundle exists and we're not forced to rebuild, use it directly
+    if artifact_path == CURRENT_DIR / "model_bundle.joblib" and artifact_path.exists() and not force_rebuild:
+        return joblib.load(artifact_path)
     return build_artifacts(force_rebuild=force_rebuild)
 
 
@@ -596,8 +636,16 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
     if len(player_features) != 1:
         raise HybridInferenceError("Expected exactly one aggregated player row for live scoring.")
 
-    model_frame = make_model_frame(player_features)
-    style_frame = make_style_frame(player_features)
+    model_frame = make_model_frame(
+        player_features,
+        feature_columns=artifacts.get("feature_columns"),
+        log1p_columns=artifacts.get("log1p_columns"),
+    )
+    style_frame = make_style_frame(
+        player_features,
+        style_columns=artifacts.get("style_columns"),
+        style_log1p_columns=artifacts.get("style_log1p_columns"),
+    )
 
     X_unsup = artifacts["scaler_unsup"].transform(model_frame)
     iso_raw = float(-artifacts["iso_forest"].score_samples(X_unsup)[0])
@@ -608,11 +656,21 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
     iso_norm = normalize_component(iso_raw, artifacts["iso_min"], artifacts["iso_max"])
     mahal_norm = normalize_component(mahal_raw, artifacts["mahal_min"], artifacts["mahal_max"])
     cluster_norm = normalize_component(cluster_raw, artifacts["cluster_min"], artifacts["cluster_max"])
-    anomaly_score = float(0.40 * iso_norm + 0.30 * mahal_norm + 0.30 * cluster_norm)
+    component_weights = artifacts.get(
+        "anomaly_component_weights",
+        {"iso_forest_score_norm": 0.40, "mahalanobis_norm": 0.30, "cluster_distance_norm": 0.30},
+    )
+    anomaly_score = float(
+        float(component_weights["iso_forest_score_norm"]) * iso_norm
+        + float(component_weights["mahalanobis_norm"]) * mahal_norm
+        + float(component_weights["cluster_distance_norm"]) * cluster_norm
+    )
 
     X_operational = artifacts["scaler_operational"].transform(model_frame)
     supervised_score = float(artifacts["lr_operational"].predict_proba(X_operational)[0, 1])
-    risk_score = float(ANOMALY_WEIGHT * anomaly_score + SUPERVISED_WEIGHT * supervised_score)
+    anomaly_weight = float(artifacts.get("anomaly_weight", ANOMALY_WEIGHT))
+    supervised_weight = float(artifacts.get("supervised_weight", SUPERVISED_WEIGHT))
+    risk_score = float(anomaly_weight * anomaly_score + supervised_weight * supervised_score)
 
     if risk_score <= artifacts["risk_p80"]:
         risk_tier = "LOW"
@@ -622,7 +680,10 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
         risk_tier = "HIGH"
 
     full_coords = artifacts["full_pca"].transform(X_unsup)[0] if "full_pca" in artifacts else [np.nan, np.nan]
-    style_coords = artifacts["style_pca"].transform(artifacts["style_scaler"].transform(style_frame))[0]
+    if "style_pca" in artifacts and "style_scaler" in artifacts:
+        style_coords = artifacts["style_pca"].transform(artifacts["style_scaler"].transform(style_frame))[0]
+    else:
+        style_coords = [np.nan, np.nan]
     draws_played = int(player_features.loc[0, "draws_played"])
     reliability, notes = reliability_label(draws_played=draws_played, raw_rows=len(raw_history))
     notes.append("Risk tier is relative to the current analysis cohort and is not an absolute fraud probability.")

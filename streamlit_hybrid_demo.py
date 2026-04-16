@@ -21,9 +21,16 @@ from hybrid_inference import (
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data_cache"
-SCORED_PATH = DATA_DIR / "hybrid_scored_players.parquet"
-ALERT_PATH = DATA_DIR / "alert_queue.csv"
-EVAL_PATH = DATA_DIR / "hybrid_evaluation.json"
+CURRENT_DIR = ROOT / "artifacts" / "current"
+
+# Prefer artifacts/current/ (MLOps pipeline); fall back to data_cache/ for legacy compatibility
+def _prefer_current(filename: str) -> Path:
+    new_path = CURRENT_DIR / filename
+    return new_path if new_path.exists() else DATA_DIR / filename
+
+SCORED_PATH = _prefer_current("hybrid_scored_players.parquet")
+ALERT_PATH = _prefer_current("alert_queue.csv")
+EVAL_PATH = _prefer_current("hybrid_evaluation.json")
 
 PRIMARY_FEATURES = [
     "draws_played",
@@ -51,6 +58,15 @@ DISPLAY_COLUMNS = [
 ]
 
 LIVE_RESULT_STATE_KEY = "live_result_payload"
+BEHAVIOUR_COLUMNS = ["cluster_id", "style_pc1", "style_pc2"]
+
+
+def has_columns(df: pd.DataFrame, columns: list[str]) -> bool:
+    return all(column in df.columns for column in columns)
+
+
+def has_player_fields(player_row: pd.Series, fields: list[str]) -> bool:
+    return all(field in player_row.index for field in fields)
 
 
 @st.cache_data(show_spinner=False)
@@ -124,6 +140,8 @@ def feature_profile(scored: pd.DataFrame, player_row: pd.Series) -> pd.DataFrame
 
 
 def nearest_peers(scored: pd.DataFrame, player_row: pd.Series, limit: int = 8) -> pd.DataFrame:
+    if not has_columns(scored, BEHAVIOUR_COLUMNS) or not has_player_fields(player_row, BEHAVIOUR_COLUMNS):
+        return pd.DataFrame()
     peer_df = scored[["member_id", "cluster_id", "risk_tier", "risk_score", "style_pc1", "style_pc2"]].copy()
     peer_df["distance"] = np.sqrt(
         (peer_df["style_pc1"] - float(player_row["style_pc1"])) ** 2
@@ -134,9 +152,15 @@ def nearest_peers(scored: pd.DataFrame, player_row: pd.Series, limit: int = 8) -
 
 
 def pca_chart(scored: pd.DataFrame, player_row: pd.Series):
+    if not has_columns(scored, ["style_pc1", "style_pc2"]) or not has_player_fields(player_row, ["style_pc1", "style_pc2"]):
+        return None
+
     plot_df = scored.copy()
     plot_df["selected"] = plot_df["member_id"].eq(player_row["member_id"])
-    plot_df["known_fraud"] = plot_df["event_fraud_flag"].astype(int)
+    if "event_fraud_flag" in plot_df.columns:
+        plot_df["known_fraud"] = pd.to_numeric(plot_df["event_fraud_flag"], errors="coerce").fillna(0).astype(int)
+    else:
+        plot_df["known_fraud"] = 0
 
     fig = px.scatter(
         plot_df,
@@ -159,15 +183,16 @@ def pca_chart(scored: pd.DataFrame, player_row: pd.Series):
     )
 
     fraud_df = plot_df[plot_df["known_fraud"] == 1]
-    fig.add_scatter(
-        x=fraud_df["style_pc1"],
-        y=fraud_df["style_pc2"],
-        mode="markers",
-        name="Known fraud",
-        marker={"size": 11, "symbol": "x", "color": "black", "line": {"width": 1}},
-        hovertext=fraud_df["member_id"],
-        hovertemplate="Known fraud<br>%{hovertext}<extra></extra>",
-    )
+    if not fraud_df.empty:
+        fig.add_scatter(
+            x=fraud_df["style_pc1"],
+            y=fraud_df["style_pc2"],
+            mode="markers",
+            name="Known fraud",
+            marker={"size": 11, "symbol": "x", "color": "black", "line": {"width": 1}},
+            hovertext=fraud_df["member_id"],
+            hovertemplate="Known fraud<br>%{hovertext}<extra></extra>",
+        )
 
     fig.add_scatter(
         x=[player_row["style_pc1"]],
@@ -381,16 +406,23 @@ def main() -> None:
             st.warning(note)
 
     if validation_mode:
+        label_available = "event_fraud_flag" in player_row.index and not pd.isna(player_row.get("event_fraud_flag"))
         if selected_source == "mongo_live":
-            st.info(
-                f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
-                "Evaluation-only scores are not available for one-off live scoring."
-            )
+            if label_available:
+                st.info(
+                    f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
+                    "Evaluation-only scores are not available for one-off live scoring."
+                )
+            else:
+                st.info("Known-fraud labels are not available for this live-scored view. Evaluation-only scores are not available for one-off live scoring.")
         else:
-            st.info(
-                f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
-                f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
-            )
+            if label_available:
+                st.info(
+                    f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
+                    f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
+                )
+            else:
+                st.info("Known-fraud labels are not present in the current operational artifact bundle. Evaluation-only fields are unavailable unless you load a replay-eval output.")
 
     tab1, tab2, tab3, tab4 = st.tabs(["Player Summary", "Feature Profile", "Behaviour Map", "Alert Queue"])
 
@@ -403,6 +435,7 @@ def main() -> None:
             summary_cols += ["event_fraud_flag"]
         if selected_source == "mongo_live":
             summary_cols += ["raw_history_rows", "history_rows_used", "matched_fraud_rows", "score_reliability", "source"]
+        summary_cols = [col for col in summary_cols if col in player_row.index]
         summary_df = pd.DataFrame(
             {
                 "field": summary_cols,
@@ -413,7 +446,10 @@ def main() -> None:
 
         peers = nearest_peers(reference_scored, player_row)
         st.subheader("Nearest behavioural peers")
-        st.dataframe(peers, width="stretch", hide_index=True)
+        if peers.empty:
+            st.info("Behaviour-space peer lookup is unavailable because the current artifact bundle does not include style coordinates.")
+        else:
+            st.dataframe(peers, width="stretch", hide_index=True)
 
     with tab2:
         profile_df = feature_profile(reference_scored, player_row)
@@ -439,11 +475,15 @@ def main() -> None:
 
     with tab3:
         st.subheader("Player position in behaviour space")
-        st.plotly_chart(pca_chart(reference_scored, player_row), width="stretch")
-        st.caption(
-            "The selected player is highlighted on the same style-PCA space used for the CTO-facing behaviour view. "
-            "Known fraud points are marked with black X symbols for internal demos."
-        )
+        fig = pca_chart(reference_scored, player_row)
+        if fig is None:
+            st.info("Behaviour-map coordinates are not present in the current operational artifact bundle, so this view is unavailable.")
+        else:
+            st.plotly_chart(fig, width="stretch")
+            st.caption(
+                "The selected player is highlighted on the same style-PCA space used for the CTO-facing behaviour view. "
+                "Known fraud points are marked with black X symbols for internal demos."
+            )
 
     with tab4:
         st.subheader("Current alert queue")

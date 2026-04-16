@@ -4,6 +4,8 @@ feature_modeling_plan.md
 eda_findings.md
 semi_supervised_plan.md
 demo_commands_and_steps.txt
+fraud_members_for_streamlit_testing.txt
+llm_step_by_step_implementation_plan.md
 __pycache__/
 *.py[codz]
 *$py.class
@@ -14,6 +16,7 @@ fraud_no_cheat_eda_and_baseline.ipynb
 analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
+artifacts/
 
 # C extensions
 *.so
@@ -229,3 +232,10 @@ notebook/.ipynb_checkpoints/
 data_cache/
 notebook/data_cache/
 *.parquet
+
+# MLOps pipeline outputs (gitignored)
+artifacts/runs/
+artifacts/current/
+logs/
+mlruns/
+mlops_implementation_plan.md

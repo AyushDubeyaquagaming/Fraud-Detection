@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fraud_detection.entity.artifact_entity import ModelEvaluationArtifact, ModelPusherArtifact, ModelTrainingArtifact
+from fraud_detection.entity.config_entity import ModelPusherConfig
+from fraud_detection.exception import FraudDetectionException
+from fraud_detection.logger import get_logger
+from fraud_detection.utils.common import ensure_dir, load_joblib, read_json, save_joblib, write_json
+
+logger = get_logger(__name__)
+
+
+def _git_sha() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+class ModelPusher:
+    def __init__(
+        self,
+        config: ModelPusherConfig,
+        training_artifact: ModelTrainingArtifact,
+        evaluation_artifact: ModelEvaluationArtifact,
+    ):
+        self.config = config
+        self.training_artifact = training_artifact
+        self.evaluation_artifact = evaluation_artifact
+
+    def initiate_model_pusher(self) -> ModelPusherArtifact:
+        logger.info("ModelPusher: starting — gate_passed=%s", self.evaluation_artifact.gate_passed)
+        try:
+            ensure_dir(self.config.current_dir)
+            run_dir = self.training_artifact.iso_forest_path.parent.parent  # run_dir/model_training → run_dir
+
+            eval_report = read_json(self.evaluation_artifact.evaluation_report_path)
+            training_report = read_json(self.training_artifact.training_report_path)
+            promotion_metadata_path = self.config.current_dir / "promotion_metadata.json"
+
+            if not self.evaluation_artifact.gate_passed:
+                metadata = {
+                    "gate_passed": False,
+                    "reason": f"combined_oos_top_20pct={self.evaluation_artifact.combined_oos_top_20pct} < {self.config.min_capture_top_20pct}",
+                    "capture_rates": eval_report.get("capture_rates", {}),
+                    "decided_at": datetime.now(timezone.utc).isoformat(),
+                    "git_sha": _git_sha(),
+                }
+                write_json(metadata, promotion_metadata_path)
+                logger.error("ModelPusher: NOT promoted — gate failed")
+                return ModelPusherArtifact(
+                    model_bundle_path=promotion_metadata_path,
+                    promotion_metadata_path=promotion_metadata_path,
+                    promoted=False,
+                )
+
+            # --- Build model bundle ---
+            iso_forest = load_joblib(self.training_artifact.iso_forest_path)
+            kmeans = load_joblib(self.training_artifact.kmeans_path)
+            mahal_stats = load_joblib(self.training_artifact.mahalanobis_stats_path)
+            scalers = load_joblib(self.training_artifact.scaler_path)
+            lr_models = load_joblib(self.training_artifact.lr_operational_path)
+
+            scored_df = __import__("pandas").read_parquet(self.evaluation_artifact.scored_players_path)
+
+            bundle = {
+                "iso_forest": iso_forest,
+                "kmeans": kmeans,
+                "mahal_stats": mahal_stats,
+                # Top-level for hybrid_inference.py compatibility
+                "mean_vec": mahal_stats["mean_vec"],
+                "cov_inv": mahal_stats["cov_inv"],
+                "scaler_unsup": scalers["scaler_unsup"],
+                "scaler_operational": scalers["scaler_operational"],
+                "style_scaler": scalers.get("style_scaler"),
+                "style_pca": scalers.get("style_pca"),
+                "full_pca": scalers.get("full_pca"),
+                "lr_operational": lr_models["lr_operational"],
+                "feature_columns": self.training_artifact.feature_columns,
+                "log1p_columns": sorted(training_report.get("log1p_cols", [])),
+                "style_columns": training_report.get("style_columns", []),
+                "style_log1p_columns": training_report.get("style_log1p_cols", []),
+                "iso_min": float(scored_df["iso_forest_score"].min()),
+                "iso_max": float(scored_df["iso_forest_score"].max()),
+                "mahal_min": float(scored_df["mahalanobis_dist"].min()),
+                "mahal_max": float(scored_df["mahalanobis_dist"].max()),
+                "cluster_min": float(scored_df["cluster_distance"].min()),
+                "cluster_max": float(scored_df["cluster_distance"].max()),
+                "risk_p80": float(eval_report["risk_p80"]),
+                "risk_p95": float(eval_report["risk_p95"]),
+                "anomaly_weight": float(eval_report["anomaly_weight"]),
+                "supervised_weight": float(eval_report["supervised_weight"]),
+                "anomaly_component_weights": eval_report.get("anomaly_component_weights", {}),
+                "reference_size": int(len(scored_df)),
+            }
+            bundle_path = self.config.current_dir / "model_bundle.joblib"
+            save_joblib(bundle, bundle_path)
+
+            # Copy scored output + alert queue + evaluation
+            shutil.copy2(
+                self.evaluation_artifact.scored_players_path,
+                self.config.current_dir / "hybrid_scored_players.parquet",
+            )
+            shutil.copy2(
+                self.evaluation_artifact.evaluation_report_path,
+                self.config.current_dir / "hybrid_evaluation.json",
+            )
+            alert_src = self.evaluation_artifact.scored_players_path.parent / "alert_queue.csv"
+            if alert_src.exists():
+                shutil.copy2(alert_src, self.config.current_dir / "alert_queue.csv")
+
+            # Feature pipeline config
+            feat_config = {
+                "feature_columns": self.training_artifact.feature_columns,
+                "log1p_cols": training_report.get("log1p_cols", []),
+                "style_columns": training_report.get("style_columns", []),
+                "style_log1p_cols": training_report.get("style_log1p_cols", []),
+            }
+            write_json(feat_config, self.config.current_dir / "feature_pipeline_config.json")
+
+            metadata = {
+                "gate_passed": True,
+                "run_dir": str(run_dir),
+                "promoted_at": datetime.now(timezone.utc).isoformat(),
+                "git_sha": _git_sha(),
+                "capture_rates": eval_report.get("capture_rates", {}),
+                "combined_oos_top_20pct": self.evaluation_artifact.combined_oos_top_20pct,
+            }
+            write_json(metadata, promotion_metadata_path)
+
+            logger.info("ModelPusher: promoted successfully to %s", self.config.current_dir)
+            return ModelPusherArtifact(
+                model_bundle_path=bundle_path,
+                promotion_metadata_path=promotion_metadata_path,
+                promoted=True,
+            )
+        except FraudDetectionException:
+            raise
+        except Exception as e:
+            raise FraudDetectionException(e, sys) from e

@@ -1,0 +1,19 @@
+required_columns:
+  - member_id
+  - draw_id
+  - total_bet_amount
+  - win_points
+  - bets
+
+optional_columns:
+  - session_id
+  - ccs_id
+  - createdAt
+  - trans_date
+  - updatedAt
+
+fraud_csv_required_columns:
+  - member_id
+  - draw_id
+
+min_row_count: 1000

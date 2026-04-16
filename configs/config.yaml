@@ -1,0 +1,46 @@
+pipeline:
+  artifact_root: "artifacts"
+  current_dir: "artifacts/current"
+  random_seed: 42
+
+data_ingestion:
+  source: "mongodb"
+  parquet_path: "data_cache/fraud_modeling_pull.parquet"
+  mongodb:
+    uri_env_var: "MONGODB_URI"
+    database_env_var: "MONGODB_DATABASE"
+    collection_env_var: "MONGODB_COLLECTION_ROULETTE_REPORT"
+
+data_validation:
+  required_columns:
+    - member_id
+    - draw_id
+    - total_bet_amount
+    - win_points
+    - bets
+  min_row_count: 1000
+  fraud_csv_path: "ROULET CHEATING DATA.csv"
+
+feature_engineering:
+  exclude_cols: ["member_id", "event_fraud_flag", "primary_ccs_id",
+                 "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player"]
+  log1p_cols: ["total_staked", "avg_stake_per_draw", "median_stake_per_draw",
+               "stake_std", "max_stake_per_draw", "stake_cv",
+               "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
+               "std_net_result", "pnl_volatility"]
+  apply_pre_fraud_cutoff: true
+
+batch_scoring:
+  mode: "operational"
+  require_labels: false
+
+model_evaluation:
+  threshold_percentiles: [0.01, 0.05, 0.10, 0.20]
+  risk_tier_p80: 0.80
+  risk_tier_p95: 0.95
+  min_capture_top_20pct: 10
+
+mlflow:
+  tracking_uri_env_var: "MLFLOW_TRACKING_URI"
+  experiment_name: "fraud_detection_hybrid"
+  registered_model_name: "fraud_detection_hybrid"
