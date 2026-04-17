@@ -60,11 +60,24 @@ class BatchScoringPipeline:
             if ing_cfg["source"] == "parquet":
                 raw_df = pd.read_parquet(REPO_ROOT / ing_cfg["parquet_path"])
             else:
-                from fraud_detection.utils.mongodb import pull_full_collection
-                raw_df = pull_full_collection(
-                    uri_env_var=ing_cfg["mongodb"]["uri_env_var"],
-                    db_env_var=ing_cfg["mongodb"]["database_env_var"],
-                    collection_env_var=ing_cfg["mongodb"]["collection_env_var"],
+                from fraud_detection.utils.mongodb import (
+                    build_query_batches_from_strategy,
+                    pull_query_batches_to_dataframe,
+                )
+                mongo_cfg = ing_cfg["mongodb"]
+                strategy = mongo_cfg.get("strategy", "date_window")
+                strategy_params = dict(mongo_cfg.get("strategy_params", {}))
+                logger.info(
+                    "BatchScoringPipeline: mongodb strategy=%s, params=%s",
+                    strategy,
+                    strategy_params,
+                )
+                query_filters = build_query_batches_from_strategy(strategy, strategy_params)
+                raw_df = pull_query_batches_to_dataframe(
+                    uri_env_var=mongo_cfg["uri_env_var"],
+                    db_env_var=mongo_cfg["database_env_var"],
+                    collection_env_var=mongo_cfg["collection_env_var"],
+                    query_filters=query_filters,
                 )
 
             logger.info("Loaded %d raw rows", len(raw_df))
@@ -241,18 +254,19 @@ class BatchScoringPipeline:
             write_json(eval_summary, eval_path)
 
             # Scoring report
+            scoring_report: dict = {
+                "run_at": datetime.now(timezone.utc).isoformat(),
+                "mode": mode,
+                "total_players": len(player_df),
+                "source": ing_cfg["source"],
+                "scored_path": str(scored_path),
+                "alert_path": str(alert_path),
+            }
+            if ing_cfg["source"] == "mongodb":
+                scoring_report["strategy_used"] = mongo_cfg.get("strategy", "date_window")
+                scoring_report["query_count"] = len(query_filters)
             report_path = CURRENT_DIR / "batch_scoring_report.json"
-            write_json(
-                {
-                    "run_at": datetime.now(timezone.utc).isoformat(),
-                    "mode": mode,
-                    "total_players": len(player_df),
-                    "source": ing_cfg["source"],
-                    "scored_path": str(scored_path),
-                    "alert_path": str(alert_path),
-                },
-                report_path,
-            )
+            write_json(scoring_report, report_path)
 
             # Cleanup tmp files
             for tmp_f in [tmp_raw_path]:

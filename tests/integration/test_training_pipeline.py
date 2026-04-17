@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import joblib
 import pandas as pd
 import pytest
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
 
 # Ensure src is on path
@@ -16,19 +19,98 @@ from fraud_detection.pipeline.training_pipeline import TrainingPipeline
 from fraud_detection.constants.constants import CONFIG_FILE_PATH, REPO_ROOT
 
 
-PARQUET_PATH = REPO_ROOT / "data_cache" / "fraud_modeling_pull.parquet"
+def _make_bets(numbers: list[int], amounts: list[float]) -> str:
+    return json.dumps(
+        [
+            {"number": str(number), "bet_amount": amount}
+            for number, amount in zip(numbers, amounts)
+        ]
+    )
 
-pytestmark = pytest.mark.skipif(
-    not PARQUET_PATH.exists(),
-    reason="data_cache/fraud_modeling_pull.parquet not found — skipping integration test",
-)
+
+def _build_synthetic_raw_df() -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[dict] = []
+    fraud_rows: list[dict] = []
+    current_ts = pd.Timestamp("2024-01-01T00:00:00Z")
+    draw_id = 1
+
+    for member_idx in range(40):
+        member_id = f"N{member_idx:03d}"
+        ccs_id = f"CCS_{member_idx % 10:02d}"
+        for draw_idx in range(25):
+            bet_amounts = [4.0 + (draw_idx % 3), 3.0 + (draw_idx % 2), 2.0]
+            total_bet_amount = sum(bet_amounts)
+            rows.append(
+                {
+                    "member_id": member_id,
+                    "draw_id": draw_id,
+                    "bets": _make_bets(
+                        [
+                            (draw_idx * 3) % 38,
+                            (draw_idx * 7 + 5) % 38,
+                            (draw_idx * 11 + 9) % 38,
+                        ],
+                        bet_amounts,
+                    ),
+                    "win_points": total_bet_amount * (0.75 + 0.05 * (draw_idx % 4)),
+                    "total_bet_amount": total_bet_amount,
+                    "session_id": draw_idx // 5,
+                    "ccs_id": ccs_id,
+                    "createdAt": current_ts,
+                    "updatedAt": current_ts + timedelta(seconds=30),
+                    "trans_date": current_ts,
+                }
+            )
+            draw_id += 1
+            current_ts += timedelta(minutes=1)
+
+    for member_idx in range(8):
+        member_id = f"F{member_idx:03d}"
+        ccs_id = f"CCS_F{member_idx % 2}"
+        for draw_idx in range(30):
+            bet_amounts = [50.0, 45.0 + float(draw_idx % 2), 40.0]
+            total_bet_amount = sum(bet_amounts)
+            current_draw_id = draw_id
+            rows.append(
+                {
+                    "member_id": member_id,
+                    "draw_id": current_draw_id,
+                    "bets": _make_bets([17, 18, 19], bet_amounts),
+                    "win_points": 5.0 if draw_idx % 3 else 0.0,
+                    "total_bet_amount": total_bet_amount,
+                    "session_id": draw_idx // 10,
+                    "ccs_id": ccs_id,
+                    "createdAt": current_ts,
+                    "updatedAt": current_ts + timedelta(seconds=15),
+                    "trans_date": current_ts,
+                }
+            )
+            if draw_idx == 20:
+                fraud_rows.append({"member_id": member_id, "draw_id": current_draw_id})
+            draw_id += 1
+            current_ts += timedelta(minutes=1)
+
+    return pd.DataFrame(rows), pd.DataFrame(fraud_rows)
+
+
+def _write_synthetic_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    raw_df, fraud_df = _build_synthetic_raw_df()
+    parquet_path = tmp_path / "synthetic_raw.parquet"
+    fraud_csv_path = tmp_path / "synthetic_fraud.csv"
+    raw_df.to_parquet(parquet_path, index=False)
+    fraud_df.to_csv(fraud_csv_path, index=False)
+    return parquet_path, fraud_csv_path
 
 
 def test_full_training_pipeline(tmp_path):
     """Run end-to-end training pipeline on cached parquet and verify all outputs."""
+    parquet_path, fraud_csv_path = _write_synthetic_inputs(tmp_path)
+
     with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     config["data_ingestion"]["source"] = "parquet"
+    config["data_ingestion"]["parquet_path"] = str(parquet_path)
+    config["data_validation"]["fraud_csv_path"] = str(fraud_csv_path)
     temp_config_path = tmp_path / "config.yaml"
     with open(temp_config_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)

@@ -10,6 +10,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 fraud-data-no-cheat.csv
+bounded_ingestion_plan.md
 fraud_no_cheat_modeling_plan.md
 profile_no_cheat_dataset.py
 fraud_no_cheat_eda_and_baseline.ipynb

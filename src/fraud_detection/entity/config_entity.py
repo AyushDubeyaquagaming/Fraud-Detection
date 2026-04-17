@@ -13,6 +13,9 @@ class DataIngestionConfig:
     mongo_database_env_var: str
     mongo_collection_env_var: str
     output_dir: Path
+    # Strategy-driven bounded ingestion (additive — all have safe defaults)
+    mongo_strategy: str = "date_window"
+    mongo_strategy_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

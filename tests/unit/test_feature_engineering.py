@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from fraud_detection.components.feature_engineering import (
+    FeatureEngineering,
     gini_coeff,
     make_bet_template,
     safe_entropy,
@@ -182,3 +183,63 @@ def test_fraud_at_draw_zero_dropped():
         player_features = pd.read_parquet(artifact.player_features_path)
         # B001 had fraud at draw 0, no pre-fraud draws → should not appear in player features
         assert "B001" not in player_features["member_id"].values
+
+
+def test_history_schema_stable_across_null_and_typed_fraud_columns(tmp_path):
+    history_path = tmp_path / "history_df.parquet"
+    writers = {}
+
+    base_columns = {
+        "member_id": ["A001"],
+        "draw_id": pd.Series([1], dtype="Int64"),
+        "bets": ['[{"number": "1", "bet_amount": 10}]'],
+        "win_points": [5.0],
+        "total_bet_amount": [10.0],
+        "session_id": [1],
+        "ccs_id": ["CCS1"],
+        "createdAt": [pd.Timestamp("2024-01-01T00:00:00Z")],
+        "updatedAt": [pd.Timestamp("2024-01-01T00:00:30Z")],
+        "trans_date": [pd.Timestamp("2024-01-01T00:00:00Z")],
+        "ts": [pd.Timestamp("2024-01-01T00:00:00Z")],
+        "bets_per_draw": [1],
+        "nonzero_bets_per_draw": [1],
+        "tiny_bet_ratio_in_draw": [0.0],
+        "max_bet_share_in_draw": [1.0],
+        "bet_amount_std_in_draw": [0.0],
+        "bet_amount_mean_in_draw": [10.0],
+        "entropy_in_draw": [0.0],
+        "gini_in_draw": [0.0],
+        "unique_positions_in_draw": [1],
+        "position_coverage": [1 / 38.0],
+        "net_result": [-5.0],
+        "bet_template": ['[["1",10.0]]'],
+        "fraud_event_key": ["1|A001"],
+        "inter_draw_seconds": [0.0],
+        "event_label": [0],
+        "is_fraud_player": [0],
+    }
+
+    null_df = FeatureEngineering._ensure_history_schema(pd.DataFrame(base_columns))
+
+    typed_df = pd.DataFrame(
+        {
+            **base_columns,
+            "member_id": ["A002"],
+            "draw_id": pd.Series([2], dtype="Int64"),
+            "fraud_event_key": ["2|A002"],
+            "event_label": [1],
+            "first_fraud_ts": [pd.Timestamp("2024-01-01T00:01:00Z")],
+            "first_fraud_draw_id": pd.Series([2], dtype="Int64"),
+            "is_fraud_player": [1],
+        }
+    )
+    typed_df = FeatureEngineering._ensure_history_schema(typed_df)
+
+    FeatureEngineering._append_dataframe_to_parquet(null_df, history_path, writers)
+    FeatureEngineering._append_dataframe_to_parquet(typed_df, history_path, writers)
+    FeatureEngineering._close_writers(writers)
+
+    history_df = pd.read_parquet(history_path)
+    assert len(history_df) == 2
+    assert str(history_df["first_fraud_ts"].dtype).startswith("datetime64")
+    assert str(history_df["first_fraud_draw_id"].dtype) == "Int64"

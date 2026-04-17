@@ -1,15 +1,33 @@
+
+
 pipeline:
   artifact_root: "artifacts"
   current_dir: "artifacts/current"
   random_seed: 42
 
 data_ingestion:
-  source: "mongodb"
+  source: "parquet"
   parquet_path: "data_cache/fraud_modeling_pull.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
     database_env_var: "MONGODB_DATABASE"
     collection_env_var: "MONGODB_COLLECTION_ROULETTE_REPORT"
+    # Bounded ingestion strategy.
+    # date_window  — default; bounds by trans_date. Use for routine weekly retraining.
+    # member_list  — targeted cohort extraction and scoring. Not the standard retraining path.
+    # full_collection — escape hatch for one-time baseline pulls. Requires confirm_full_pull: true.
+    strategy: "date_window"
+    strategy_params:
+      # trans_date is the default because it aligns to gameplay time, not document write time.
+      timestamp_field: "trans_date"
+      # Rolling lookback for steady-state weekly operation.
+      # For historical backfills aligned to a known label period, comment out lookback_days
+      # and set explicit start_date / end_date (ISO-8601 strings, e.g. "2024-01-01").
+      lookback_days: 90
+      start_date: null
+      end_date: null
+      # full_collection guard — must be set to true to allow a full-collection pull.
+      confirm_full_pull: false
 
 data_validation:
   required_columns:

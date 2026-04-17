@@ -11,6 +11,10 @@ class DataIngestionArtifact:
     row_count: int
     member_count: int
     source_type: str
+    # Strategy audit fields (additive — optional with safe defaults)
+    strategy_used: str | None = None
+    query_count: int = 1
+    date_range: dict[str, str] | None = None
 
 
 @dataclass

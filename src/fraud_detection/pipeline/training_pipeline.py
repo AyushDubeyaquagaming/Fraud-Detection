@@ -72,6 +72,8 @@ class TrainingPipeline:
             mongo_database_env_var=ing_cfg["mongodb"]["database_env_var"],
             mongo_collection_env_var=ing_cfg["mongodb"]["collection_env_var"],
             output_dir=run_dir / "data_ingestion",
+            mongo_strategy=ing_cfg["mongodb"].get("strategy", "date_window"),
+            mongo_strategy_params=dict(ing_cfg["mongodb"].get("strategy_params", {})),
         )
         data_validation_config = DataValidationConfig(
             schema_path=REPO_ROOT / "configs" / "schema.yaml",
