@@ -48,15 +48,33 @@ class ModelPusher:
             promotion_metadata_path = self.config.current_dir / "promotion_metadata.json"
 
             if not self.evaluation_artifact.gate_passed:
+                cap5 = self.evaluation_artifact.combined_oos_capture_rate_top_5pct
+                lift5 = self.evaluation_artifact.combined_oos_lift_top_5pct
+                reason_parts = []
+                if cap5 < self.config.min_capture_rate_top_5pct:
+                    reason_parts.append(
+                        f"capture_rate_top_5pct={cap5:.3f} < {self.config.min_capture_rate_top_5pct:.3f}"
+                    )
+                if lift5 < self.config.min_lift_top_5pct:
+                    reason_parts.append(
+                        f"lift_top_5pct={lift5:.2f}x < {self.config.min_lift_top_5pct:.2f}x"
+                    )
                 metadata = {
                     "gate_passed": False,
-                    "reason": f"combined_oos_top_20pct={self.evaluation_artifact.combined_oos_top_20pct} < {self.config.min_capture_top_20pct}",
+                    "reason": "; ".join(reason_parts) or "gate_passed=false in evaluation",
+                    "combined_oos_capture_rate_top_5pct": cap5,
+                    "combined_oos_lift_top_5pct": lift5,
+                    "gate_thresholds": {
+                        "min_capture_rate_top_5pct": self.config.min_capture_rate_top_5pct,
+                        "min_lift_top_5pct": self.config.min_lift_top_5pct,
+                    },
                     "capture_rates": eval_report.get("capture_rates", {}),
+                    "capture_stats": eval_report.get("capture_stats", {}),
                     "decided_at": datetime.now(timezone.utc).isoformat(),
                     "git_sha": _git_sha(),
                 }
                 write_json(metadata, promotion_metadata_path)
-                logger.error("ModelPusher: NOT promoted — gate failed")
+                logger.error("ModelPusher: NOT promoted — %s", metadata["reason"])
                 return ModelPusherArtifact(
                     model_bundle_path=promotion_metadata_path,
                     promotion_metadata_path=promotion_metadata_path,
@@ -133,6 +151,13 @@ class ModelPusher:
                 "promoted_at": datetime.now(timezone.utc).isoformat(),
                 "git_sha": _git_sha(),
                 "capture_rates": eval_report.get("capture_rates", {}),
+                "capture_stats": eval_report.get("capture_stats", {}),
+                "combined_oos_capture_rate_top_5pct": self.evaluation_artifact.combined_oos_capture_rate_top_5pct,
+                "combined_oos_lift_top_5pct": self.evaluation_artifact.combined_oos_lift_top_5pct,
+                "gate_thresholds": {
+                    "min_capture_rate_top_5pct": self.config.min_capture_rate_top_5pct,
+                    "min_lift_top_5pct": self.config.min_lift_top_5pct,
+                },
                 "combined_oos_top_20pct": self.evaluation_artifact.combined_oos_top_20pct,
             }
             write_json(metadata, promotion_metadata_path)

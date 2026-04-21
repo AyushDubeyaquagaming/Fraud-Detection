@@ -36,6 +36,60 @@ def _capture_count(scores: pd.Series, labels: pd.Series, pct: float) -> int:
     return int(scores[labels == 1].ge(threshold).sum())
 
 
+def _capture_count_topk(scores: pd.Series, labels: pd.Series, k: int) -> int:
+    k = max(1, min(k, len(scores)))
+    top_idx = scores.nlargest(k).index
+    return int(labels.loc[top_idx].sum())
+
+
+def _compute_capture_stats(
+    scores: pd.Series,
+    labels: pd.Series,
+    percentiles: list[float],
+    fixed_counts: list[int],
+) -> dict[str, dict]:
+    """Compute capture_count / capture_rate / lift at each percentile and fixed-count.
+
+    Lift = precision_at_k / base_rate, where
+      precision_at_k = captured_fraud / k
+      base_rate      = total_fraud / total_players
+    """
+    n = len(scores)
+    total_fraud = int(labels.sum())
+    base_rate = total_fraud / n if n > 0 else 0.0
+
+    out: dict[str, dict] = {}
+    for pct in percentiles:
+        key = f"top_{int(pct * 100)}pct"
+        k = max(1, int(n * pct))
+        captured = _capture_count_topk(scores, labels, k)
+        capture_rate = captured / total_fraud if total_fraud > 0 else 0.0
+        precision = captured / k
+        lift = precision / base_rate if base_rate > 0 else 0.0
+        out[key] = {
+            "k": k,
+            "captured_fraud": captured,
+            "capture_rate": capture_rate,
+            "precision": precision,
+            "lift": lift,
+        }
+    for k in fixed_counts:
+        key = f"top_{k}"
+        k_eff = max(1, min(k, n))
+        captured = _capture_count_topk(scores, labels, k_eff)
+        capture_rate = captured / total_fraud if total_fraud > 0 else 0.0
+        precision = captured / k_eff
+        lift = precision / base_rate if base_rate > 0 else 0.0
+        out[key] = {
+            "k": k_eff,
+            "captured_fraud": captured,
+            "capture_rate": capture_rate,
+            "precision": precision,
+            "lift": lift,
+        }
+    return out
+
+
 def _save_feature_importance_plot(feature_importance_df: pd.DataFrame, output_path: Path) -> None:
     top_df = feature_importance_df.head(15).iloc[::-1]
     plt.figure(figsize=(10, 7))
@@ -128,7 +182,10 @@ class ModelEvaluation:
             # Anomaly scores
             iso_raw = -iso_forest.score_samples(X_unsup)
             mahal_raw = np.array([mahalanobis(row, mean_vec, cov_inv) for row in X_unsup])
-            cluster_ids = kmeans.labels_
+            # Use kmeans.predict to stay consistent with batch scoring. kmeans.labels_
+            # would require player_df to be in the exact fit-order from training; even
+            # though that happens to hold today, the predict path has no such coupling.
+            cluster_ids = kmeans.predict(X_unsup)
             cluster_raw = np.array([
                 np.linalg.norm(X_unsup[i] - kmeans.cluster_centers_[cluster_ids[i]])
                 for i in range(len(X_unsup))
@@ -167,12 +224,7 @@ class ModelEvaluation:
             X_operational = scaler_operational.transform(X_raw)
             player_df["supervised_score"] = lr_operational.predict_proba(X_operational)[:, 1]
 
-            # Risk scores
-            player_df["risk_score"] = (
-                self.config.risk_tier_p80 * player_df["anomaly_score"]  # wrong — use weights
-            )
-            # Correct: use anomaly_weight / supervised_weight from training config
-            # Read from training_report
+            # Risk scores — weights come from the training report that trained these models.
             anomaly_w = training_report.get("anomaly_weight", 0.60)
             supervised_w = training_report.get("supervised_weight", 0.40)
             player_df["risk_score"] = anomaly_w * player_df["anomaly_score"] + supervised_w * player_df["supervised_score"]
@@ -196,28 +248,56 @@ class ModelEvaluation:
 
             labels = player_df["event_fraud_flag"].astype(int)
             percentiles = self.config.threshold_percentiles
+            fixed_counts = list(self.config.threshold_fixed_counts)
+            capture_stats = {
+                "anomaly": _compute_capture_stats(
+                    player_df["anomaly_score"], labels, percentiles, fixed_counts
+                ),
+                "supervised_oos": _compute_capture_stats(
+                    player_df["supervised_score_eval"].fillna(0), labels, percentiles, fixed_counts
+                ),
+                "combined_oos": _compute_capture_stats(
+                    player_df["risk_score_eval"].fillna(0), labels, percentiles, fixed_counts
+                ),
+            }
+            # Legacy-shaped view (captured count only) for backward-compatible report fields.
             capture_rates = {
-                "anomaly": {f"top_{int(p*100)}pct": _capture_count(player_df["anomaly_score"], labels, p) for p in percentiles},
-                "supervised_oos": {f"top_{int(p*100)}pct": _capture_count(player_df["supervised_score_eval"].fillna(0), labels, p) for p in percentiles},
-                "combined_oos": {f"top_{int(p*100)}pct": _capture_count(player_df["risk_score_eval"].fillna(0), labels, p) for p in percentiles},
+                score_type: {bucket: stats["captured_fraud"] for bucket, stats in buckets.items()}
+                for score_type, buckets in capture_stats.items()
             }
 
             valid_eval_mask = player_df["supervised_score_eval"].notna()
             eval_predictions = (player_df.loc[valid_eval_mask, "supervised_score_eval"] >= 0.50).astype(int).to_numpy()
             eval_labels = labels.loc[valid_eval_mask].to_numpy()
 
-            combined_oos_top_20 = capture_rates["combined_oos"]["top_20pct"]
-            gate_passed = combined_oos_top_20 >= self.config.min_capture_top_20pct
+            # --- Phase 2 rebaseline: primary gate is lift + capture_rate at top 5%. ---
+            top5_stats = capture_stats["combined_oos"].get("top_5pct", {
+                "capture_rate": 0.0, "lift": 0.0
+            })
+            combined_oos_capture_rate_top_5 = float(top5_stats["capture_rate"])
+            combined_oos_lift_top_5 = float(top5_stats["lift"])
+            # Retain old metric in the report for diagnostic continuity; NOT a gate.
+            combined_oos_top_20 = int(capture_rates["combined_oos"].get("top_20pct", 0))
+
+            gate_capture_ok = combined_oos_capture_rate_top_5 >= self.config.min_capture_rate_top_5pct
+            gate_lift_ok = combined_oos_lift_top_5 >= self.config.min_lift_top_5pct
+            gate_passed = gate_capture_ok and gate_lift_ok
 
             if not gate_passed:
                 logger.error(
-                    "Promotion gate FAILED: combined_oos_top_20pct=%d < threshold=%d",
-                    combined_oos_top_20, self.config.min_capture_top_20pct,
+                    "Promotion gate FAILED: combined_oos top_5pct capture_rate=%.3f "
+                    "(threshold %.3f, ok=%s) lift=%.2fx (threshold %.2fx, ok=%s)",
+                    combined_oos_capture_rate_top_5, self.config.min_capture_rate_top_5pct,
+                    gate_capture_ok, combined_oos_lift_top_5, self.config.min_lift_top_5pct,
+                    gate_lift_ok,
                 )
             else:
-                logger.info("Promotion gate PASSED: combined_oos_top_20pct=%d", combined_oos_top_20)
+                logger.info(
+                    "Promotion gate PASSED: combined_oos top_5pct capture_rate=%.3f, lift=%.2fx",
+                    combined_oos_capture_rate_top_5, combined_oos_lift_top_5,
+                )
 
-            # Alert queue (top 50)
+            # Alert queue size is configurable (Phase 2 — maps to review capacity).
             alert_cols = [
                 "member_id", "primary_ccs_id", "risk_score", "risk_tier",
                 "anomaly_score", "supervised_score", "draws_played",
@@ -226,7 +306,7 @@ class ModelEvaluation:
             available_alert_cols = [c for c in alert_cols if c in player_df.columns]
             alert_queue = (
                 player_df.sort_values("risk_score", ascending=False)[available_alert_cols]
-                .head(50)
+                .head(int(self.config.alert_queue_size))
                 .reset_index(drop=True)
             )
 
@@ -239,11 +319,19 @@ class ModelEvaluation:
 
             save_parquet(player_df, scored_path)
 
-            # Capture rate as flat table
+            # Flat table includes capture_rate, precision, and lift for each bucket.
             capture_rows = []
-            for score_type, vals in capture_rates.items():
-                for pct_key, count in vals.items():
-                    capture_rows.append({"score_type": score_type, "percentile": pct_key, "captured_fraud": count})
+            for score_type, buckets in capture_stats.items():
+                for bucket_key, stats in buckets.items():
+                    capture_rows.append({
+                        "score_type": score_type,
+                        "bucket": bucket_key,
+                        "k": int(stats["k"]),
+                        "captured_fraud": int(stats["captured_fraud"]),
+                        "capture_rate": float(stats["capture_rate"]),
+                        "precision": float(stats["precision"]),
+                        "lift": float(stats["lift"]),
+                    })
             pd.DataFrame(capture_rows).to_csv(capture_path, index=False)
 
             feature_importance_df = pd.DataFrame(
@@ -270,13 +358,25 @@ class ModelEvaluation:
             evaluation = {
                 "total_players": int(len(player_df)),
                 "fraud_players": int(labels.sum()),
+                "base_rate": float(labels.sum()) / max(len(player_df), 1),
                 "anomaly_weight": anomaly_w,
                 "supervised_weight": supervised_w,
                 "anomaly_component_weights": component_weights,
+                # Legacy-shaped counts (backward compatible).
                 "capture_rates": capture_rates,
+                # Full capture statistics including capture_rate, precision, and lift.
+                "capture_stats": capture_stats,
+                # Diagnostic-only; NOT the gate metric after Phase 2 rebaseline.
                 "combined_oos_top_20pct": combined_oos_top_20,
+                # Primary Phase 2 gate metrics.
+                "combined_oos_capture_rate_top_5pct": combined_oos_capture_rate_top_5,
+                "combined_oos_lift_top_5pct": combined_oos_lift_top_5,
                 "gate_passed": gate_passed,
-                "min_capture_top_20pct": self.config.min_capture_top_20pct,
+                "gate_thresholds": {
+                    "min_capture_rate_top_5pct": self.config.min_capture_rate_top_5pct,
+                    "min_lift_top_5pct": self.config.min_lift_top_5pct,
+                },
+                "alert_queue_size": int(self.config.alert_queue_size),
                 "confusion_matrix": confusion_matrix_counts,
                 "risk_tier_distribution": {
                     k: int(v) for k, v in player_df["risk_tier"].value_counts().sort_index().to_dict().items()
@@ -305,8 +405,10 @@ class ModelEvaluation:
                 scored_players_path=scored_path,
                 capture_rate_table_path=capture_path,
                 evaluation_report_path=eval_path,
-                combined_oos_top_20pct=combined_oos_top_20,
                 gate_passed=gate_passed,
+                combined_oos_capture_rate_top_5pct=combined_oos_capture_rate_top_5,
+                combined_oos_lift_top_5pct=combined_oos_lift_top_5,
+                combined_oos_top_20pct=combined_oos_top_20,
             )
         except FraudDetectionException:
             raise

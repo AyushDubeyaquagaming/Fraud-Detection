@@ -111,6 +111,14 @@ def test_full_training_pipeline(tmp_path):
     config["data_ingestion"]["source"] = "parquet"
     config["data_ingestion"]["parquet_path"] = str(parquet_path)
     config["data_validation"]["fraud_csv_path"] = str(fraud_csv_path)
+    config["pipeline"]["artifact_root"] = str(tmp_path / "artifacts")
+    config["pipeline"]["current_dir"] = str(tmp_path / "artifacts" / "current")
+    # Use synthetic-data-appropriate gate thresholds so the test exercises the
+    # promoted-artifact code path without requiring an unrealistically strong
+    # model on the 48-player toy cohort.
+    config["data_validation"]["min_row_count"] = 100
+    config["model_evaluation"]["min_capture_rate_top_5pct"] = 0.0
+    config["model_evaluation"]["min_lift_top_5pct"] = 0.0
     temp_config_path = tmp_path / "config.yaml"
     with open(temp_config_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
@@ -158,7 +166,16 @@ def test_full_training_pipeline(tmp_path):
     with open(run_dir / "model_evaluation" / "evaluation_report.json") as f:
         ev = json.load(f)
     assert "capture_rates" in ev
+    assert "capture_stats" in ev
     assert "gate_passed" in ev
+    assert "combined_oos_capture_rate_top_5pct" in ev
+    assert "combined_oos_lift_top_5pct" in ev
+    # capture_stats has per-bucket lift / precision / capture_rate
+    combined_oos_stats = ev["capture_stats"]["combined_oos"]
+    for bucket in ["top_5pct", "top_50", "top_500"]:
+        assert bucket in combined_oos_stats, f"missing {bucket} in combined_oos capture_stats"
+        assert "lift" in combined_oos_stats[bucket]
+        assert "capture_rate" in combined_oos_stats[bucket]
 
     # --- Run metadata ---
     assert (run_dir / "run_metadata.json").exists()
@@ -168,7 +185,7 @@ def test_full_training_pipeline(tmp_path):
 
     # --- Promotion gate & current/ ---
     if ev["gate_passed"]:
-        current_dir = REPO_ROOT / "artifacts" / "current"
+        current_dir = tmp_path / "artifacts" / "current"
         assert (current_dir / "model_bundle.joblib").exists(), "model_bundle.joblib missing"
         bundle = joblib.load(current_dir / "model_bundle.joblib")
         assert "iso_forest" in bundle

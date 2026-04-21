@@ -65,8 +65,9 @@ tests/
 
 All tunable parameters live in `configs/`. Secrets go in `.env` (see `.env.example`).
 
-The default training source is now live MongoDB. Every training run refreshes `data_cache/fraud_modeling_pull.parquet`
-from MongoDB before validation and downstream processing so the cached parquet stays current.
+The default training source is live MongoDB. A standard training run pulls a bounded cohort from MongoDB,
+writes the raw pull into the run's ingestion artifact directory, validates it, and then continues through the
+rest of the pipeline. The parquet path remains available for controlled replays and local debugging.
 
 | File | Purpose |
 |---|---|

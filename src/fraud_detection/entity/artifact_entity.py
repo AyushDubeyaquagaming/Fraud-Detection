@@ -51,8 +51,12 @@ class ModelEvaluationArtifact:
     scored_players_path: Path
     capture_rate_table_path: Path
     evaluation_report_path: Path
-    combined_oos_top_20pct: int
     gate_passed: bool
+    # Primary gate metrics (Phase 2 rebaseline)
+    combined_oos_capture_rate_top_5pct: float
+    combined_oos_lift_top_5pct: float
+    # Retained for diagnostic/observability
+    combined_oos_top_20pct: int
 
 
 @dataclass

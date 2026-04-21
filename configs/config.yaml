@@ -6,7 +6,7 @@ pipeline:
   random_seed: 42
 
 data_ingestion:
-  source: "parquet"
+  source: "mongodb"
   parquet_path: "data_cache/fraud_modeling_pull.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
@@ -51,12 +51,31 @@ feature_engineering:
 batch_scoring:
   mode: "operational"
   require_labels: false
+  # Operational pre-filter applied at SCORING time (not during training). Excludes
+  # low-activity players whose scores are statistically unreliable. Training still
+  # sees the full cohort so the unsupervised scaler reflects the full population.
+  operational_filter:
+    enabled: true
+    min_draws_played: 10
+  # Alert queue size for batch scoring output (maps to analyst review capacity).
+  alert_queue_size: 50
 
 model_evaluation:
+  # Percentile buckets REPORTED in the evaluation output. The primary gate is at
+  # top_5pct; top_20pct is retained only for continuity with historical reports.
   threshold_percentiles: [0.01, 0.05, 0.10, 0.20]
+  # Fixed-count buckets that map to operational review capacity (weekly / monthly).
+  threshold_fixed_counts: [50, 500]
+  # Alert queue size written to alert_queue.csv.
+  alert_queue_size: 50
   risk_tier_p80: 0.80
   risk_tier_p95: 0.95
-  min_capture_top_20pct: 10
+  # --- Phase 2 rebaseline: primary gate is lift + capture_rate at top 5%. ---
+  # Cohort-size-independent thresholds that translate across 1K and 1M cohorts alike.
+  min_capture_rate_top_5pct: 0.40   # top 5% must catch >=40% of known fraud
+  min_lift_top_5pct: 5.0            # top 5% precision must be >=5x base rate
+  # Retained for diagnostic reporting only — not used as a gate after rebaseline.
+  min_capture_top_20pct: 0
 
 mlflow:
   tracking_uri_env_var: "MLFLOW_TRACKING_URI"

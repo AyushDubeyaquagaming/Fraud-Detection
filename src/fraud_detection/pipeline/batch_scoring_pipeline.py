@@ -10,7 +10,6 @@ from scipy.spatial.distance import mahalanobis
 
 from fraud_detection.constants.constants import (
     CONFIG_FILE_PATH,
-    CURRENT_DIR,
     MODEL_BUNDLE_FILE,
     REPO_ROOT,
 )
@@ -32,6 +31,11 @@ def _normalize_component(value: float, min_v: float, max_v: float) -> float:
     return float(np.clip((value - min_v) / (max_v - min_v), 0.0, 1.5))
 
 
+def _resolve_repo_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 class BatchScoringPipeline:
     def __init__(self, config_path: Path = CONFIG_FILE_PATH):
         self.config_path = config_path
@@ -40,14 +44,23 @@ class BatchScoringPipeline:
         logger.info("BatchScoringPipeline: starting")
         try:
             config = read_yaml(self.config_path)
+            current_dir = _resolve_repo_path(config["pipeline"]["current_dir"])
             batch_cfg = config.get("batch_scoring", {})
             mode = batch_cfg.get("mode", "operational")
             require_labels = batch_cfg.get("require_labels", False)
+            op_filter_cfg = batch_cfg.get("operational_filter", {}) or {}
+            op_filter_enabled = bool(op_filter_cfg.get("enabled", False))
+            op_min_draws = int(op_filter_cfg.get("min_draws_played", 0))
+            alert_queue_size = int(batch_cfg.get("alert_queue_size", 50))
 
-            logger.info("BatchScoringPipeline: mode=%s, require_labels=%s", mode, require_labels)
+            logger.info(
+                "BatchScoringPipeline: mode=%s, require_labels=%s, "
+                "operational_filter=%s (min_draws_played=%d), alert_queue_size=%d, current_dir=%s",
+                mode, require_labels, op_filter_enabled, op_min_draws, alert_queue_size, current_dir,
+            )
 
             # Load model bundle
-            bundle_path = CURRENT_DIR / MODEL_BUNDLE_FILE
+            bundle_path = current_dir / MODEL_BUNDLE_FILE
             if not bundle_path.exists():
                 raise FileNotFoundError(
                     f"Model bundle not found: {bundle_path}. Run training pipeline first."
@@ -91,12 +104,13 @@ class BatchScoringPipeline:
             fe_cfg = config["feature_engineering"]
 
             # Save raw_df temporarily for the ingestion artifact pattern
-            tmp_raw_path = CURRENT_DIR / "_tmp_scoring_raw.parquet"
+            current_dir.mkdir(parents=True, exist_ok=True)
+            tmp_raw_path = current_dir / "_tmp_scoring_raw.parquet"
             raw_df.to_parquet(tmp_raw_path, index=False)
 
             ingestion_artifact = DataIngestionArtifact(
                 raw_data_path=tmp_raw_path,
-                ingestion_report_path=CURRENT_DIR / "_tmp_ingestion_report.json",
+                ingestion_report_path=current_dir / "_tmp_ingestion_report.json",
                 row_count=len(raw_df),
                 member_count=int(raw_df["member_id"].nunique()) if "member_id" in raw_df.columns else 0,
                 source_type=ing_cfg["source"],
@@ -112,7 +126,7 @@ class BatchScoringPipeline:
                 log1p_cols=fe_cfg["log1p_cols"],
                 apply_pre_fraud_cutoff=(fe_mode == "training_eval"),
                 fraud_csv_path=REPO_ROOT / val_cfg["fraud_csv_path"],
-                output_dir=CURRENT_DIR / "_tmp_fe",
+                output_dir=current_dir / "_tmp_fe",
                 mode=fe_mode,
             )
             fe_artifact = FeatureEngineering(fe_config, ingestion_artifact).initiate_feature_engineering()
@@ -125,7 +139,7 @@ class BatchScoringPipeline:
                 make_style_frame,
             )
 
-            feat_cfg_path = CURRENT_DIR / "feature_pipeline_config.json"
+            feat_cfg_path = current_dir / "feature_pipeline_config.json"
             import json
             feature_columns = bundle.get("feature_columns", [])
             if feat_cfg_path.exists():
@@ -202,9 +216,26 @@ class BatchScoringPipeline:
             )
             player_df["source"] = f"batch_{mode}"
 
-            # Save outputs
-            scored_path = CURRENT_DIR / "hybrid_scored_players.parquet"
+            # Save full scored population BEFORE applying the operational filter so
+            # downstream analyses can always see the un-filtered view if needed.
+            scored_path = current_dir / "hybrid_scored_players.parquet"
             player_df.to_parquet(scored_path, index=False)
+
+            # Operational pre-filter: applied at scoring time only, not during training.
+            # Training still sees the full cohort so the unsupervised scaler reflects
+            # the full population baseline.
+            n_before_filter = len(player_df)
+            n_filtered_out = 0
+            if op_filter_enabled and "draws_played" in player_df.columns:
+                eligible_mask = player_df["draws_played"] >= op_min_draws
+                n_filtered_out = int((~eligible_mask).sum())
+                alert_source = player_df.loc[eligible_mask]
+                logger.info(
+                    "operational_filter: kept %d / %d players (min_draws_played=%d)",
+                    len(alert_source), n_before_filter, op_min_draws,
+                )
+            else:
+                alert_source = player_df
 
             # Alert queue (drop label columns for operational mode)
             alert_cols = [
@@ -213,13 +244,13 @@ class BatchScoringPipeline:
             ]
             if "primary_ccs_id" in player_df.columns:
                 alert_cols.insert(1, "primary_ccs_id")
-            alert_cols_available = [c for c in alert_cols if c in player_df.columns]
+            alert_cols_available = [c for c in alert_cols if c in alert_source.columns]
             alert_queue = (
-                player_df.sort_values("risk_score", ascending=False)[alert_cols_available]
-                .head(50)
+                alert_source.sort_values("risk_score", ascending=False)[alert_cols_available]
+                .head(alert_queue_size)
                 .reset_index(drop=True)
             )
-            alert_path = CURRENT_DIR / "alert_queue.csv"
+            alert_path = current_dir / "alert_queue.csv"
             alert_queue.to_csv(alert_path, index=False)
 
             # Evaluation summary (only if labels available)
@@ -227,6 +258,14 @@ class BatchScoringPipeline:
                 "mode": mode,
                 "scored_at": datetime.now(timezone.utc).isoformat(),
                 "total_players": len(player_df),
+                "operational_filter": {
+                    "enabled": op_filter_enabled,
+                    "min_draws_played": op_min_draws,
+                    "players_before_filter": n_before_filter,
+                    "players_after_filter": len(alert_source),
+                    "players_filtered_out": n_filtered_out,
+                },
+                "alert_queue_size": alert_queue_size,
                 "score_distribution": {
                     "mean": float(player_df["risk_score"].mean()),
                     "median": float(player_df["risk_score"].median()),
@@ -237,20 +276,42 @@ class BatchScoringPipeline:
 
             if mode == "replay_eval" and "event_fraud_flag" in player_df.columns:
                 labels = player_df["event_fraud_flag"].astype(int)
+                n_total = len(player_df)
+                total_fraud = int(labels.sum())
+                base_rate = total_fraud / n_total if n_total > 0 else 0.0
 
-                def capture(scores, pct):
-                    t = scores.quantile(1 - pct)
-                    return int(scores[labels == 1].ge(t).sum())
+                def stats_at_k(scores: pd.Series, k: int) -> dict:
+                    k = max(1, min(k, n_total))
+                    top_idx = scores.nlargest(k).index
+                    captured = int(labels.loc[top_idx].sum())
+                    cap_rate = captured / total_fraud if total_fraud > 0 else 0.0
+                    precision = captured / k
+                    lift = precision / base_rate if base_rate > 0 else 0.0
+                    return {
+                        "k": k,
+                        "captured_fraud": captured,
+                        "capture_rate": cap_rate,
+                        "precision": precision,
+                        "lift": lift,
+                    }
 
-                eval_summary["fraud_players"] = int(labels.sum())
+                eval_summary["fraud_players"] = total_fraud
+                eval_summary["base_rate"] = base_rate
+                scores = player_df["risk_score"]
+                eval_summary["capture_stats"] = {
+                    "top_1pct": stats_at_k(scores, max(1, int(n_total * 0.01))),
+                    "top_5pct": stats_at_k(scores, max(1, int(n_total * 0.05))),
+                    "top_10pct": stats_at_k(scores, max(1, int(n_total * 0.10))),
+                    "top_20pct": stats_at_k(scores, max(1, int(n_total * 0.20))),
+                    "top_50": stats_at_k(scores, 50),
+                    "top_500": stats_at_k(scores, 500),
+                }
+                # Legacy capture_rates (count-only) retained for backward compatibility.
                 eval_summary["capture_rates"] = {
-                    "top_1pct": capture(player_df["risk_score"], 0.01),
-                    "top_5pct": capture(player_df["risk_score"], 0.05),
-                    "top_10pct": capture(player_df["risk_score"], 0.10),
-                    "top_20pct": capture(player_df["risk_score"], 0.20),
+                    b: s["captured_fraud"] for b, s in eval_summary["capture_stats"].items()
                 }
 
-            eval_path = CURRENT_DIR / "hybrid_evaluation.json"
+            eval_path = current_dir / "hybrid_evaluation.json"
             write_json(eval_summary, eval_path)
 
             # Scoring report
@@ -258,6 +319,15 @@ class BatchScoringPipeline:
                 "run_at": datetime.now(timezone.utc).isoformat(),
                 "mode": mode,
                 "total_players": len(player_df),
+                "operational_filter": {
+                    "enabled": op_filter_enabled,
+                    "min_draws_played": op_min_draws,
+                    "players_before_filter": n_before_filter,
+                    "players_after_filter": len(alert_source),
+                    "players_filtered_out": n_filtered_out,
+                },
+                "alert_queue_size": alert_queue_size,
+                "alert_queue_rows": len(alert_queue),
                 "source": ing_cfg["source"],
                 "scored_path": str(scored_path),
                 "alert_path": str(alert_path),
@@ -265,7 +335,7 @@ class BatchScoringPipeline:
             if ing_cfg["source"] == "mongodb":
                 scoring_report["strategy_used"] = mongo_cfg.get("strategy", "date_window")
                 scoring_report["query_count"] = len(query_filters)
-            report_path = CURRENT_DIR / "batch_scoring_report.json"
+            report_path = current_dir / "batch_scoring_report.json"
             write_json(scoring_report, report_path)
 
             # Cleanup tmp files
@@ -279,7 +349,7 @@ class BatchScoringPipeline:
                 "BatchScoringPipeline: complete — %d players scored, alert_queue at %s",
                 len(player_df), alert_path,
             )
-            return CURRENT_DIR
+            return current_dir
 
         except FraudDetectionException:
             raise

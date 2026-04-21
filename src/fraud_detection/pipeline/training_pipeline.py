@@ -39,6 +39,11 @@ def _make_run_id() -> str:
     return f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
+def _resolve_repo_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 class TrainingPipeline:
     def __init__(self, config_path: Path = CONFIG_FILE_PATH):
         self.config_path = config_path
@@ -49,9 +54,9 @@ class TrainingPipeline:
         model_params = read_yaml(MODEL_PARAMS_FILE_PATH)
 
         run_id = _make_run_id()
-        artifact_root = REPO_ROOT / config_dict["pipeline"]["artifact_root"]
+        artifact_root = _resolve_repo_path(config_dict["pipeline"]["artifact_root"])
         run_dir = artifact_root / "runs" / run_id
-        current_dir = REPO_ROOT / config_dict["pipeline"]["current_dir"]
+        current_dir = _resolve_repo_path(config_dict["pipeline"]["current_dir"])
         random_seed = int(config_dict["pipeline"].get("random_seed", 42))
         ensure_dir(run_dir)
 
@@ -103,12 +108,18 @@ class TrainingPipeline:
             threshold_percentiles=eval_cfg["threshold_percentiles"],
             risk_tier_p80=float(eval_cfg["risk_tier_p80"]),
             risk_tier_p95=float(eval_cfg["risk_tier_p95"]),
-            min_capture_top_20pct=int(eval_cfg["min_capture_top_20pct"]),
             output_dir=run_dir / "model_evaluation",
+            min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
+            min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
+            threshold_fixed_counts=list(eval_cfg.get("threshold_fixed_counts", [50, 500])),
+            alert_queue_size=int(eval_cfg.get("alert_queue_size", 50)),
+            min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
         )
         model_pusher_config = ModelPusherConfig(
             current_dir=current_dir,
-            min_capture_top_20pct=int(eval_cfg["min_capture_top_20pct"]),
+            min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
+            min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
+            min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
         )
 
         # MLflow setup (non-fatal)
@@ -200,6 +211,8 @@ class TrainingPipeline:
                     "combined_oos_top_5pct": capture.get("top_5pct", 0),
                     "combined_oos_top_10pct": capture.get("top_10pct", 0),
                     "combined_oos_top_20pct": capture.get("top_20pct", 0),
+                    "combined_oos_capture_rate_top_5pct": eval_artifact.combined_oos_capture_rate_top_5pct,
+                    "combined_oos_lift_top_5pct": eval_artifact.combined_oos_lift_top_5pct,
                     "gate_passed": int(eval_artifact.gate_passed),
                 })
                 log_artifact_safe(str(eval_artifact.evaluation_report_path))

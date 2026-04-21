@@ -1,11 +1,14 @@
 #!/usr/bin/env python
-"""Audit script: verify artifacts/current/ is internally consistent.
+"""Audit script: verify a promoted artifact directory is internally consistent.
 
 Usage:
     python scripts/audit_artifacts.py
+    python scripts/audit_artifacts.py --config configs/config.yaml
+    python scripts/audit_artifacts.py --artifact-dir artifacts/current
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -15,8 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import joblib
 import pandas as pd
 
-from fraud_detection.constants.constants import CURRENT_DIR, REPO_ROOT
+from fraud_detection.constants.constants import CONFIG_FILE_PATH, CURRENT_DIR, REPO_ROOT
 from fraud_detection.logger import get_logger
+from fraud_detection.utils.common import read_yaml
 
 logger = get_logger(__name__)
 
@@ -45,7 +49,38 @@ def warn(name: str, detail: str = "") -> dict:
     return {"check": name, "status": WARN, "detail": detail}
 
 
+def _resolve_artifact_dir(config_path: Path, artifact_dir_arg: str | None) -> Path:
+    if artifact_dir_arg:
+        artifact_dir = Path(artifact_dir_arg)
+        if not artifact_dir.is_absolute():
+            artifact_dir = REPO_ROOT / artifact_dir
+        return artifact_dir
+
+    config = read_yaml(config_path)
+    configured_dir = config.get("pipeline", {}).get("current_dir")
+    if configured_dir:
+        configured_path = Path(configured_dir)
+        return configured_path if configured_path.is_absolute() else REPO_ROOT / configured_path
+    return CURRENT_DIR
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Audit a promoted artifact directory.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_FILE_PATH,
+        help="Path to config.yaml used to resolve pipeline.current_dir.",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="Explicit artifact directory to audit. Overrides pipeline.current_dir.",
+    )
+    args = parser.parse_args()
+    artifact_dir = _resolve_artifact_dir(args.config, args.artifact_dir)
+
     print("\n" + "=" * 70)
     print("Fraud Detection Artifact Audit")
     print("=" * 70)
@@ -53,10 +88,10 @@ def main() -> int:
     results = []
 
     # 1. Current directory exists
-    results.append(check("current_dir_exists", CURRENT_DIR.exists(), str(CURRENT_DIR)))
+    results.append(check("current_dir_exists", artifact_dir.exists(), str(artifact_dir)))
 
     # 2. model_bundle.joblib exists and loads
-    bundle_path = CURRENT_DIR / "model_bundle.joblib"
+    bundle_path = artifact_dir / "model_bundle.joblib"
     bundle_exists = bundle_path.exists()
     results.append(check("model_bundle_exists", bundle_exists, str(bundle_path)))
 
@@ -78,7 +113,7 @@ def main() -> int:
             results.append(check("model_bundle_loads", False, str(e)))
 
     # 3. hybrid_scored_players.parquet exists and has required columns
-    scored_path = CURRENT_DIR / "hybrid_scored_players.parquet"
+    scored_path = artifact_dir / "hybrid_scored_players.parquet"
     scored_exists = scored_path.exists()
     results.append(check("scored_players_exists", scored_exists))
     if scored_exists:
@@ -95,7 +130,7 @@ def main() -> int:
             results.append(check("scored_players_reads", False, str(e)))
 
     # 4. alert_queue.csv exists
-    alert_path = CURRENT_DIR / "alert_queue.csv"
+    alert_path = artifact_dir / "alert_queue.csv"
     alert_exists = alert_path.exists()
     results.append(check("alert_queue_exists", alert_exists))
     if alert_exists:
@@ -106,7 +141,7 @@ def main() -> int:
             results.append(check("alert_queue_reads", False, str(e)))
 
     # 5. hybrid_evaluation.json exists and has expected fields
-    eval_path = CURRENT_DIR / "hybrid_evaluation.json"
+    eval_path = artifact_dir / "hybrid_evaluation.json"
     eval_exists = eval_path.exists()
     results.append(check("evaluation_json_exists", eval_exists))
     if eval_exists:
@@ -119,7 +154,7 @@ def main() -> int:
             results.append(check("evaluation_json_reads", False, str(e)))
 
     # 6. promotion_metadata.json
-    promo_path = CURRENT_DIR / "promotion_metadata.json"
+    promo_path = artifact_dir / "promotion_metadata.json"
     promo_exists = promo_path.exists()
     results.append(check("promotion_metadata_exists", promo_exists))
     if promo_exists:
@@ -127,6 +162,16 @@ def main() -> int:
             with open(promo_path) as f:
                 promo = json.load(f)
             results.append(check("promotion_gate_passed", promo.get("gate_passed", False), str(promo.get("gate_passed"))))
+            # Phase 2 rebaseline — report new primary gate metrics when present.
+            cap5 = promo.get("combined_oos_capture_rate_top_5pct")
+            lift5 = promo.get("combined_oos_lift_top_5pct")
+            if cap5 is not None or lift5 is not None:
+                results.append(
+                    warn(
+                        "promotion_gate_metrics",
+                        f"capture_rate_top_5pct={cap5} lift_top_5pct={lift5}",
+                    )
+                )
         except Exception as e:
             results.append(check("promotion_metadata_reads", False, str(e)))
 

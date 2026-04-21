@@ -234,6 +234,22 @@ data_cache/
 notebook/data_cache/
 *.parquet
 
+# Generated audit / diagnostic outputs
+audit_gate_report.md
+feature_engineering_audit_report.md
+label_matching_audit_report.md
+model_training_audit_report.md
+final_verification_report.md
+gate_documentation.md
+diagnostic_feature_separation.csv
+diagnostic_feature_separation_live.csv
+diagnostic_fraud_label_matching.csv
+diagnostic_fraud_label_matching.summary.json
+audit_and_rebaseline_plan.md
+
+# Local MLflow tracking state
+mlruns/
+
 # MLOps pipeline outputs (gitignored)
 artifacts/runs/
 artifacts/current/

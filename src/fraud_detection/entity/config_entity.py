@@ -53,14 +53,26 @@ class ModelEvaluationConfig:
     threshold_percentiles: list[float]
     risk_tier_p80: float
     risk_tier_p95: float
-    min_capture_top_20pct: int
     output_dir: Path
+    # Phase 2 rebaseline — primary gate is lift + capture_rate at top 5%.
+    min_capture_rate_top_5pct: float = 0.40
+    min_lift_top_5pct: float = 5.0
+    # Fixed-count thresholds (top 50/500) reported for operational sizing.
+    threshold_fixed_counts: list[int] = field(default_factory=lambda: [50, 500])
+    # Alert queue size for the per-run alert_queue.csv output.
+    alert_queue_size: int = 50
+    # Retained for diagnostic reporting only — NOT used as gate.
+    min_capture_top_20pct: int = 0
 
 
 @dataclass
 class ModelPusherConfig:
     current_dir: Path
-    min_capture_top_20pct: int
+    # Phase 2 rebaseline — primary gate is lift + capture_rate at top 5%.
+    min_capture_rate_top_5pct: float = 0.40
+    min_lift_top_5pct: float = 5.0
+    # Retained for diagnostic reporting only — NOT used as gate.
+    min_capture_top_20pct: int = 0
 
 
 @dataclass

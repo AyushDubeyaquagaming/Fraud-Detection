@@ -2,10 +2,26 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from fraud_detection.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _redact_uri_for_logs(uri: str) -> str:
+    if not uri or "://" not in uri:
+        return uri
+
+    parts = urlsplit(uri)
+    hostname = parts.hostname or ""
+    port = f":{parts.port}" if parts.port is not None else ""
+    if parts.username or parts.password:
+        netloc = f"***:***@{hostname}{port}" if hostname else "***:***"
+    else:
+        netloc = parts.netloc
+
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def get_tracking_uri() -> str:
@@ -37,7 +53,12 @@ def setup_mlflow(tracking_uri: str, experiment_name: str) -> str:
 
         mlflow.set_tracking_uri(tracking_uri)
         exp_id = get_or_create_experiment(experiment_name)
-        logger.info("MLflow tracking URI: %s | experiment: %s (id=%s)", tracking_uri, experiment_name, exp_id)
+        logger.info(
+            "MLflow tracking URI: %s | experiment: %s (id=%s)",
+            _redact_uri_for_logs(tracking_uri),
+            experiment_name,
+            exp_id,
+        )
         return exp_id
     except Exception as e:
         logger.warning("MLflow setup failed: %s — falling back to local mlruns", e)

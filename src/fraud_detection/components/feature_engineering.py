@@ -147,14 +147,32 @@ def _mode_val(series: pd.Series):
 # ---------------------------------------------------------------------------
 
 class FeatureEngineering:
-    def __init__(self, config: FeatureEngineeringConfig, ingestion_artifact: DataIngestionArtifact):
+    def __init__(
+        self,
+        config: FeatureEngineeringConfig,
+        ingestion_artifact: DataIngestionArtifact,
+        _force_mode: str = "auto",
+    ):
         self.config = config
         self.ingestion_artifact = ingestion_artifact
+        if _force_mode not in {"auto", "in_memory", "bucketed"}:
+            raise ValueError(
+                f"_force_mode must be one of 'auto', 'in_memory', 'bucketed'; got {_force_mode!r}"
+            )
+        self._force_mode = _force_mode
 
     def initiate_feature_engineering(self) -> FeatureEngineeringArtifact:
-        logger.info("FeatureEngineering: starting (mode=%s)", self.config.mode)
+        logger.info(
+            "FeatureEngineering: starting (mode=%s, force_mode=%s)",
+            self.config.mode, self._force_mode,
+        )
         try:
             ensure_dir(self.config.output_dir)
+
+            if self._force_mode == "in_memory":
+                return self._initiate_feature_engineering_in_memory()
+            if self._force_mode == "bucketed":
+                return self._initiate_feature_engineering_bucketed()
 
             if self.ingestion_artifact.row_count > FEATURE_ENGINEERING_IN_MEMORY_MAX_ROWS:
                 return self._initiate_feature_engineering_bucketed()
@@ -539,14 +557,22 @@ class FeatureEngineering:
             history_df = df.copy()
             return history_df, len(fraud_players), 0
 
-        # Compute first fraud event per player
-        event_match_df = df.loc[df["event_label"] == 1, ["member_id", "draw_id", "ts"]].copy()
+        # Compute first fraud event per player.
+        # The earliest row is selected by (ts, draw_id) sort with NaT last, so
+        # first_fraud_ts and first_fraud_draw_id both come from the SAME event row.
+        # Using independent min() per column would mix fields from different rows
+        # whenever a member has multiple fraud events and the earliest timestamp
+        # is not on the same row as the lowest draw_id.
+        event_match_df = (
+            df.loc[df["event_label"] == 1, ["member_id", "draw_id", "ts"]]
+            .sort_values(["member_id", "ts", "draw_id"], na_position="last")
+        )
         first_fraud = (
-            event_match_df.sort_values(["member_id", "ts", "draw_id"])
+            event_match_df
             .groupby("member_id", as_index=False)
             .agg(
-                first_fraud_ts=("ts", "min"),
-                first_fraud_draw_id=("draw_id", "min"),
+                first_fraud_ts=("ts", "first"),
+                first_fraud_draw_id=("draw_id", "first"),
             )
         )
         df = df.merge(
