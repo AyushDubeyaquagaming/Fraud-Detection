@@ -21,6 +21,10 @@ case "$1" in
   shell)
     exec /bin/sh
     ;;
+  serve)
+    shift
+    exec python scripts/run_api.py --host 0.0.0.0 --port "${API_PORT:-8000}" "$@"
+    ;;
   worker)
     shift
     exec prefect worker start --pool "${PREFECT_POOL_NAME:-fraud-pool}" "$@"

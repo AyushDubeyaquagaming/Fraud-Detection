@@ -68,6 +68,8 @@ class ModelEvaluationConfig:
 @dataclass
 class ModelPusherConfig:
     current_dir: Path
+    manifest_file: str = "serving_manifest.json"
+    model_version: str = "hybrid_v1"
     # Phase 2 rebaseline — primary gate is lift + capture_rate at top 5%.
     min_capture_rate_top_5pct: float = 0.40
     min_lift_top_5pct: float = 5.0

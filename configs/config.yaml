@@ -82,6 +82,14 @@ mlflow:
   experiment_name: "fraud_detection_hybrid"
   registered_model_name: "fraud_detection_hybrid"
 
+serving:
+  artifact_provider: "local_disk"
+  current_dir: "artifacts/current"
+  manifest_file: "serving_manifest.json"
+  model_version: "hybrid_v1"
+  host: "127.0.0.1"
+  port: 8000
+
 monitoring:
   enabled: true
   reports_dir: "monitoring"

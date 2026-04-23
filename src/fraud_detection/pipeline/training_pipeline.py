@@ -67,6 +67,7 @@ class TrainingPipeline:
         fe_cfg = config_dict["feature_engineering"]
         eval_cfg = config_dict["model_evaluation"]
         mp_cfg = model_params
+        serving_cfg = config_dict.get("serving", {})
 
         # Build component configs
         iso_params = dict(mp_cfg["isolation_forest"])
@@ -119,6 +120,8 @@ class TrainingPipeline:
         )
         model_pusher_config = ModelPusherConfig(
             current_dir=current_dir,
+            manifest_file=str(serving_cfg.get("manifest_file", "serving_manifest.json")),
+            model_version=str(serving_cfg.get("model_version", "hybrid_v1")),
             min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
             min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
             min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),

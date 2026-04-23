@@ -145,10 +145,11 @@ class ModelPusher:
             }
             write_json(feat_config, self.config.current_dir / "feature_pipeline_config.json")
 
+            promoted_at = datetime.now(timezone.utc).isoformat()
             metadata = {
                 "gate_passed": True,
                 "run_dir": str(run_dir),
-                "promoted_at": datetime.now(timezone.utc).isoformat(),
+                "promoted_at": promoted_at,
                 "git_sha": _git_sha(),
                 "capture_rates": eval_report.get("capture_rates", {}),
                 "capture_stats": eval_report.get("capture_stats", {}),
@@ -161,6 +162,21 @@ class ModelPusher:
                 "combined_oos_top_20pct": self.evaluation_artifact.combined_oos_top_20pct,
             }
             write_json(metadata, promotion_metadata_path)
+
+            # Write serving manifest atomically — only on successful promotion.
+            # The API reads this file to find the immutable promoted run directory.
+            run_id = run_dir.name
+            serving_manifest = {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "promoted_at": promoted_at,
+                "git_sha": _git_sha(),
+                "model_version": self.config.model_version,
+            }
+            manifest_path = self.config.current_dir / self.config.manifest_file
+            tmp_manifest_path = self.config.current_dir / f"{self.config.manifest_file}.tmp"
+            write_json(serving_manifest, tmp_manifest_path)
+            tmp_manifest_path.replace(manifest_path)
 
             logger.info("ModelPusher: promoted successfully to %s", self.config.current_dir)
             return ModelPusherArtifact(

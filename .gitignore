@@ -19,6 +19,7 @@ hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
 artifacts/
 DEPLOYMENT.md
+fastapi_serving_plan.md
 developer_validation_guide.txt
 # C extensions
 *.so
