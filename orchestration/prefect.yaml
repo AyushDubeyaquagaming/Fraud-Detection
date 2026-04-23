@@ -1,0 +1,43 @@
+# Prefect deployment spec for the fraud detection pipeline.
+# Prerequisites:
+#   1. pip install prefect>=2.20.0,<3.0.0
+#   2. prefect cloud login   (or set PREFECT_API_URL + PREFECT_API_KEY in .env)
+#   3. prefect work-pool create fraud-pool --type process
+#   4. prefect deploy --prefect-file orchestration/prefect.yaml
+
+name: fraud-detection
+
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: .
+
+deployments:
+  - name: training-weekly
+    flow: orchestration/flows/training_flow.py:training_flow
+    description: "Weekly fraud model retraining with monitoring and promotion gate"
+    parameters:
+      config_path: "configs/config.yaml"
+    schedules:
+      - cron: "0 2 * * 1"       # every Monday at 02:00 UTC
+        timezone: UTC
+        active: true
+    work_pool:
+      name: fraud-pool
+    tags:
+      - fraud-detection
+      - training
+
+  - name: batch-scoring-daily
+    flow: orchestration/flows/batch_scoring_flow.py:batch_scoring_flow
+    description: "Daily batch scoring against the promoted model bundle"
+    parameters:
+      config_path: "configs/config.yaml"
+    schedules:
+      - cron: "0 4 * * *"       # every day at 04:00 UTC
+        timezone: UTC
+        active: true
+    work_pool:
+      name: fraud-pool
+    tags:
+      - fraud-detection
+      - scoring

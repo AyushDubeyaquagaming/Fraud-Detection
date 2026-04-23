@@ -76,6 +76,16 @@ class ModelPusherConfig:
 
 
 @dataclass
+class MonitoringConfig:
+    enabled: bool
+    reports_dir: str
+    sample_size: int
+    monitored_features: list[str]
+    drift_threshold: float
+    reference_from_current_metadata: bool
+
+
+@dataclass
 class PipelineConfig:
     artifact_root: Path
     run_id: str

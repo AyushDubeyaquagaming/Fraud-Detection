@@ -1,0 +1,52 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local artifacts and run outputs
+artifacts/
+mlruns/
+logs/
+data_cache/
+
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Notebooks
+notebook/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docs and planning files
+*.md
+!README.md
+monitoring_prefect_docker_plan.md
+mlops_implementation_plan.md
+bounded_ingestion_plan.md
+
+# Demo and diagnostic scripts (not needed in container)
+demo_scripts/
+diagnostic_*.csv
+diagnostic_*.json
+audit_*.py
+rebuild_*.py
+hybrid_inference.py
+streamlit_*.py

@@ -81,3 +81,19 @@ mlflow:
   tracking_uri_env_var: "MLFLOW_TRACKING_URI"
   experiment_name: "fraud_detection_hybrid"
   registered_model_name: "fraud_detection_hybrid"
+
+monitoring:
+  enabled: true
+  reports_dir: "monitoring"
+  sample_size: 50000
+  reference_from_current_metadata: true
+  monitored_features:
+    - template_reuse_ratio
+    - avg_entropy
+    - avg_tiny_bet_ratio
+    - total_staked
+    - avg_stake_per_draw
+    - draws_played
+    - avg_inter_draw_seconds
+    - positive_draw_rate
+  drift_threshold: 0.3

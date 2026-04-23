@@ -15,6 +15,7 @@ from fraud_detection.components.feature_engineering import FeatureEngineering
 from fraud_detection.components.model_evaluation import ModelEvaluation
 from fraud_detection.components.model_pusher import ModelPusher
 from fraud_detection.components.model_training import ModelTraining
+from fraud_detection.components.monitoring import Monitoring
 from fraud_detection.constants.constants import (
     CONFIG_FILE_PATH,
     MODEL_PARAMS_FILE_PATH,
@@ -27,6 +28,7 @@ from fraud_detection.entity.config_entity import (
     ModelEvaluationConfig,
     ModelPusherConfig,
     ModelTrainingConfig,
+    MonitoringConfig,
 )
 from fraud_detection.exception import FraudDetectionException
 from fraud_detection.logger import get_logger
@@ -122,6 +124,16 @@ class TrainingPipeline:
             min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
         )
 
+        mon_cfg_raw = config_dict.get("monitoring", {})
+        monitoring_config = MonitoringConfig(
+            enabled=bool(mon_cfg_raw.get("enabled", True)),
+            reports_dir=str(mon_cfg_raw.get("reports_dir", "monitoring")),
+            sample_size=int(mon_cfg_raw.get("sample_size", 50000)),
+            monitored_features=list(mon_cfg_raw.get("monitored_features", [])),
+            drift_threshold=float(mon_cfg_raw.get("drift_threshold", 0.3)),
+            reference_from_current_metadata=bool(mon_cfg_raw.get("reference_from_current_metadata", True)),
+        )
+
         # MLflow setup (non-fatal)
         load_dotenv(REPO_ROOT / ".env")
         mlflow_cfg = config_dict.get("mlflow", {})
@@ -152,15 +164,15 @@ class TrainingPipeline:
         pusher_artifact = None
         try:
             # --- Step 1: Data Ingestion ---
-            logger.info("[1/6] DataIngestion")
+            logger.info("[1/7] DataIngestion")
             ingestion_artifact = DataIngestion(data_ingestion_config).initiate_data_ingestion()
 
             # --- Step 2: Data Validation ---
-            logger.info("[2/6] DataValidation")
+            logger.info("[2/7] DataValidation")
             DataValidation(data_validation_config, ingestion_artifact).initiate_data_validation()
 
             # --- Step 3: Feature Engineering ---
-            logger.info("[3/6] FeatureEngineering")
+            logger.info("[3/7] FeatureEngineering")
             fe_artifact = FeatureEngineering(
                 feature_engineering_config, ingestion_artifact
             ).initiate_feature_engineering()
@@ -181,7 +193,7 @@ class TrainingPipeline:
                 })
 
             # --- Step 4: Model Training ---
-            logger.info("[4/6] ModelTraining")
+            logger.info("[4/7] ModelTraining")
             training_artifact = ModelTraining(
                 model_training_config, fe_artifact
             ).initiate_model_training()
@@ -197,7 +209,7 @@ class TrainingPipeline:
                 log_artifact_safe(str(training_artifact.training_report_path))
 
             # --- Step 5: Model Evaluation ---
-            logger.info("[5/6] ModelEvaluation")
+            logger.info("[5/7] ModelEvaluation")
             eval_artifact = ModelEvaluation(
                 model_evaluation_config, training_artifact
             ).initiate_model_evaluation()
@@ -220,8 +232,25 @@ class TrainingPipeline:
                 if plots_dir.exists():
                     log_artifacts_safe(str(plots_dir))
 
-            # --- Step 6: Model Pusher ---
-            logger.info("[6/6] ModelPusher")
+            # --- Step 6: Monitoring (non-blocking) ---
+            logger.info("[6/7] Monitoring")
+            monitoring_artifact = Monitoring(
+                config=monitoring_config,
+                current_dir=current_dir,
+                ingestion_artifact=ingestion_artifact,
+                fe_artifact=fe_artifact,
+                eval_artifact=eval_artifact,
+                run_dir=run_dir,
+            ).initiate_monitoring()
+
+            if mlflow_active and monitoring_artifact.monitoring_completed and monitoring_artifact.reports_dir:
+                from fraud_detection.utils.mlflow_utils import log_artifacts_safe, log_artifact_safe
+                log_artifacts_safe(str(monitoring_artifact.reports_dir))
+                if monitoring_artifact.drift_summary_path:
+                    log_artifact_safe(str(monitoring_artifact.drift_summary_path))
+
+            # --- Step 7: Model Pusher ---
+            logger.info("[7/7] ModelPusher")
             pusher_artifact = ModelPusher(
                 model_pusher_config, training_artifact, eval_artifact
             ).initiate_model_pusher()

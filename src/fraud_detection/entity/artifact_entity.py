@@ -64,3 +64,13 @@ class ModelPusherArtifact:
     model_bundle_path: Path
     promotion_metadata_path: Path
     promoted: bool
+
+
+@dataclass
+class MonitoringArtifact:
+    reports_dir: Path | None
+    data_drift_report_path: Path | None
+    feature_drift_report_path: Path | None
+    prediction_drift_report_path: Path | None
+    drift_summary_path: Path | None
+    monitoring_completed: bool
