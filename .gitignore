@@ -18,7 +18,10 @@ analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
 artifacts/
+live_scoring_plan.md
 DEPLOYMENT.md
+live_scoring_handoff_notes.txt
+live_scoring_developer_checklist.txt
 fastapi_serving_plan.md
 developer_validation_guide.txt
 # C extensions

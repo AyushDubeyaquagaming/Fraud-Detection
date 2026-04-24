@@ -44,6 +44,16 @@ TRAINING_HISTORY_COLUMNS = [
 ]
 HISTORY_INT_COLUMNS = ["event_label", "first_fraud_draw_id"]
 HISTORY_TS_COLUMNS = ["ts", "first_fraud_ts"]
+TIMESTAMP_CANDIDATES = [
+    "createdAt.$date",
+    "createdat.$date",
+    "trans_date.$date",
+    "updatedAt.$date",
+    "ts",
+    "createdAt",
+    "trans_date",
+    "updatedAt",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +134,8 @@ def _coerce_datetime(value: Any):
 
 
 def _normalize_timestamp(df: pd.DataFrame) -> pd.Series:
-    candidates = [
-        "createdAt.$date", "createdat.$date", "trans_date.$date",
-        "updatedAt.$date", "ts", "createdAt", "trans_date", "updatedAt",
-    ]
     ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
-    for col in candidates:
+    for col in TIMESTAMP_CANDIDATES:
         if col not in df.columns:
             continue
         series = pd.to_datetime(df[col].map(_coerce_datetime), utc=True, errors="coerce")
@@ -140,6 +146,219 @@ def _normalize_timestamp(df: pd.DataFrame) -> pd.Series:
 def _mode_val(series: pd.Series):
     modes = series.mode()
     return modes.iloc[0] if len(modes) else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Module-level feature helpers (shared by training bulk path and serving path)
+# ---------------------------------------------------------------------------
+
+def _normalize_raw_df(
+    raw_df: pd.DataFrame,
+    compute_inter_draw_seconds: bool = True,
+    sort_rows: bool = True,
+) -> pd.DataFrame:
+    """Normalize a raw draw DataFrame — identical logic to FeatureEngineering._normalize()."""
+    df = raw_df.copy()
+    df["member_id"] = df["member_id"].astype(str).str.strip().str.upper()
+    df["draw_id"] = pd.to_numeric(df["draw_id"], errors="coerce").astype("Int64")
+    df["ts"] = _normalize_timestamp(df)
+    df["bets_parsed"] = df["bets"].apply(parse_bets)
+
+    draw_feats = pd.DataFrame(df["bets_parsed"].apply(compute_draw_features).tolist())
+    df = pd.concat([df.reset_index(drop=True), draw_feats.reset_index(drop=True)], axis=1)
+
+    if "win_points" in df.columns:
+        df["win_points"] = pd.to_numeric(df["win_points"], errors="coerce").fillna(0.0)
+    else:
+        df["win_points"] = 0.0
+
+    if "total_bet_amount" in df.columns:
+        df["total_bet_amount"] = pd.to_numeric(df["total_bet_amount"], errors="coerce").fillna(0.0)
+    else:
+        df["total_bet_amount"] = 0.0
+
+    if "session_id" in df.columns:
+        df["session_id"] = pd.to_numeric(df["session_id"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["session_id"] = 0
+
+    if "ccs_id" in df.columns:
+        df["ccs_id"] = df["ccs_id"].astype(str)
+    else:
+        df["ccs_id"] = ""
+
+    df["net_result"] = df["win_points"] - df["total_bet_amount"]
+    df["bet_template"] = df["bets_parsed"].apply(make_bet_template_key)
+    df = df.drop(columns=["bets_parsed"])
+
+    if sort_rows:
+        df = df.sort_values(["member_id", "ts", "draw_id"])
+    if compute_inter_draw_seconds:
+        if not sort_rows:
+            df = df.sort_values(["member_id", "ts", "draw_id"])
+        df["inter_draw_seconds"] = df.groupby("member_id")["ts"].diff().dt.total_seconds()
+
+    df["fraud_event_key"] = df["draw_id"].astype(str) + "|" + df["member_id"]
+    return df
+
+
+def _aggregate_player_features_from_history(history_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate player-level features from normalized draw history."""
+    if history_df.empty:
+        return pd.DataFrame(columns=["member_id"])
+
+    player_agg = history_df.groupby("member_id").agg(
+        draws_played=("draw_id", "nunique"),
+        sessions_played=("session_id", "nunique"),
+        active_days=("ts", lambda x: x.dt.date.nunique()),
+        total_staked=("total_bet_amount", "sum"),
+        avg_stake_per_draw=("total_bet_amount", "mean"),
+        median_stake_per_draw=("total_bet_amount", "median"),
+        stake_std=("total_bet_amount", "std"),
+        max_stake_per_draw=("total_bet_amount", "max"),
+        min_stake_per_draw=("total_bet_amount", "min"),
+        avg_inter_draw_seconds=("inter_draw_seconds", "mean"),
+        std_inter_draw_seconds=("inter_draw_seconds", "std"),
+        median_inter_draw_seconds=("inter_draw_seconds", "median"),
+        min_inter_draw_seconds=("inter_draw_seconds", "min"),
+        avg_nonzero_bets_per_draw=("nonzero_bets_per_draw", "mean"),
+        median_nonzero_bets_per_draw=("nonzero_bets_per_draw", "median"),
+        avg_max_bet_share=("max_bet_share_in_draw", "mean"),
+        median_max_bet_share=("max_bet_share_in_draw", "median"),
+        avg_bet_amount_std_in_draw=("bet_amount_std_in_draw", "mean"),
+        avg_bet_amount_mean_in_draw=("bet_amount_mean_in_draw", "mean"),
+        avg_entropy=("entropy_in_draw", "mean"),
+        entropy_std=("entropy_in_draw", "std"),
+        avg_gini=("gini_in_draw", "mean"),
+        gini_std=("gini_in_draw", "std"),
+        avg_tiny_bet_ratio=("tiny_bet_ratio_in_draw", "mean"),
+        avg_position_coverage=("position_coverage", "mean"),
+        unique_templates=("bet_template", "nunique"),
+        avg_net_result=("net_result", "mean"),
+        median_net_result=("net_result", "median"),
+        std_net_result=("net_result", "std"),
+        total_net_result=("net_result", "sum"),
+        positive_draw_rate=("net_result", lambda x: (x > 0).mean()),
+        primary_ccs_id=("ccs_id", _mode_val),
+    ).reset_index()
+
+    for col in ["stake_std", "entropy_std", "gini_std", "std_net_result", "std_inter_draw_seconds"]:
+        player_agg[col] = player_agg[col].fillna(0)
+    for col in ["avg_inter_draw_seconds", "median_inter_draw_seconds", "min_inter_draw_seconds"]:
+        player_agg[col] = player_agg[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    player_agg["active_days"] = pd.to_numeric(player_agg["active_days"], errors="coerce").fillna(0).astype(int)
+
+    player_agg["stake_cv"] = (
+        player_agg["stake_std"] / player_agg["avg_stake_per_draw"].replace(0, np.nan)
+    ).fillna(0)
+    player_agg["template_reuse_ratio"] = (
+        1 - (player_agg["unique_templates"] / player_agg["draws_played"].replace(0, np.nan))
+    ).fillna(0).clip(lower=0)
+    player_agg["pnl_volatility"] = (
+        player_agg["std_net_result"] / player_agg["avg_stake_per_draw"].replace(0, np.nan)
+    ).fillna(0)
+    player_agg["win_rate"] = player_agg["positive_draw_rate"]
+    player_agg["draws_per_active_day"] = (
+        player_agg["draws_played"] / player_agg["active_days"].replace(0, np.nan)
+    ).fillna(0)
+
+    session_draws = (
+        history_df.groupby(["member_id", "session_id"])["draw_id"]
+        .nunique()
+        .reset_index(name="draws_in_session")
+    )
+    avg_session_draws = (
+        session_draws.groupby("member_id")["draws_in_session"]
+        .mean()
+        .reset_index(name="avg_draws_per_session")
+    )
+    player_agg = player_agg.merge(avg_session_draws, on="member_id", how="left")
+    player_agg["avg_draws_per_session"] = player_agg["avg_draws_per_session"].fillna(1)
+
+    max_reuse = (
+        history_df.groupby("member_id")["bet_template"]
+        .apply(lambda vals: vals.value_counts().iloc[0] if len(vals) else 1)
+        .reset_index(name="max_template_reuse")
+    )
+    player_agg = player_agg.merge(max_reuse, on="member_id", how="left")
+
+    ccs_player_count = (
+        history_df.groupby("ccs_id")["member_id"].nunique().reset_index(name="ccs_player_count")
+    )
+    ccs_totals = (
+        history_df.groupby("ccs_id")
+        .agg(ccs_total_staked=("total_bet_amount", "sum"), ccs_avg_bet=("total_bet_amount", "mean"))
+        .reset_index()
+    )
+    player_agg = (
+        player_agg
+        .merge(ccs_player_count.rename(columns={"ccs_id": "primary_ccs_id"}), on="primary_ccs_id", how="left")
+        .merge(ccs_totals.rename(columns={"ccs_id": "primary_ccs_id"}), on="primary_ccs_id", how="left")
+    )
+    for col in ["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]:
+        player_agg[col] = player_agg[col].fillna(0)
+
+    return player_agg
+
+
+def build_ccs_stats_lookup(history_df: pd.DataFrame) -> pd.DataFrame:
+    """Build frozen CCS cohort stats from training history, indexed by ccs_id.
+
+    Returns a DataFrame indexed by ccs_id with columns:
+    ccs_player_count, ccs_total_staked, ccs_avg_bet.
+    """
+    ccs_counts = (
+        history_df.groupby("ccs_id")["member_id"].nunique().reset_index(name="ccs_player_count")
+    )
+    ccs_sums = (
+        history_df.groupby("ccs_id")
+        .agg(ccs_total_staked=("total_bet_amount", "sum"), ccs_avg_bet=("total_bet_amount", "mean"))
+        .reset_index()
+    )
+    lookup = ccs_counts.merge(ccs_sums, on="ccs_id", how="outer")
+    lookup[["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]] = (
+        lookup[["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]].fillna(0)
+    )
+    return lookup.set_index("ccs_id")
+
+
+def compute_single_player_features(
+    raw_df: pd.DataFrame,
+    ccs_stats_lookup: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Compute features for one player's raw draws in a training-compatible way.
+
+    Member-local features are computed directly from raw_df.
+    CCS cohort features (ccs_player_count, ccs_total_staked, ccs_avg_bet) are
+    taken from the frozen ccs_stats_lookup so they reflect the training cohort,
+    not just this player's single-member slice.
+    """
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    normalized = _normalize_raw_df(raw_df, compute_inter_draw_seconds=True, sort_rows=True)
+    if normalized.empty:
+        return pd.DataFrame()
+
+    player_features = _aggregate_player_features_from_history(normalized)
+    if player_features.empty:
+        return pd.DataFrame()
+
+    # Override the cohort-derived CCS columns with the frozen training-time lookup.
+    if ccs_stats_lookup is not None and not ccs_stats_lookup.empty:
+        primary_ccs = str(player_features["primary_ccs_id"].iloc[0])
+        if primary_ccs in ccs_stats_lookup.index:
+            row = ccs_stats_lookup.loc[primary_ccs]
+            player_features["ccs_player_count"] = float(row["ccs_player_count"])
+            player_features["ccs_total_staked"] = float(row["ccs_total_staked"])
+            player_features["ccs_avg_bet"] = float(row["ccs_avg_bet"])
+        else:
+            player_features["ccs_player_count"] = 0.0
+            player_features["ccs_total_staked"] = 0.0
+            player_features["ccs_avg_bet"] = 0.0
+
+    return player_features
 
 
 # ---------------------------------------------------------------------------
@@ -495,48 +714,7 @@ class FeatureEngineering:
         compute_inter_draw_seconds: bool = True,
         sort_rows: bool = True,
     ) -> pd.DataFrame:
-        df = raw_df.copy()
-        df["member_id"] = df["member_id"].astype(str).str.strip().str.upper()
-        df["draw_id"] = pd.to_numeric(df["draw_id"], errors="coerce").astype("Int64")
-        df["ts"] = _normalize_timestamp(df)
-        df["bets_parsed"] = df["bets"].apply(parse_bets)
-
-        draw_feats = pd.DataFrame(df["bets_parsed"].apply(compute_draw_features).tolist())
-        df = pd.concat([df.reset_index(drop=True), draw_feats.reset_index(drop=True)], axis=1)
-
-        if "win_points" in df.columns:
-            df["win_points"] = pd.to_numeric(df["win_points"], errors="coerce").fillna(0.0)
-        else:
-            df["win_points"] = 0.0
-
-        if "total_bet_amount" in df.columns:
-            df["total_bet_amount"] = pd.to_numeric(df["total_bet_amount"], errors="coerce").fillna(0.0)
-        else:
-            df["total_bet_amount"] = 0.0
-
-        if "session_id" in df.columns:
-            df["session_id"] = pd.to_numeric(df["session_id"], errors="coerce").fillna(0).astype(int)
-        else:
-            df["session_id"] = 0
-
-        if "ccs_id" in df.columns:
-            df["ccs_id"] = df["ccs_id"].astype(str)
-        else:
-            df["ccs_id"] = ""
-
-        df["net_result"] = df["win_points"] - df["total_bet_amount"]
-        df["bet_template"] = df["bets_parsed"].apply(make_bet_template_key)
-        df = df.drop(columns=["bets_parsed"])
-
-        if sort_rows:
-            df = df.sort_values(["member_id", "ts", "draw_id"])
-        if compute_inter_draw_seconds:
-            if not sort_rows:
-                df = df.sort_values(["member_id", "ts", "draw_id"])
-            df["inter_draw_seconds"] = df.groupby("member_id")["ts"].diff().dt.total_seconds()
-
-        df["fraud_event_key"] = df["draw_id"].astype(str) + "|" + df["member_id"]
-        return df
+        return _normalize_raw_df(raw_df, compute_inter_draw_seconds=compute_inter_draw_seconds, sort_rows=sort_rows)
 
     def _finalize_normalized_bucket(self, bucket_df: pd.DataFrame) -> pd.DataFrame:
         df = bucket_df.copy()
@@ -592,100 +770,4 @@ class FeatureEngineering:
         return history_df, len(fraud_players), 0  # dropped count computed after aggregation
 
     def _aggregate_player_features(self, history_df: pd.DataFrame) -> pd.DataFrame:
-        if history_df.empty:
-            return pd.DataFrame(columns=["member_id"])
-
-        player_agg = history_df.groupby("member_id").agg(
-            draws_played=("draw_id", "nunique"),
-            sessions_played=("session_id", "nunique"),
-            active_days=("ts", lambda x: x.dt.date.nunique()),
-            total_staked=("total_bet_amount", "sum"),
-            avg_stake_per_draw=("total_bet_amount", "mean"),
-            median_stake_per_draw=("total_bet_amount", "median"),
-            stake_std=("total_bet_amount", "std"),
-            max_stake_per_draw=("total_bet_amount", "max"),
-            min_stake_per_draw=("total_bet_amount", "min"),
-            avg_inter_draw_seconds=("inter_draw_seconds", "mean"),
-            std_inter_draw_seconds=("inter_draw_seconds", "std"),
-            median_inter_draw_seconds=("inter_draw_seconds", "median"),
-            min_inter_draw_seconds=("inter_draw_seconds", "min"),
-            avg_nonzero_bets_per_draw=("nonzero_bets_per_draw", "mean"),
-            median_nonzero_bets_per_draw=("nonzero_bets_per_draw", "median"),
-            avg_max_bet_share=("max_bet_share_in_draw", "mean"),
-            median_max_bet_share=("max_bet_share_in_draw", "median"),
-            avg_bet_amount_std_in_draw=("bet_amount_std_in_draw", "mean"),
-            avg_bet_amount_mean_in_draw=("bet_amount_mean_in_draw", "mean"),
-            avg_entropy=("entropy_in_draw", "mean"),
-            entropy_std=("entropy_in_draw", "std"),
-            avg_gini=("gini_in_draw", "mean"),
-            gini_std=("gini_in_draw", "std"),
-            avg_tiny_bet_ratio=("tiny_bet_ratio_in_draw", "mean"),
-            avg_position_coverage=("position_coverage", "mean"),
-            unique_templates=("bet_template", "nunique"),
-            avg_net_result=("net_result", "mean"),
-            median_net_result=("net_result", "median"),
-            std_net_result=("net_result", "std"),
-            total_net_result=("net_result", "sum"),
-            positive_draw_rate=("net_result", lambda x: (x > 0).mean()),
-            primary_ccs_id=("ccs_id", _mode_val),
-        ).reset_index()
-
-        for col in ["stake_std", "entropy_std", "gini_std", "std_net_result", "std_inter_draw_seconds"]:
-            player_agg[col] = player_agg[col].fillna(0)
-        for col in ["avg_inter_draw_seconds", "median_inter_draw_seconds", "min_inter_draw_seconds"]:
-            player_agg[col] = player_agg[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-
-        # Ensure active_days is numeric (lambda may return DatetimeArray dtype on edge cases)
-        player_agg["active_days"] = pd.to_numeric(player_agg["active_days"], errors="coerce").fillna(0).astype(int)
-
-        player_agg["stake_cv"] = (
-            player_agg["stake_std"] / player_agg["avg_stake_per_draw"].replace(0, np.nan)
-        ).fillna(0)
-        player_agg["template_reuse_ratio"] = (
-            1 - (player_agg["unique_templates"] / player_agg["draws_played"].replace(0, np.nan))
-        ).fillna(0).clip(lower=0)
-        player_agg["pnl_volatility"] = (
-            player_agg["std_net_result"] / player_agg["avg_stake_per_draw"].replace(0, np.nan)
-        ).fillna(0)
-        player_agg["win_rate"] = player_agg["positive_draw_rate"]
-        player_agg["draws_per_active_day"] = (
-            player_agg["draws_played"] / player_agg["active_days"].replace(0, np.nan)
-        ).fillna(0)
-
-        session_draws = (
-            history_df.groupby(["member_id", "session_id"])["draw_id"]
-            .nunique()
-            .reset_index(name="draws_in_session")
-        )
-        avg_session_draws = (
-            session_draws.groupby("member_id")["draws_in_session"]
-            .mean()
-            .reset_index(name="avg_draws_per_session")
-        )
-        player_agg = player_agg.merge(avg_session_draws, on="member_id", how="left")
-        player_agg["avg_draws_per_session"] = player_agg["avg_draws_per_session"].fillna(1)
-
-        max_reuse = (
-            history_df.groupby("member_id")["bet_template"]
-            .apply(lambda vals: vals.value_counts().iloc[0] if len(vals) else 1)
-            .reset_index(name="max_template_reuse")
-        )
-        player_agg = player_agg.merge(max_reuse, on="member_id", how="left")
-
-        ccs_player_count = (
-            history_df.groupby("ccs_id")["member_id"].nunique().reset_index(name="ccs_player_count")
-        )
-        ccs_totals = (
-            history_df.groupby("ccs_id")
-            .agg(ccs_total_staked=("total_bet_amount", "sum"), ccs_avg_bet=("total_bet_amount", "mean"))
-            .reset_index()
-        )
-        player_agg = (
-            player_agg
-            .merge(ccs_player_count.rename(columns={"ccs_id": "primary_ccs_id"}), on="primary_ccs_id", how="left")
-            .merge(ccs_totals.rename(columns={"ccs_id": "primary_ccs_id"}), on="primary_ccs_id", how="left")
-        )
-        for col in ["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]:
-            player_agg[col] = player_agg[col].fillna(0)
-
-        return player_agg
+        return _aggregate_player_features_from_history(history_df)

@@ -88,7 +88,22 @@ class ModelPusher:
             scalers = load_joblib(self.training_artifact.scaler_path)
             lr_models = load_joblib(self.training_artifact.lr_operational_path)
 
-            scored_df = __import__("pandas").read_parquet(self.evaluation_artifact.scored_players_path)
+            pd = __import__("pandas")
+            scored_df = pd.read_parquet(self.evaluation_artifact.scored_players_path)
+
+            # Build frozen CCS lookup from pre-computed player features.
+            # CCS columns are cohort-level stats already merged into scored_df.
+            _ccs_cols = ["primary_ccs_id", "ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]
+            if all(c in scored_df.columns for c in _ccs_cols):
+                ccs_stats_lookup = (
+                    scored_df[_ccs_cols]
+                    .drop_duplicates(subset=["primary_ccs_id"])
+                    .set_index("primary_ccs_id")
+                )
+            else:
+                ccs_stats_lookup = pd.DataFrame(
+                    columns=["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]
+                )
 
             bundle = {
                 "iso_forest": iso_forest,
@@ -119,6 +134,7 @@ class ModelPusher:
                 "supervised_weight": float(eval_report["supervised_weight"]),
                 "anomaly_component_weights": eval_report.get("anomaly_component_weights", {}),
                 "reference_size": int(len(scored_df)),
+                "ccs_stats_lookup": ccs_stats_lookup,
             }
             bundle_path = self.config.current_dir / "model_bundle.joblib"
             save_joblib(bundle, bundle_path)

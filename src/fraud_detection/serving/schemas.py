@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -161,3 +162,69 @@ class ErrorResponse(BaseModel):
 
     detail: str
     member_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Live / historical scoring schemas
+# ---------------------------------------------------------------------------
+
+class HistoricalScoreRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "member_id": "GK00100436",
+                "start_date": "2026-02-20T00:00:00Z",
+                "end_date": "2026-04-20T00:00:00Z",
+            }
+        }
+    )
+
+    member_id: str = Field(..., min_length=1)
+    start_date: datetime
+    end_date: datetime
+
+
+class LiveScoreResponse(BaseModel):
+    member_id: str
+    risk_score: float = Field(..., ge=0.0)
+    risk_tier: Literal["LOW", "MEDIUM", "HIGH"]
+    anomaly_score: float = Field(..., ge=0.0)
+    supervised_score: float = Field(..., ge=0.0, le=1.0)
+    ccs_id: str | None = None
+
+    window_start: str
+    window_end: str
+    window_days: int
+    data_sources: list[str]
+    parquet_rows: int
+    mongo_rows: int
+    total_draws_scored: int
+
+    scoring_baseline: str
+    scored_at: str
+    source_run_id: str
+    model_version: str
+
+
+class HistoricalScoreResponse(LiveScoreResponse):
+    """Same shape as LiveScoreResponse — different endpoint tag only."""
+    pass
+
+
+class LiveInsufficientDataResponse(BaseModel):
+    status: Literal["insufficient_data"]
+    member_id: str
+    detail: str
+    evaluated_at: str | None = None
+    promoted_at: str | None = None
+    source_run_id: str
+    model_version: str
+    window_start: str
+    window_end: str
+    window_days: int
+    data_sources: list[str]
+    parquet_rows: int
+    mongo_rows: int
+    total_draws_scored: int
+    scoring_baseline: str
+    scored_at: str

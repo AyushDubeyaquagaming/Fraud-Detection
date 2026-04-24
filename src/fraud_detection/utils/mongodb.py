@@ -5,6 +5,7 @@ import sys
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import pandas as pd
@@ -45,21 +46,68 @@ MONGO_PROJECTION = {
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+_SERVING_CLIENTS: dict[tuple[str, str, str], Any] = {}
+_SERVING_CLIENTS_LOCK = RLock()
+
+
+def _resolve_mongo_connection_settings(
+    uri_env_var: str,
+    db_env_var: str,
+    collection_env_var: str,
+) -> tuple[str, str, str]:
+    load_dotenv(REPO_ROOT / ".env")
+    uri = os.getenv(uri_env_var)
+    database = os.getenv(db_env_var)
+    collection_name = os.getenv(collection_env_var)
+    if not uri or not database or not collection_name:
+        raise ValueError(
+            f"Missing MongoDB env vars: {uri_env_var}, {db_env_var}, {collection_env_var}. "
+            "Check your .env file."
+        )
+    return uri, database, collection_name
+
+
 def get_mongo_collection(uri_env_var: str, db_env_var: str, collection_env_var: str):
     try:
-        load_dotenv(REPO_ROOT / ".env")
         from pymongo import MongoClient
 
-        uri = os.getenv(uri_env_var)
-        database = os.getenv(db_env_var)
-        collection_name = os.getenv(collection_env_var)
-        if not uri or not database or not collection_name:
-            raise ValueError(
-                f"Missing MongoDB env vars: {uri_env_var}, {db_env_var}, {collection_env_var}. "
-                "Check your .env file."
-            )
+        uri, database, collection_name = _resolve_mongo_connection_settings(
+            uri_env_var,
+            db_env_var,
+            collection_env_var,
+        )
         client = MongoClient(uri, serverSelectionTimeoutMS=15000)
         return client, client[database][collection_name]
+    except Exception as e:
+        raise FraudDetectionException(e, sys) from e
+
+
+def get_serving_mongo_collection(
+    uri_env_var: str = ENV_MONGODB_URI,
+    db_env_var: str = ENV_MONGODB_DATABASE,
+    collection_env_var: str = ENV_MONGODB_COLLECTION,
+):
+    """Return a process-level Mongo collection for serving paths.
+
+    PyMongo is designed around long-lived clients with internal pooling.
+    Serving requests should reuse one client per process rather than opening
+    and closing a new client on every call.
+    """
+    try:
+        from pymongo import MongoClient
+
+        uri, database, collection_name = _resolve_mongo_connection_settings(
+            uri_env_var,
+            db_env_var,
+            collection_env_var,
+        )
+        cache_key = (uri, database, collection_name)
+        with _SERVING_CLIENTS_LOCK:
+            client = _SERVING_CLIENTS.get(cache_key)
+            if client is None:
+                client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+                _SERVING_CLIENTS[cache_key] = client
+        return client[database][collection_name]
     except Exception as e:
         raise FraudDetectionException(e, sys) from e
 
