@@ -17,6 +17,7 @@ from fraud_detection.components.model_pusher import ModelPusher
 from fraud_detection.components.model_training import ModelTraining
 from fraud_detection.components.monitoring import Monitoring
 from fraud_detection.constants.constants import (
+    BATCH_SCORING_CONFIG_FILE_PATH,
     CONFIG_FILE_PATH,
     MODEL_PARAMS_FILE_PATH,
     REPO_ROOT,
@@ -68,6 +69,9 @@ class TrainingPipeline:
         eval_cfg = config_dict["model_evaluation"]
         mp_cfg = model_params
         serving_cfg = config_dict.get("serving", {})
+        batch_scoring_config_path = _resolve_repo_path(
+            config_dict["pipeline"].get("weekly_serving_snapshot_config", BATCH_SCORING_CONFIG_FILE_PATH)
+        )
 
         # Build component configs
         iso_params = dict(mp_cfg["isolation_forest"])
@@ -253,10 +257,19 @@ class TrainingPipeline:
                     log_artifact_safe(str(monitoring_artifact.drift_summary_path))
 
             # --- Step 7: Model Pusher ---
-            logger.info("[7/7] ModelPusher")
+            logger.info("[7/8] ModelPusher")
             pusher_artifact = ModelPusher(
                 model_pusher_config, training_artifact, eval_artifact
             ).initiate_model_pusher()
+
+            # --- Step 8: Weekly Serving Snapshot ---
+            if pusher_artifact.promoted:
+                logger.info("[8/8] WeeklyServingSnapshot")
+                from fraud_detection.pipeline.batch_scoring_pipeline import BatchScoringPipeline
+
+                BatchScoringPipeline(config_path=batch_scoring_config_path).run()
+            else:
+                logger.info("[8/8] WeeklyServingSnapshot skipped because promotion gate did not pass")
 
             if mlflow_active:
                 mlflow.set_tag("promoted", "true" if pusher_artifact.promoted else "false")

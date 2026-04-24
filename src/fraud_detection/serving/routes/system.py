@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from datetime import timezone
 
 from fastapi import APIRouter, Depends
 
@@ -15,15 +14,19 @@ _start_time = time.time()
 
 def _build_model_info(cache: ArtifactCache) -> ModelInfoResponse:
     bundle = cache.get_bundle()
-    df = bundle.scored_players_df
-    tier_counts = df["risk_tier"].value_counts().to_dict()
+    evaluation = bundle.evaluation_metadata
+    tier_counts = evaluation.get("risk_tier_distribution", {})
 
     return ModelInfoResponse(
         model_version=bundle.model_version,
         source_run_id=bundle.source_run_id,
         promoted_at=bundle.promoted_at,
         evaluated_at=bundle.evaluated_at,
-        total_scored_members=len(df),
+        snapshot_available=bundle.snapshot_available,
+        snapshot_status=str(bundle.snapshot_metadata.get("snapshot_status", "ready" if bundle.snapshot_available else "insufficient_data")),
+        snapshot_reason=bundle.snapshot_reason,
+        snapshot_lookback_days=bundle.snapshot_metadata.get("lookback_days"),
+        total_scored_members=int(evaluation.get("total_players", len(bundle.scored_players_df))),
         tier_distribution=TierDistribution(
             LOW=int(tier_counts.get("LOW", 0)),
             MEDIUM=int(tier_counts.get("MEDIUM", 0)),

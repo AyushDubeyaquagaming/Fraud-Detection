@@ -7,6 +7,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # --- Config paths ---
 CONFIG_FILE_PATH = REPO_ROOT / "configs" / "config.yaml"
+BATCH_SCORING_CONFIG_FILE_PATH = REPO_ROOT / "configs" / "batch_scoring.yaml"
 MODEL_PARAMS_FILE_PATH = REPO_ROOT / "configs" / "model_params.yaml"
 SCHEMA_FILE_PATH = REPO_ROOT / "configs" / "schema.yaml"
 
@@ -48,6 +49,7 @@ FEATURE_PIPELINE_CONFIG_FILE = "feature_pipeline_config.json"
 HYBRID_SCORED_PLAYERS_FILE = "hybrid_scored_players.parquet"
 HYBRID_EVALUATION_FILE = "hybrid_evaluation.json"
 ALERT_QUEUE_FILE = "alert_queue.csv"
+WEEKLY_SCORING_MANIFEST_FILE = "weekly_scoring_manifest.json"
 PROMOTION_METADATA_FILE = "promotion_metadata.json"
 RUN_METADATA_FILE = "run_metadata.json"
 BATCH_SCORING_REPORT_FILE = "batch_scoring_report.json"

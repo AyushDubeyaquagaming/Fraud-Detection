@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
-from typing import Optional
-from unittest.mock import patch
 
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from fraud_detection.serving.app import create_app
-from fraud_detection.serving.artifact_provider import ArtifactBundle, ArtifactProvider
+from fraud_detection.serving.artifact_provider import ArtifactBundle, ArtifactProvider, LocalDiskArtifactProvider
 
 
 def _make_df() -> pd.DataFrame:
@@ -48,17 +47,26 @@ def _make_bundle() -> ArtifactBundle:
     return ArtifactBundle(
         scored_players_df=_make_df(),
         serving_manifest={"run_id": "run_test", "model_version": "hybrid_v1", "promoted_at": "2026-04-22T00:00:00+00:00"},
+        snapshot_metadata={
+            "snapshot_type": "weekly_serving",
+            "source_run_id": "run_test",
+            "model_version": "hybrid_v1",
+        },
         promotion_metadata={},
         evaluation_metadata={
-            "evaluated_at": "2026-04-22T00:00:00+00:00",
+            "scored_at": "2026-04-23T00:00:00+00:00",
             "anomaly_weight": 0.6,
             "supervised_weight": 0.4,
+            "total_players": 3,
+            "risk_tier_distribution": {"LOW": 1, "MEDIUM": 1, "HIGH": 1},
         },
         run_metadata={"run_id": "run_test", "status": "FINISHED"},
+        snapshot_available=True,
+        snapshot_reason=None,
         loaded_at=datetime(2026, 4, 22, 0, 0, 0, tzinfo=timezone.utc),
         source_run_id="run_test",
         promoted_at="2026-04-22T00:00:00+00:00",
-        evaluated_at="2026-04-22T00:00:00+00:00",
+        evaluated_at="2026-04-23T00:00:00+00:00",
         model_version="hybrid_v1",
     )
 
@@ -95,9 +103,12 @@ class _ToggleProvider(ArtifactProvider):
         return ArtifactBundle(
             scored_players_df=b.scored_players_df,
             serving_manifest={**b.serving_manifest, "run_id": run_id},
+            snapshot_metadata={**b.snapshot_metadata, "source_run_id": run_id},
             promotion_metadata=b.promotion_metadata,
             evaluation_metadata=b.evaluation_metadata,
             run_metadata=b.run_metadata,
+            snapshot_available=b.snapshot_available,
+            snapshot_reason=b.snapshot_reason,
             loaded_at=b.loaded_at,
             source_run_id=run_id,
             promoted_at=b.promoted_at,
@@ -106,9 +117,42 @@ class _ToggleProvider(ArtifactProvider):
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+class _SnapshotMissingProvider(ArtifactProvider):
+    def is_available(self) -> bool:
+        return True
+
+    def load(self) -> ArtifactBundle:
+        b = _make_bundle()
+        return ArtifactBundle(
+            scored_players_df=b.scored_players_df.iloc[0:0],
+            serving_manifest=b.serving_manifest,
+            snapshot_metadata={
+                "snapshot_type": "weekly_serving",
+                "source_run_id": "run_test",
+                "model_version": "hybrid_v1",
+                "snapshot_status": "insufficient_data",
+                "lookback_days": 7,
+            },
+            promotion_metadata=b.promotion_metadata,
+            evaluation_metadata={
+                "scored_at": None,
+                "anomaly_weight": 0.6,
+                "supervised_weight": 0.4,
+                "total_players": 0,
+                "risk_tier_distribution": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
+                "snapshot_status": "insufficient_data",
+                "snapshot_reason": "Weekly serving snapshot has not been generated yet.",
+            },
+            run_metadata=b.run_metadata,
+            snapshot_available=False,
+            snapshot_reason="Weekly serving snapshot has not been generated yet.",
+            loaded_at=b.loaded_at,
+            source_run_id=b.source_run_id,
+            promoted_at=b.promoted_at,
+            evaluated_at=None,
+            model_version=b.model_version,
+        )
+
 
 def _client(provider: ArtifactProvider) -> TestClient:
     return TestClient(create_app(provider=provider), raise_server_exceptions=False)
@@ -173,17 +217,30 @@ def test_score_normalizes_member_id():
     assert r.json()["member_id"] == "GK001"
 
 
-def test_score_not_found_returns_404():
+def test_score_not_found_returns_insufficient_data_payload():
     with _client(_GoodProvider()) as c:
         r = c.get("/score/GK999")
-    assert r.status_code == 404
-    assert "not found" in r.json()["detail"].lower()
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "insufficient_data"
+    assert body["member_id"] == "GK999"
+    assert "not enough weekly data" in body["detail"].lower()
 
 
 def test_score_when_artifacts_absent_returns_503():
     with _client(_FailProvider()) as c:
         r = c.get("/score/GK001")
     assert r.status_code == 503
+
+
+def test_score_when_snapshot_missing_returns_insufficient_data_payload():
+    with _client(_SnapshotMissingProvider()) as c:
+        r = c.get("/score/GK001")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "insufficient_data"
+    assert body["member_id"] == "GK001"
+    assert "snapshot has not been generated" in body["detail"].lower()
 
 
 def test_score_null_ccs_id():
@@ -203,6 +260,8 @@ def test_model_info_returns_correct_tiers():
         r = c.get("/model-info")
     assert r.status_code == 200
     body = r.json()
+    assert body["snapshot_available"] is True
+    assert body["snapshot_status"] == "ready"
     tiers = body["tier_distribution"]
     assert tiers["HIGH"] == 1
     assert tiers["MEDIUM"] == 1
@@ -210,6 +269,18 @@ def test_model_info_returns_correct_tiers():
     assert body["total_scored_members"] == 3
     assert body["anomaly_weight"] == pytest.approx(0.6)
     assert body["supervised_weight"] == pytest.approx(0.4)
+
+
+def test_model_info_reports_missing_snapshot_state():
+    with _client(_SnapshotMissingProvider()) as c:
+        r = c.get("/model-info")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["snapshot_available"] is False
+    assert body["snapshot_status"] == "insufficient_data"
+    assert body["snapshot_lookback_days"] == 7
+    assert "snapshot has not been generated" in body["snapshot_reason"].lower()
+    assert body["total_scored_members"] == 0
 
 
 def test_root_returns_model_info_payload():
@@ -235,6 +306,36 @@ def test_model_info_503_when_not_loaded():
     with _client(_FailProvider()) as c:
         r = c.get("/model-info")
     assert r.status_code == 503
+
+
+def test_local_disk_provider_requires_weekly_snapshot_for_scores(tmp_path):
+    current_dir = tmp_path / "current"
+    run_dir = tmp_path / "runs" / "run_test"
+    current_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True)
+
+    (current_dir / "serving_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "run_id": "run_test",
+                "model_version": "hybrid_v1",
+                "promoted_at": "2026-04-22T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"run_id": "run_test", "status": "FINISHED"}),
+        encoding="utf-8",
+    )
+
+    bundle = LocalDiskArtifactProvider(current_dir=current_dir, repo_root=tmp_path).load()
+
+    assert bundle.snapshot_available is False
+    assert bundle.scored_players_df.empty
+    assert bundle.evaluation_metadata["total_players"] == 0
+    assert "not been generated" in bundle.snapshot_reason.lower()
 
 
 # ---------------------------------------------------------------------------

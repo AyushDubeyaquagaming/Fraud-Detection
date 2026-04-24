@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from fraud_detection.pipeline.training_pipeline import TrainingPipeline
-from fraud_detection.constants.constants import CONFIG_FILE_PATH, REPO_ROOT
+from fraud_detection.constants.constants import BATCH_SCORING_CONFIG_FILE_PATH, CONFIG_FILE_PATH, REPO_ROOT
 
 
 def _make_bets(numbers: list[int], amounts: list[float]) -> str:
@@ -113,15 +113,33 @@ def test_full_training_pipeline(tmp_path):
     config["data_validation"]["fraud_csv_path"] = str(fraud_csv_path)
     config["pipeline"]["artifact_root"] = str(tmp_path / "artifacts")
     config["pipeline"]["current_dir"] = str(tmp_path / "artifacts" / "current")
+    config["pipeline"]["weekly_serving_snapshot_config"] = str(tmp_path / "batch_scoring.yaml")
     # Use synthetic-data-appropriate gate thresholds so the test exercises the
     # promoted-artifact code path without requiring an unrealistically strong
     # model on the 48-player toy cohort.
     config["data_validation"]["min_row_count"] = 100
     config["model_evaluation"]["min_capture_rate_top_5pct"] = 0.0
     config["model_evaluation"]["min_lift_top_5pct"] = 0.0
+
+    with open(BATCH_SCORING_CONFIG_FILE_PATH, "r", encoding="utf-8") as handle:
+        batch_config = yaml.safe_load(handle)
+    batch_config["pipeline"]["current_dir"] = str(tmp_path / "artifacts" / "current")
+    batch_config["data_ingestion"]["source"] = "parquet"
+    batch_config["data_ingestion"]["parquet_path"] = str(parquet_path)
+    batch_config["data_validation"]["fraud_csv_path"] = str(fraud_csv_path)
+    batch_config["batch_scoring"]["window"] = {
+        "timestamp_field": "trans_date",
+        "start_date": "2023-12-31T00:00:00+00:00",
+        "end_date": "2024-12-31T00:00:00+00:00",
+        "lookback_days": None,
+    }
+
     temp_config_path = tmp_path / "config.yaml"
+    temp_batch_config_path = tmp_path / "batch_scoring.yaml"
     with open(temp_config_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
+    with open(temp_batch_config_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(batch_config, handle, sort_keys=False)
 
     run_dir = TrainingPipeline(config_path=temp_config_path).run()
 

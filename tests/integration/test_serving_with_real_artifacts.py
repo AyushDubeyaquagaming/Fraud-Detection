@@ -62,11 +62,13 @@ def test_model_info_matches_manifest(real_client):
 
 def test_score_known_member(real_client):
     client, manifest = real_client
-    from fraud_detection.constants.constants import CURRENT_DIR, SCORED_PLAYERS_FILE
-    from pathlib import Path
+    from fraud_detection.constants.constants import CURRENT_DIR, HYBRID_SCORED_PLAYERS_FILE
 
-    run_dir = Path(manifest["run_dir"])
-    scored_path = run_dir / "model_evaluation" / SCORED_PLAYERS_FILE
+    scored_path = CURRENT_DIR / HYBRID_SCORED_PLAYERS_FILE
+    assert scored_path.exists(), (
+        f"No weekly serving snapshot at {scored_path}. "
+        "Run the training pipeline or batch scoring pipeline first."
+    )
     df = pd.read_parquet(scored_path)
     member_id = str(df["member_id"].iloc[0]).strip().upper()
 
@@ -78,7 +80,9 @@ def test_score_known_member(real_client):
     assert body["risk_tier"] in ("LOW", "MEDIUM", "HIGH")
 
 
-def test_score_unknown_member_returns_404(real_client):
+def test_score_unknown_member_returns_insufficient_data(real_client):
     client, _ = real_client
     r = client.get("/score/MEMBER_THAT_DOES_NOT_EXIST_XYZ")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "insufficient_data"

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -168,6 +171,13 @@ class ScoreResult:
     matched_fraud_rows: int
     reliability: str
     notes: list[str]
+
+
+WEEKLY_LOOKBACK_DAYS = 7
+MIN_WEEKLY_HISTORY_ROWS = 5
+MIN_WEEKLY_DRAWS = 5
+DEFAULT_ALERT_QUEUE_SIZE = 50
+WEEKLY_COHORT_CACHE_TTL_SECONDS = 900
 
 
 LIVE_OUTPUT_EXCLUDE_FIELDS = {"supervised_score_eval", "risk_score_eval"}
@@ -592,16 +602,66 @@ def get_mongo_collection():
     return client, client[database][collection_name]
 
 
-def fetch_member_history(member_id: str) -> pd.DataFrame:
+def build_member_history_query(member_id: str, lookback_days: int | None = None) -> dict[str, Any]:
+    normalized = validate_member_id(member_id)
+    query: dict[str, Any] = {
+        "member_id": {"$regex": f"^{re.escape(normalized)}$", "$options": "i"}
+    }
+    if lookback_days is not None:
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=int(lookback_days))
+        query["trans_date"] = {"$gte": start_dt, "$lt": end_dt}
+    return query
+
+
+def build_date_window_query(lookback_days: int) -> dict[str, Any]:
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=int(lookback_days))
+    return {"trans_date": {"$gte": start_dt, "$lt": end_dt}}
+
+
+def fetch_member_history(member_id: str, lookback_days: int | None = None) -> pd.DataFrame:
     normalized = validate_member_id(member_id)
     client, collection = get_mongo_collection()
     try:
-        docs = list(collection.find({"member_id": {"$regex": f"^{re.escape(normalized)}$", "$options": "i"}}, MONGO_PROJECTION))
+        docs = list(collection.find(build_member_history_query(normalized, lookback_days=lookback_days), MONGO_PROJECTION))
     finally:
         client.close()
     if not docs:
+        if lookback_days is not None:
+            raise MemberNotFoundError(
+                f"{normalized} was not found in the last {int(lookback_days)} days of the MongoDB roulette source."
+            )
         raise MemberNotFoundError(f"{normalized} was not found in the MongoDB roulette source.")
     return pd.DataFrame(docs)
+
+
+def fetch_cohort_history(lookback_days: int) -> pd.DataFrame:
+    client, collection = get_mongo_collection()
+    try:
+        docs = list(collection.find(build_date_window_query(lookback_days), MONGO_PROJECTION))
+    finally:
+        client.close()
+    if not docs:
+        raise InsufficientHistoryError(
+            f"No MongoDB roulette activity was found in the last {int(lookback_days)} days."
+        )
+    return pd.DataFrame(docs)
+
+
+def enforce_minimum_history(
+    player_features: pd.DataFrame,
+    raw_rows: int,
+    min_rows: int,
+    min_draws: int,
+    lookback_days: int,
+) -> None:
+    draws_played = int(player_features.loc[0, "draws_played"])
+    if raw_rows < min_rows or draws_played < min_draws:
+        raise InsufficientHistoryError(
+            f"Insufficient recent history for weekly scoring: last {lookback_days} days produced "
+            f"{raw_rows} raw rows and {draws_played} draws; need at least {min_rows} rows and {min_draws} draws."
+        )
 
 
 def normalize_component(value: float, min_value: float, max_value: float) -> float:
@@ -623,18 +683,333 @@ def append_reference_rank_fields(reference: pd.DataFrame, row: dict[str, Any]) -
     return row
 
 
-def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> ScoreResult:
+def _weekly_score_notes(row: dict[str, Any], lookback_days: int) -> list[str]:
+    notes = [
+        f"Score computed from the last {lookback_days} days of member activity.",
+        "Risk tier and rank are relative to the current weekly cohort and are not an absolute fraud probability.",
+        "Evaluation-only fields are not available for weekly live scoring.",
+    ]
+    if int(row.get("matched_fraud_rows", 0)) > 0:
+        notes.append("Pre-fraud cutoff was applied because this member matches existing fraud labels.")
+    return notes
+
+
+def _score_result_from_weekly_row(row: pd.Series, lookback_days: int) -> ScoreResult:
+    row_dict = row.to_dict()
+    reliability = str(row_dict.get("score_reliability", "higher"))
+    return ScoreResult(
+        scored_row=row_dict,
+        source=str(row_dict.get("source", "mongo_weekly")),
+        raw_rows=int(row_dict.get("raw_history_rows", 0)),
+        history_rows_used=int(row_dict.get("history_rows_used", 0)),
+        matched_fraud_rows=int(row_dict.get("matched_fraud_rows", 0)),
+        reliability=reliability,
+        notes=_weekly_score_notes(row_dict, lookback_days),
+    )
+
+
+def _current_cache_bucket(ttl_seconds: int = WEEKLY_COHORT_CACHE_TTL_SECONDS) -> int:
+    return int(datetime.now(timezone.utc).timestamp() // int(ttl_seconds))
+
+
+def _get_mahalanobis_stats(artifacts: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    if "mahal_stats" in artifacts:
+        return artifacts["mahal_stats"]["mean_vec"], artifacts["mahal_stats"]["cov_inv"]
+    return artifacts["mean_vec"], artifacts["cov_inv"]
+
+
+def score_feature_frame(
+    player_features: pd.DataFrame,
+    artifacts: dict[str, Any],
+    *,
+    lookback_days: int | None = None,
+    source: str,
+    risk_p80: float | None = None,
+    risk_p95: float | None = None,
+) -> pd.DataFrame:
+    scored = player_features.copy()
+
+    model_frame = make_model_frame(
+        scored,
+        feature_columns=artifacts.get("feature_columns"),
+        log1p_columns=artifacts.get("log1p_columns"),
+    )
+    style_frame = make_style_frame(
+        scored,
+        style_columns=artifacts.get("style_columns"),
+        style_log1p_columns=artifacts.get("style_log1p_columns"),
+    )
+
+    X_unsup = artifacts["scaler_unsup"].transform(model_frame)
+    iso_raw = -artifacts["iso_forest"].score_samples(X_unsup)
+    mean_vec, cov_inv = _get_mahalanobis_stats(artifacts)
+    mahal_raw = np.array([mahalanobis(row, mean_vec, cov_inv) for row in X_unsup])
+    cluster_ids = artifacts["kmeans"].predict(X_unsup)
+    cluster_raw = np.array([
+        np.linalg.norm(X_unsup[i] - artifacts["kmeans"].cluster_centers_[cluster_ids[i]])
+        for i in range(len(X_unsup))
+    ])
+
+    scored["cluster_id"] = cluster_ids
+    scored["cluster_distance"] = cluster_raw
+    scored["iso_forest_score"] = iso_raw
+    scored["mahalanobis_dist"] = mahal_raw
+    scored["iso_forest_score_norm"] = [
+        normalize_component(v, artifacts["iso_min"], artifacts["iso_max"]) for v in iso_raw
+    ]
+    scored["mahalanobis_norm"] = [
+        normalize_component(v, artifacts["mahal_min"], artifacts["mahal_max"]) for v in mahal_raw
+    ]
+    scored["cluster_distance_norm"] = [
+        normalize_component(v, artifacts["cluster_min"], artifacts["cluster_max"]) for v in cluster_raw
+    ]
+
+    component_weights = artifacts.get(
+        "anomaly_component_weights",
+        {"iso_forest_score_norm": 0.40, "mahalanobis_norm": 0.30, "cluster_distance_norm": 0.30},
+    )
+    scored["anomaly_score"] = (
+        float(component_weights["iso_forest_score_norm"]) * scored["iso_forest_score_norm"]
+        + float(component_weights["mahalanobis_norm"]) * scored["mahalanobis_norm"]
+        + float(component_weights["cluster_distance_norm"]) * scored["cluster_distance_norm"]
+    )
+
+    X_operational = artifacts["scaler_operational"].transform(model_frame)
+    scored["supervised_score"] = artifacts["lr_operational"].predict_proba(X_operational)[:, 1]
+    anomaly_weight = float(artifacts.get("anomaly_weight", ANOMALY_WEIGHT))
+    supervised_weight = float(artifacts.get("supervised_weight", SUPERVISED_WEIGHT))
+    scored["risk_score"] = anomaly_weight * scored["anomaly_score"] + supervised_weight * scored["supervised_score"]
+
+    if artifacts.get("full_pca") is not None:
+        full_coords = artifacts["full_pca"].transform(X_unsup)
+        scored["pc1"] = full_coords[:, 0]
+        scored["pc2"] = full_coords[:, 1]
+
+    if artifacts.get("style_pca") is not None and artifacts.get("style_scaler") is not None and len(style_frame.columns) > 0:
+        style_coords = artifacts["style_pca"].transform(artifacts["style_scaler"].transform(style_frame))
+        scored["style_pc1"] = style_coords[:, 0]
+        scored["style_pc2"] = style_coords[:, 1]
+
+    local_p80 = float(risk_p80) if risk_p80 is not None else float(scored["risk_score"].quantile(0.80))
+    local_p95 = float(risk_p95) if risk_p95 is not None else float(scored["risk_score"].quantile(0.95))
+    scored["risk_tier"] = pd.cut(
+        scored["risk_score"],
+        bins=[-0.001, local_p80, local_p95, float(scored["risk_score"].max()) + 0.001],
+        labels=["LOW", "MEDIUM", "HIGH"],
+    ).astype(str)
+
+    scored["risk_rank"] = scored["risk_score"].rank(ascending=False, method="min").astype(int)
+    scored["risk_percentile"] = scored["risk_score"].rank(pct=True)
+    scored["anomaly_percentile"] = scored["anomaly_score"].rank(pct=True)
+    scored["supervised_percentile"] = scored["supervised_score"].rank(pct=True)
+    scored["source"] = source
+    scored["lookback_days"] = int(lookback_days) if lookback_days is not None else None
+    return scored
+
+
+def clear_weekly_scored_cohort_cache() -> None:
+    _cached_weekly_scored_cohort.cache_clear()
+
+
+@lru_cache(maxsize=4)
+def _cached_weekly_scored_cohort(
+    lookback_days: int = WEEKLY_LOOKBACK_DAYS,
+    alert_queue_size: int = DEFAULT_ALERT_QUEUE_SIZE,
+    cache_bucket: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    artifacts = ensure_artifacts()
+    fraud_csv = load_fraud_labels()
+
+    raw_history = fetch_cohort_history(lookback_days)
+    normalized_history = normalize_member_history(raw_history)
+
+    fraud_event_keys = set(fraud_csv["fraud_event_key"])
+    event_labels = (
+        normalized_history.assign(event_fraud_flag=normalized_history["fraud_event_key"].isin(fraud_event_keys).astype(int))
+        .groupby("member_id", as_index=False)["event_fraud_flag"]
+        .max()
+    )
+
+    usable_history, _ = apply_pre_fraud_cutoff(normalized_history, fraud_csv)
+    player_features = aggregate_member_features(usable_history)
+
+    raw_counts = normalized_history.groupby("member_id").size().reset_index(name="raw_history_rows")
+    used_counts = usable_history.groupby("member_id").size().reset_index(name="history_rows_used")
+    matched_fraud_rows = (
+        normalized_history.assign(event_fraud_flag=normalized_history["fraud_event_key"].isin(fraud_event_keys).astype(int))
+        .groupby("member_id", as_index=False)["event_fraud_flag"]
+        .sum()
+        .rename(columns={"event_fraud_flag": "matched_fraud_rows"})
+    )
+
+    scored = (
+        player_features
+        .merge(event_labels, on="member_id", how="left")
+        .merge(raw_counts, on="member_id", how="left")
+        .merge(used_counts, on="member_id", how="left")
+        .merge(matched_fraud_rows, on="member_id", how="left")
+    )
+    for column in ["event_fraud_flag", "raw_history_rows", "history_rows_used", "matched_fraud_rows"]:
+        scored[column] = scored[column].fillna(0).astype(int)
+
+    scored["score_reliability"] = [
+        reliability_label(draws_played=int(draws), raw_rows=int(rows))[0]
+        for draws, rows in zip(scored["draws_played"], scored["raw_history_rows"])
+    ]
+
+    eligibility_mask = (
+        (scored["raw_history_rows"] >= MIN_WEEKLY_HISTORY_ROWS)
+        & (scored["draws_played"] >= MIN_WEEKLY_DRAWS)
+    )
+    scored = scored.loc[eligibility_mask].reset_index(drop=True)
+    if scored.empty:
+        raise InsufficientHistoryError(
+            f"No members met the minimum weekly history thresholds in the last {int(lookback_days)} days."
+        )
+
+    scored = score_feature_frame(
+        scored,
+        artifacts,
+        lookback_days=lookback_days,
+        source="mongo_weekly",
+    )
+
+    queue_columns = [
+        "member_id", "primary_ccs_id", "risk_score", "risk_tier", "anomaly_score", "supervised_score",
+        "draws_played", "total_staked", "avg_entropy", "template_reuse_ratio",
+    ]
+    queue_columns = [column for column in queue_columns if column in scored.columns]
+    alert_queue = (
+        scored.sort_values("risk_score", ascending=False)[queue_columns]
+        .head(int(alert_queue_size))
+        .reset_index(drop=True)
+    )
+
+    evaluation = {
+        "mode": "weekly_live",
+        "scored_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_days": int(lookback_days),
+        "total_players": int(len(scored)),
+        "fraud_players": int(scored.get("event_fraud_flag", pd.Series(dtype=int)).sum()) if "event_fraud_flag" in scored.columns else 0,
+        "alert_queue_size": int(alert_queue_size),
+        "risk_tier_distribution": {tier: int((scored["risk_tier"] == tier).sum()) for tier in ["LOW", "MEDIUM", "HIGH"]},
+        "score_distribution": {
+            "mean": float(scored["risk_score"].mean()),
+            "median": float(scored["risk_score"].median()),
+            "p95": float(scored["risk_score"].quantile(0.95)),
+        },
+        "cohort_scope_note": f"Weekly operational cohort scored from the last {int(lookback_days)} days using the promoted model bundle.",
+    }
+    return scored, alert_queue, evaluation
+
+
+def load_weekly_scored_cohort(
+    lookback_days: int = WEEKLY_LOOKBACK_DAYS,
+    alert_queue_size: int = DEFAULT_ALERT_QUEUE_SIZE,
+    force_refresh: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if force_refresh:
+        clear_weekly_scored_cohort_cache()
+    cache_bucket = _current_cache_bucket()
+    scored, alert_queue, evaluation = _cached_weekly_scored_cohort(
+        int(lookback_days),
+        int(alert_queue_size),
+        cache_bucket,
+    )
+    return scored.copy(), alert_queue.copy(), deepcopy(evaluation)
+
+
+def get_weekly_member_score(
+    member_id: str,
+    *,
+    lookback_days: int = WEEKLY_LOOKBACK_DAYS,
+    force_refresh: bool = False,
+) -> ScoreResult:
+    normalized = validate_member_id(member_id)
+    weekly_scored, _, _ = load_weekly_scored_cohort(
+        lookback_days=lookback_days,
+        force_refresh=force_refresh,
+    )
+    match_df = weekly_scored.loc[weekly_scored["member_id"] == normalized]
+    if not match_df.empty:
+        return _score_result_from_weekly_row(match_df.iloc[0], lookback_days)
+
+    artifacts = ensure_artifacts()
+    fraud_csv = load_fraud_labels()
+    raw_history = fetch_member_history(normalized, lookback_days=lookback_days)
+    normalized_history = normalize_member_history(raw_history)
+    usable_history, matched_fraud_rows = apply_pre_fraud_cutoff(normalized_history, fraud_csv)
+    player_features = aggregate_member_features(usable_history)
+    if len(player_features) != 1:
+        raise HybridInferenceError("Expected exactly one aggregated player row for weekly member scoring.")
+
+    enforce_minimum_history(
+        player_features=player_features,
+        raw_rows=int(len(raw_history)),
+        min_rows=MIN_WEEKLY_HISTORY_ROWS,
+        min_draws=MIN_WEEKLY_DRAWS,
+        lookback_days=lookback_days,
+    )
+
+    scored_member = score_feature_frame(
+        player_features,
+        artifacts,
+        lookback_days=lookback_days,
+        source="mongo_live",
+        risk_p80=float(weekly_scored["risk_score"].quantile(0.80)),
+        risk_p95=float(weekly_scored["risk_score"].quantile(0.95)),
+    )
+    row = scored_member.iloc[0].to_dict()
+    row.update(
+        {
+            "event_fraud_flag": int(matched_fraud_rows > 0),
+            "raw_history_rows": int(len(raw_history)),
+            "history_rows_used": int(len(usable_history)),
+            "matched_fraud_rows": int(matched_fraud_rows),
+            "lookback_days": int(lookback_days),
+            "score_reliability": reliability_label(
+                draws_played=int(player_features.loc[0, "draws_played"]),
+                raw_rows=int(len(raw_history)),
+            )[0],
+        }
+    )
+    row = append_reference_rank_fields(weekly_scored, row)
+    return ScoreResult(
+        scored_row=row,
+        source="mongo_live",
+        raw_rows=int(len(raw_history)),
+        history_rows_used=int(len(usable_history)),
+        matched_fraud_rows=int(matched_fraud_rows),
+        reliability=str(row["score_reliability"]),
+        notes=_weekly_score_notes(row, lookback_days),
+    )
+
+
+def score_member_id(
+    member_id: str,
+    force_rebuild_artifacts: bool = False,
+    lookback_days: int | None = None,
+    require_minimum_history: bool = False,
+) -> ScoreResult:
     normalized = validate_member_id(member_id)
     artifacts = ensure_artifacts(force_rebuild=force_rebuild_artifacts)
     fraud_csv = load_fraud_labels()
     reference = load_reference_scored()
 
-    raw_history = fetch_member_history(normalized)
+    raw_history = fetch_member_history(normalized, lookback_days=lookback_days)
     normalized_history = normalize_member_history(raw_history)
     usable_history, matched_fraud_rows = apply_pre_fraud_cutoff(normalized_history, fraud_csv)
     player_features = aggregate_member_features(usable_history)
     if len(player_features) != 1:
         raise HybridInferenceError("Expected exactly one aggregated player row for live scoring.")
+    if require_minimum_history and lookback_days is not None:
+        enforce_minimum_history(
+            player_features=player_features,
+            raw_rows=int(len(raw_history)),
+            min_rows=MIN_WEEKLY_HISTORY_ROWS,
+            min_draws=MIN_WEEKLY_DRAWS,
+            lookback_days=lookback_days,
+        )
 
     model_frame = make_model_frame(
         player_features,
@@ -686,6 +1061,8 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
         style_coords = [np.nan, np.nan]
     draws_played = int(player_features.loc[0, "draws_played"])
     reliability, notes = reliability_label(draws_played=draws_played, raw_rows=len(raw_history))
+    if lookback_days is not None:
+        notes.append(f"Score computed from the last {lookback_days} days of member activity.")
     notes.append("Risk tier is relative to the current analysis cohort and is not an absolute fraud probability.")
     if matched_fraud_rows:
         notes.append("Pre-fraud cutoff was applied because this member matches existing fraud labels.")
@@ -716,6 +1093,7 @@ def score_member_id(member_id: str, force_rebuild_artifacts: bool = False) -> Sc
             "raw_history_rows": int(len(raw_history)),
             "history_rows_used": int(len(usable_history)),
             "matched_fraud_rows": int(matched_fraud_rows),
+            "lookback_days": int(lookback_days) if lookback_days is not None else None,
             "score_reliability": reliability,
             "source": "mongo_live",
         }

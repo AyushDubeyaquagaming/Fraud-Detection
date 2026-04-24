@@ -4,9 +4,12 @@ pipeline:
   artifact_root: "artifacts"
   current_dir: "artifacts/current"
   random_seed: 42
+  weekly_serving_snapshot_config: "configs/batch_scoring.yaml"
 
 data_ingestion:
   source: "mongodb"
+  # Local cache target refreshed by Mongo ingestion. For local training, you can
+  # temporarily switch source=parquet and point this path at a known-good extract.
   parquet_path: "data_cache/fraud_modeling_pull.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
@@ -47,18 +50,6 @@ feature_engineering:
                "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
                "std_net_result", "pnl_volatility"]
   apply_pre_fraud_cutoff: true
-
-batch_scoring:
-  mode: "operational"
-  require_labels: false
-  # Operational pre-filter applied at SCORING time (not during training). Excludes
-  # low-activity players whose scores are statistically unreliable. Training still
-  # sees the full cohort so the unsupervised scaler reflects the full population.
-  operational_filter:
-    enabled: true
-    min_draws_played: 10
-  # Alert queue size for batch scoring output (maps to analyst review capacity).
-  alert_queue_size: 50
 
 model_evaluation:
   # Percentile buckets REPORTED in the evaluation output. The primary gate is at

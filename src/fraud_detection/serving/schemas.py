@@ -33,6 +33,30 @@ class ScoreResponse(BaseModel):
     model_version: str
 
 
+class InsufficientDataResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "insufficient_data",
+                "member_id": "GK00999999",
+                "detail": "Not enough weekly data is currently available for this member.",
+                "evaluated_at": "2026-04-22T15:03:55.299996+00:00",
+                "promoted_at": "2026-04-22T15:03:55.377091+00:00",
+                "source_run_id": "run_20260422_105102",
+                "model_version": "hybrid_v1",
+            }
+        }
+    )
+
+    status: Literal["insufficient_data"]
+    member_id: str
+    detail: str
+    evaluated_at: str | None = None
+    promoted_at: str | None = None
+    source_run_id: str
+    model_version: str
+
+
 class HealthResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -73,6 +97,10 @@ class ModelInfoResponse(BaseModel):
                 "source_run_id": "run_20260422_105102",
                 "promoted_at": "2026-04-22T15:03:55.377091+00:00",
                 "evaluated_at": "2026-04-22T15:03:55.299996+00:00",
+                "snapshot_available": True,
+                "snapshot_status": "ready",
+                "snapshot_reason": None,
+                "snapshot_lookback_days": 7,
                 "total_scored_members": 109708,
                 "tier_distribution": {
                     "LOW": 87766,
@@ -90,6 +118,10 @@ class ModelInfoResponse(BaseModel):
     source_run_id: str
     promoted_at: str | None
     evaluated_at: str | None
+    snapshot_available: bool
+    snapshot_status: Literal["ready", "insufficient_data"]
+    snapshot_reason: str | None = None
+    snapshot_lookback_days: int | None = None
     total_scored_members: int
     tier_distribution: TierDistribution
     anomaly_weight: float

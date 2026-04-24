@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/run_batch_scoring.py
-    python scripts/run_batch_scoring.py --config configs/config.yaml
+    python scripts/run_batch_scoring.py --config configs/batch_scoring.yaml
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fraud_detection.pipeline.batch_scoring_pipeline import BatchScoringPipeline
-from fraud_detection.constants.constants import CONFIG_FILE_PATH
+from fraud_detection.constants.constants import BATCH_SCORING_CONFIG_FILE_PATH
 
 
 def main() -> int:
@@ -22,8 +22,8 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=Path,
-        default=CONFIG_FILE_PATH,
-        help="Path to config.yaml (default: configs/config.yaml)",
+        default=BATCH_SCORING_CONFIG_FILE_PATH,
+        help="Path to batch scoring config (default: configs/batch_scoring.yaml)",
     )
     args = parser.parse_args()
 

@@ -8,16 +8,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from hybrid_inference import (
-    HybridInferenceError,
-    InvalidMemberIdError,
-    MemberNotFoundError,
-    ScoreResult,
-    ensure_artifacts,
-    score_member_id,
-    validate_member_id,
-)
-
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data_cache"
@@ -57,7 +47,6 @@ DISPLAY_COLUMNS = [
     "avg_tiny_bet_ratio",
 ]
 
-LIVE_RESULT_STATE_KEY = "live_result_payload"
 BEHAVIOUR_COLUMNS = ["cluster_id", "style_pc1", "style_pc2"]
 
 
@@ -69,16 +58,18 @@ def has_player_fields(player_row: pd.Series, fields: list[str]) -> bool:
     return all(field in player_row.index for field in fields)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=900)
 def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     if not SCORED_PATH.exists():
-        raise FileNotFoundError(f"Missing scored player file: {SCORED_PATH}")
+        raise FileNotFoundError(f"Scored cohort not found at {SCORED_PATH}")
+    if not ALERT_PATH.exists():
+        raise FileNotFoundError(f"Alert queue not found at {ALERT_PATH}")
     if not EVAL_PATH.exists():
-        raise FileNotFoundError(f"Missing evaluation file: {EVAL_PATH}")
+        raise FileNotFoundError(f"Evaluation metadata not found at {EVAL_PATH}")
 
     scored = pd.read_parquet(SCORED_PATH)
-    alert_queue = pd.read_csv(ALERT_PATH) if ALERT_PATH.exists() else pd.DataFrame()
-    with open(EVAL_PATH, "r", encoding="utf-8") as handle:
+    alert_queue = pd.read_csv(ALERT_PATH)
+    with EVAL_PATH.open() as handle:
         evaluation = json.load(handle)
 
     scored = scored.copy()
@@ -97,12 +88,6 @@ def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     scored["review_recommendation"] = np.where(review_recommendation.notna(), review_recommendation, "Unassigned")
 
     return scored, alert_queue, evaluation
-
-
-@st.cache_resource(show_spinner=False)
-def warm_inference_artifacts() -> bool:
-    ensure_artifacts()
-    return True
 
 
 def format_pct(value: float) -> str:
@@ -265,66 +250,35 @@ def with_review_labels(scored: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_augmented_reference(scored: pd.DataFrame, live_row: dict) -> pd.DataFrame:
-    combined = pd.concat([scored, pd.DataFrame([live_row])], ignore_index=True, sort=False)
-    return with_review_labels(combined)
-
-
 def get_member_row(scored: pd.DataFrame, member_id: str) -> pd.Series:
     return scored.loc[scored["member_id"] == member_id].iloc[0]
-
-
-def serialize_live_result(result: ScoreResult) -> dict:
-    return {
-        "member_id": result.scored_row["member_id"],
-        "scored_row": result.scored_row,
-        "raw_rows": result.raw_rows,
-        "history_rows_used": result.history_rows_used,
-        "matched_fraud_rows": result.matched_fraud_rows,
-        "reliability": result.reliability,
-        "notes": result.notes,
-        "source": result.source,
-    }
 
 
 def main() -> None:
     st.set_page_config(page_title="Hybrid Fraud Demo", page_icon="🎯", layout="wide")
     st.title("Hybrid Fraud Detection Demo")
     st.caption(
-        "Lookup a real member ID from the scored cohort and inspect the current hybrid risk output. "
-        "This demo shows ranking and review priority, not a final legal fraud verdict."
+        "Inspect the latest stored weekly serving snapshot. Training still uses the 90-day model pipeline, "
+        "but this app serves lookup-only scores from the most recent 7-day cohort written into artifacts/current."
     )
 
     try:
         scored, alert_queue, evaluation = load_assets()
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         st.error(str(exc))
         st.stop()
 
     scored = with_review_labels(scored)
 
-    if LIVE_RESULT_STATE_KEY not in st.session_state:
-        st.session_state[LIVE_RESULT_STATE_KEY] = None
-
-    try:
-        warm_inference_artifacts()
-        inference_ready = True
-        inference_error = None
-    except Exception as exc:
-        inference_ready = False
-        inference_error = str(exc)
-
     selected_member = None
-    live_result: ScoreResult | None = None
     player_row = None
-    reference_scored = scored
-    selected_source = "precomputed"
     query = ""
-    score_live = False
+    lookback_days = evaluation.get("lookback_days", 7)
 
     with st.sidebar:
         st.header("Demo Controls")
-        st.metric("Players in cohort", f"{len(scored):,}")
+        st.metric("Players in weekly cohort", f"{len(scored):,}")
+        st.metric("Scoring window", f"{lookback_days} days")
         st.metric("Known fraud in cohort", evaluation.get("fraud_players", 0))
         st.metric("High-risk players", evaluation.get("risk_tier_distribution", {}).get("HIGH", 0))
 
@@ -339,42 +293,14 @@ def main() -> None:
             matches = alert_queue["member_id"].astype(str).str.upper().tolist() if not alert_queue.empty else member_ids[:50]
 
         if query and query not in member_ids:
-            if inference_ready:
-                st.info("This ID is not in the local scored cohort. Use the button below to score it live from MongoDB.")
-            else:
-                st.warning(f"Live inference is unavailable: {inference_error}")
+            st.warning("This ID is not present in the latest stored weekly serving snapshot.")
 
-        selected_member = st.selectbox("Browse scored cohort", options=matches, index=0 if matches else None)
-        score_live = st.button("Score typed ID from MongoDB", type="primary", disabled=not bool(query) or not inference_ready, use_container_width=True)
+        default_index = 0
+        if query and query in matches:
+            default_index = matches.index(query)
+
+        selected_member = st.selectbox("Browse scored cohort", options=matches, index=default_index if matches else None)
         validation_mode = st.toggle("Internal validation mode", value=True, help="Show known-fraud labels and evaluation-only fields for internal review.")
-
-    live_payload = st.session_state.get(LIVE_RESULT_STATE_KEY)
-    if live_payload and live_payload.get("member_id") == query:
-        selected_source = "mongo_live"
-        reference_scored = build_augmented_reference(scored, live_payload["scored_row"])
-        selected_member = live_payload["member_id"]
-        player_row = get_member_row(reference_scored, selected_member)
-
-    if score_live and query:
-        try:
-            validated_query = validate_member_id(query)
-            if validated_query in scored["member_id"].values:
-                st.session_state[LIVE_RESULT_STATE_KEY] = None
-                live_payload = None
-                selected_member = validated_query
-                selected_source = "precomputed"
-            else:
-                with st.spinner("Fetching raw history from MongoDB and scoring the member..."):
-                    live_result = score_member_id(validated_query)
-                live_payload = serialize_live_result(live_result)
-                st.session_state[LIVE_RESULT_STATE_KEY] = live_payload
-                reference_scored = build_augmented_reference(scored, live_result.scored_row)
-                selected_member = validated_query
-                player_row = get_member_row(reference_scored, selected_member)
-                selected_source = "mongo_live"
-        except (InvalidMemberIdError, MemberNotFoundError, HybridInferenceError) as exc:
-            st.error(str(exc))
-            st.stop()
 
     if player_row is None:
         if not selected_member:
@@ -382,10 +308,7 @@ def main() -> None:
             st.stop()
         player_row = get_member_row(scored, selected_member)
 
-    if selected_source == "precomputed":
-        reference_scored = scored
-
-    rank_display = f"#{int(player_row['risk_rank'])} / {len(reference_scored):,}"
+    rank_display = f"#{int(player_row['risk_rank'])} / {len(scored):,}"
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Review recommendation", str(player_row["review_recommendation"]))
@@ -398,43 +321,23 @@ def main() -> None:
     c6.metric("Supervised score", f"{float(player_row['supervised_score']):.3f}", delta=f"{format_pct(float(player_row['supervised_percentile']))} percentile")
     c7.metric("Draws played", f"{int(player_row['draws_played']):,}")
 
-    if selected_source == "mongo_live" and live_payload is not None:
-        st.success(
-            f"Live-scored from MongoDB: {live_payload['raw_rows']} raw rows, {live_payload['history_rows_used']} usable history rows, reliability={live_payload['reliability']}."
-        )
-        for note in live_payload["notes"]:
-            st.warning(note)
-
     if validation_mode:
         label_available = "event_fraud_flag" in player_row.index and not pd.isna(player_row.get("event_fraud_flag"))
-        if selected_source == "mongo_live":
-            if label_available:
-                st.info(
-                    f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
-                    "Evaluation-only scores are not available for one-off live scoring."
-                )
-            else:
-                st.info("Known-fraud labels are not available for this live-scored view. Evaluation-only scores are not available for one-off live scoring.")
+        if label_available:
+            st.info(
+                f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
+                f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
+            )
         else:
-            if label_available:
-                st.info(
-                    f"Known-fraud label in current extract: {int(player_row['event_fraud_flag'])} | "
-                    f"Evaluation-only hybrid score: {format_value(player_row.get('risk_score_eval', np.nan))}"
-                )
-            else:
-                st.info("Known-fraud labels are not present in the current operational artifact bundle. Evaluation-only fields are unavailable unless you load a replay-eval output.")
+            st.info("Known-fraud labels are not present in the current operational artifact bundle. Evaluation-only fields are unavailable unless you load a replay-eval output.")
 
     tab1, tab2, tab3, tab4 = st.tabs(["Player Summary", "Feature Profile", "Behaviour Map", "Alert Queue"])
 
     with tab1:
         st.subheader(f"Member {selected_member}")
         summary_cols = DISPLAY_COLUMNS.copy()
-        if validation_mode and selected_source != "mongo_live":
+        if validation_mode:
             summary_cols += ["event_fraud_flag", "risk_score_eval", "supervised_score_eval"]
-        elif validation_mode:
-            summary_cols += ["event_fraud_flag"]
-        if selected_source == "mongo_live":
-            summary_cols += ["raw_history_rows", "history_rows_used", "matched_fraud_rows", "score_reliability", "source"]
         summary_cols = [col for col in summary_cols if col in player_row.index]
         summary_df = pd.DataFrame(
             {
@@ -444,7 +347,7 @@ def main() -> None:
         )
         st.dataframe(summary_df, width="stretch", hide_index=True)
 
-        peers = nearest_peers(reference_scored, player_row)
+        peers = nearest_peers(scored, player_row)
         st.subheader("Nearest behavioural peers")
         if peers.empty:
             st.info("Behaviour-space peer lookup is unavailable because the current artifact bundle does not include style coordinates.")
@@ -452,7 +355,7 @@ def main() -> None:
             st.dataframe(peers, width="stretch", hide_index=True)
 
     with tab2:
-        profile_df = feature_profile(reference_scored, player_row)
+        profile_df = feature_profile(scored, player_row)
         st.subheader("Selected feature percentiles vs cohort")
         if profile_df.empty:
             st.warning("No profile features available.")
@@ -475,7 +378,7 @@ def main() -> None:
 
     with tab3:
         st.subheader("Player position in behaviour space")
-        fig = pca_chart(reference_scored, player_row)
+        fig = pca_chart(scored, player_row)
         if fig is None:
             st.info("Behaviour-map coordinates are not present in the current operational artifact bundle, so this view is unavailable.")
         else:
@@ -486,9 +389,9 @@ def main() -> None:
             )
 
     with tab4:
-        st.subheader("Current alert queue")
+        st.subheader("Current weekly alert queue")
         if alert_queue.empty:
-            st.warning("alert_queue.csv not found.")
+            st.warning("Weekly alert queue is empty.")
         else:
             queue_view = alert_queue.copy()
             queue_view["selected"] = queue_view["member_id"].astype(str).str.upper().eq(selected_member)

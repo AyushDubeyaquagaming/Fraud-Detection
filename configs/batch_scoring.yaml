@@ -1,0 +1,43 @@
+pipeline:
+  current_dir: "artifacts/current"
+
+data_ingestion:
+  # Batch scoring is designed to operate from a prepared parquet extract.
+  # Point this at the latest available raw cohort parquet for weekly serving.
+  source: "parquet"
+  parquet_path: "artifacts/runs/run_20260422_105102/data_ingestion/raw_data.parquet"
+  mongodb:
+    uri_env_var: "MONGODB_URI"
+    database_env_var: "MONGODB_DATABASE"
+    collection_env_var: "MONGODB_COLLECTION_ROULETTE_REPORT"
+    strategy: "date_window"
+    strategy_params:
+      timestamp_field: "trans_date"
+      lookback_days: 7
+      start_date: null
+      end_date: null
+      confirm_full_pull: false
+
+data_validation:
+  fraud_csv_path: "ROULET CHEATING DATA.csv"
+
+feature_engineering:
+  exclude_cols: ["member_id", "event_fraud_flag", "primary_ccs_id",
+                 "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player"]
+  log1p_cols: ["total_staked", "avg_stake_per_draw", "median_stake_per_draw",
+               "stake_std", "max_stake_per_draw", "stake_cv",
+               "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
+               "std_net_result", "pnl_volatility"]
+
+batch_scoring:
+  mode: "operational"
+  require_labels: false
+  window:
+    timestamp_field: "trans_date"
+    lookback_days: 7
+    start_date: null
+    end_date: null
+  operational_filter:
+    enabled: true
+    min_draws_played: 10
+  alert_queue_size: 50

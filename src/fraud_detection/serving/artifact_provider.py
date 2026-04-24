@@ -9,11 +9,12 @@ from typing import Any
 import pandas as pd
 
 from fraud_detection.constants.constants import (
-    EVALUATION_REPORT_FILE,
+    HYBRID_EVALUATION_FILE,
+    HYBRID_SCORED_PLAYERS_FILE,
     PROMOTION_METADATA_FILE,
     REPO_ROOT,
     RUN_METADATA_FILE,
-    SCORED_PLAYERS_FILE,
+    WEEKLY_SCORING_MANIFEST_FILE,
 )
 from fraud_detection.utils.common import load_parquet, read_json
 
@@ -22,9 +23,12 @@ from fraud_detection.utils.common import load_parquet, read_json
 class ArtifactBundle:
     scored_players_df: pd.DataFrame
     serving_manifest: dict[str, Any]
+    snapshot_metadata: dict[str, Any]
     promotion_metadata: dict[str, Any]
     evaluation_metadata: dict[str, Any]
     run_metadata: dict[str, Any]
+    snapshot_available: bool
+    snapshot_reason: str | None
     loaded_at: datetime
     source_run_id: str
     promoted_at: str | None
@@ -64,29 +68,64 @@ class LocalDiskArtifactProvider(ArtifactProvider):
 
         manifest = read_json(self.manifest_path)
         run_dir = Path(manifest["run_dir"])
+        snapshot_manifest_path = self.current_dir / WEEKLY_SCORING_MANIFEST_FILE
+        snapshot_metadata = read_json(snapshot_manifest_path) if snapshot_manifest_path.exists() else {}
+        snapshot_scored_path = self.current_dir / snapshot_metadata.get("scored_players_file", HYBRID_SCORED_PLAYERS_FILE)
+        snapshot_eval_path = self.current_dir / snapshot_metadata.get("evaluation_file", HYBRID_EVALUATION_FILE)
+        snapshot_available = bool(snapshot_metadata) and snapshot_scored_path.exists() and snapshot_eval_path.exists()
 
-        scored_path = run_dir / "model_evaluation" / SCORED_PLAYERS_FILE
-        eval_path = run_dir / "model_evaluation" / EVALUATION_REPORT_FILE
+        if not snapshot_metadata:
+            snapshot_reason = "Weekly serving snapshot has not been generated yet."
+        elif not snapshot_available:
+            snapshot_reason = "Weekly serving snapshot artifacts are incomplete."
+        else:
+            snapshot_reason = None
+
         run_meta_path = run_dir / RUN_METADATA_FILE
         promotion_meta_path = self.current_dir / PROMOTION_METADATA_FILE
 
-        df = load_parquet(scored_path)
-        df["member_id"] = df["member_id"].astype(str).str.strip().str.upper()
-        df = df.set_index("member_id", drop=False)
-
-        evaluation_metadata = read_json(eval_path)
         run_metadata = read_json(run_meta_path)
         promotion_metadata = read_json(promotion_meta_path) if promotion_meta_path.exists() else {}
+
+        if snapshot_available:
+            df = load_parquet(snapshot_scored_path)
+            df["member_id"] = df["member_id"].astype(str).str.strip().str.upper()
+            df = df.set_index("member_id", drop=False)
+            evaluation_metadata = read_json(snapshot_eval_path)
+        else:
+            df = pd.DataFrame(columns=["member_id"]).set_index("member_id", drop=False)
+            evaluation_metadata = {
+                "scored_at": None,
+                "total_players": 0,
+                "risk_tier_distribution": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
+                "anomaly_weight": 0.6,
+                "supervised_weight": 0.4,
+                "snapshot_status": "insufficient_data",
+                "snapshot_reason": snapshot_reason,
+            }
+
+        snapshot_metadata = {
+            **snapshot_metadata,
+            "snapshot_available": snapshot_available,
+            "snapshot_status": "ready" if snapshot_available else "insufficient_data",
+            "snapshot_reason": snapshot_reason,
+        }
 
         return ArtifactBundle(
             scored_players_df=df,
             serving_manifest=manifest,
+            snapshot_metadata=snapshot_metadata,
             promotion_metadata=promotion_metadata,
             evaluation_metadata=evaluation_metadata,
             run_metadata=run_metadata,
+            snapshot_available=snapshot_available,
+            snapshot_reason=snapshot_reason,
             loaded_at=datetime.now(timezone.utc),
-            source_run_id=manifest["run_id"],
+            source_run_id=str(snapshot_metadata.get("source_run_id") or manifest["run_id"]),
             promoted_at=manifest.get("promoted_at"),
-            evaluated_at=evaluation_metadata.get("evaluated_at"),
-            model_version=manifest.get("model_version", self.default_model_version),
+            evaluated_at=evaluation_metadata.get("scored_at") or evaluation_metadata.get("evaluated_at"),
+            model_version=str(
+                snapshot_metadata.get("model_version")
+                or manifest.get("model_version", self.default_model_version)
+            ),
         )
