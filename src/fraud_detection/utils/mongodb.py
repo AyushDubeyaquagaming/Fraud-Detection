@@ -29,6 +29,7 @@ MEMBER_LIST_CHUNK_SIZE = 10_000
 TIMESTAMP_COLUMNS = ("createdAt", "trans_date", "updatedAt")
 
 MONGO_PROJECTION = {
+    "_id": 0,
     "member_id": 1,
     "draw_id": 1,
     "bets": 1,

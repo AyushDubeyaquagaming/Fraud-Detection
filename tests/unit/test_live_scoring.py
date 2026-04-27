@@ -428,3 +428,148 @@ def test_endpoint_normalizes_member_id_case(tmp_path):
         r = c.post("/score/historical", json={"member_id": "gk001", "start_date": "2026-04-01T00:00:00Z", "end_date": "2026-04-03T00:00:00Z"})
     assert r.status_code == 200
     assert r.json()["member_id"] == "GK001"
+
+
+def test_live_path_never_calls_pd_read_parquet(tmp_path, monkeypatch):
+    """Memory-safety guard: a single live request must not trigger a full
+    `pd.read_parquet` of the training cohort. We replace `pd.read_parquet`
+    with a sentinel that raises if called, then exercise the resolver end
+    to end. The streaming pyarrow scanner should be the only path used.
+    """
+    raw_df = _raw_rows()
+    raw_path = tmp_path / "raw.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError(
+            "pd.read_parquet must not be called from the live path — bounds "
+            "should come from row-group metadata and per-request reads should "
+            "stream via pyarrow.dataset.scanner."
+        )
+
+    monkeypatch.setattr("pandas.read_parquet", _boom)
+
+    resolver = WindowResolver(raw_path)
+    monkeypatch.setattr(resolver, "_pull_from_mongo", lambda *args, **kwargs: pd.DataFrame())
+    data = resolver.resolve(
+        "GK001",
+        pd.Timestamp("2026-04-02T00:00:00Z").to_pydatetime(),
+        pd.Timestamp("2026-04-05T00:00:00Z").to_pydatetime(),
+    )
+    assert data.parquet_rows >= 1
+
+
+def test_mongo_pull_uses_projection_and_batch_size(tmp_path, monkeypatch):
+    """Mongo lean-read guard (Fix 4): the live path must call
+    `collection.find(query, MONGO_PROJECTION).batch_size(...)` rather than
+    `find(query)` — the latter pulls every document field, which is what
+    drove the original RAM blow-up.
+    """
+    from fraud_detection.utils import mongodb as mongodb_module
+
+    captured = {"projection": None, "batch_size": None}
+
+    class _FakeCursor:
+        def __init__(self):
+            self._docs = []
+
+        def batch_size(self, value):
+            captured["batch_size"] = value
+            return self
+
+        def close(self):
+            pass
+
+        def __iter__(self):
+            return iter(self._docs)
+
+    class _FakeCollection:
+        def find(self, query, projection=None):  # noqa: ARG002 - signature mirrors pymongo
+            captured["projection"] = projection
+            return _FakeCursor()
+
+    monkeypatch.setattr(
+        "fraud_detection.serving.live_scoring.window_resolver.get_serving_mongo_collection",
+        lambda *args, **kwargs: _FakeCollection(),
+    )
+
+    raw_df = _raw_rows()
+    raw_path = tmp_path / "raw.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+    resolver = WindowResolver(
+        raw_path,
+        parquet_start_date=pd.Timestamp("2026-04-01T00:00:00Z").to_pydatetime(),
+        parquet_end_date=pd.Timestamp("2026-04-06T00:00:00Z").to_pydatetime(),
+    )
+    resolver.resolve(
+        "GK001",
+        pd.Timestamp("2026-03-25T00:00:00Z").to_pydatetime(),
+        pd.Timestamp("2026-04-08T00:00:00Z").to_pydatetime(),
+    )
+
+    assert captured["projection"] == mongodb_module.MONGO_PROJECTION
+    assert captured["batch_size"] == 10_000
+
+
+def test_mongo_pull_serializes_bson_like_bets_and_drops_id(tmp_path, monkeypatch):
+    class _FakeObjectId:
+        def __str__(self):
+            return "fake-object-id"
+
+    class _FakeCursor:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def batch_size(self, _value):
+            return self
+
+        def close(self):
+            pass
+
+        def __iter__(self):
+            return iter(self._docs)
+
+    class _FakeCollection:
+        def find(self, _query, _projection=None):
+            return _FakeCursor(
+                [
+                    {
+                        "_id": _FakeObjectId(),
+                        "member_id": "GK001",
+                        "draw_id": 2001,
+                        "bets": [{"number": "7", "bet_amount": 15.0, "bet_id": _FakeObjectId()}],
+                        "win_points": 3.0,
+                        "total_bet_amount": 15.0,
+                        "session_id": 9,
+                        "ccs_id": "CCS1",
+                        "createdAt": pd.Timestamp("2026-04-07T00:00:00Z").to_pydatetime(),
+                        "updatedAt": pd.Timestamp("2026-04-07T00:00:00Z").to_pydatetime(),
+                        "trans_date": pd.Timestamp("2026-04-07T00:00:00Z").to_pydatetime(),
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        "fraud_detection.serving.live_scoring.window_resolver.get_serving_mongo_collection",
+        lambda *args, **kwargs: _FakeCollection(),
+    )
+
+    raw_df = _raw_rows().iloc[:1].copy()
+    raw_path = tmp_path / "raw.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+    resolver = WindowResolver(
+        raw_path,
+        parquet_start_date=pd.Timestamp("2026-04-01T00:00:00Z").to_pydatetime(),
+        parquet_end_date=pd.Timestamp("2026-04-06T00:00:00Z").to_pydatetime(),
+    )
+
+    mongo_df = resolver._pull_from_mongo(
+        "GK001",
+        pd.Timestamp("2026-04-06T00:00:00Z").to_pydatetime(),
+        pd.Timestamp("2026-04-08T00:00:00Z").to_pydatetime(),
+        start_inclusive=False,
+    )
+
+    assert len(mongo_df) == 1
+    assert "_id" not in mongo_df.columns
+    assert mongo_df.iloc[0]["bets"] == '[{"number": "7", "bet_amount": 15.0, "bet_id": "fake-object-id"}]'

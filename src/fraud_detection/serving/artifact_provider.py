@@ -8,7 +8,6 @@ from typing import Any
 
 import pandas as pd
 
-from fraud_detection.components.feature_engineering import _normalize_timestamp
 from fraud_detection.constants.constants import (
     HYBRID_EVALUATION_FILE,
     HYBRID_SCORED_PLAYERS_FILE,
@@ -18,6 +17,8 @@ from fraud_detection.constants.constants import (
     WEEKLY_SCORING_MANIFEST_FILE,
 )
 from fraud_detection.utils.common import load_joblib, load_parquet, read_json
+
+from .live_scoring.parquet_metadata import read_training_parquet_bounds
 
 
 @dataclass(frozen=True)
@@ -127,21 +128,17 @@ class LocalDiskArtifactProvider(ArtifactProvider):
                 model_bundle = None
 
         # Resolve canonical raw parquet from the promoted run directory.
+        # Bounds are read from row-group metadata (no full-file load) to keep
+        # API startup memory-safe even when the training parquet is multi-GB.
         training_raw_parquet_path: Path | None = None
         training_parquet_start_date: datetime | None = None
         training_parquet_end_date: datetime | None = None
         _candidate = run_dir / "data_ingestion" / "raw_data.parquet"
         if _candidate.exists():
             training_raw_parquet_path = _candidate
-            try:
-                parquet_sample = pd.read_parquet(_candidate)
-                normalized_ts = _normalize_timestamp(parquet_sample).dropna()
-                if not normalized_ts.empty:
-                    training_parquet_start_date = normalized_ts.min().to_pydatetime()
-                    training_parquet_end_date = normalized_ts.max().to_pydatetime()
-            except Exception:
-                training_parquet_start_date = None
-                training_parquet_end_date = None
+            training_parquet_start_date, training_parquet_end_date = (
+                read_training_parquet_bounds(_candidate)
+            )
 
         return ArtifactBundle(
             scored_players_df=df,

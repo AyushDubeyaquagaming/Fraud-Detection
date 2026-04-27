@@ -6,8 +6,7 @@ from pathlib import Path
 import re
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 from fraud_detection.components.feature_engineering import (
     FEATURE_ENGINEERING_RAW_COLUMNS,
@@ -20,9 +19,26 @@ from fraud_detection.constants.constants import (
     ENV_MONGODB_URI,
 )
 from fraud_detection.logger import get_logger
-from fraud_detection.utils.mongodb import get_serving_mongo_collection
+from fraud_detection.utils.mongodb import MONGO_PROJECTION, _serialize_bets, get_serving_mongo_collection
+
+from .parquet_metadata import read_training_parquet_bounds
 
 logger = get_logger(__name__)
+
+# Per-request streaming and safety caps. Bounded so a single live request can
+# never accidentally materialize an entire parquet window or Mongo cursor.
+LIVE_MONGO_BATCH_SIZE = 10_000
+LIVE_MONGO_MAX_DOCS = 100_000
+
+# Cap retained matched rows per request as a defense-in-depth limit. A single
+# member's draws over a few weeks should never approach this — if we hit it,
+# something is wrong upstream and we'd rather log+truncate than OOM.
+LIVE_PARQUET_MAX_RETAINED_ROWS = 500_000
+
+# Mongo timestamp candidates — only fields that actually exist in the source
+# collection (per MONGO_PROJECTION). The longer TIMESTAMP_CANDIDATES list is
+# parquet-only (it includes post-FE artifacts like `ts` and `*.$date`).
+MONGO_TIMESTAMP_CANDIDATES = ("trans_date", "createdAt", "updatedAt")
 
 
 class MongoWindowFetchError(RuntimeError):
@@ -69,46 +85,6 @@ class WindowResolver:
                 ordered.append(col)
         return ordered
 
-    @staticmethod
-    def _to_arrow_filter_bound(value: datetime, arrow_type: pa.DataType) -> object:
-        timestamp = pd.Timestamp(value)
-        if pa.types.is_timestamp(arrow_type):
-            if arrow_type.tz:
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.tz_localize("UTC")
-                else:
-                    timestamp = timestamp.tz_convert(arrow_type.tz)
-            else:
-                if timestamp.tzinfo is not None:
-                    timestamp = timestamp.tz_convert("UTC").tz_localize(None)
-            return timestamp.to_pydatetime()
-        if pa.types.is_date32(arrow_type) or pa.types.is_date64(arrow_type):
-            if timestamp.tzinfo is not None:
-                timestamp = timestamp.tz_convert("UTC").tz_localize(None)
-            return timestamp.date()
-        return timestamp.to_pydatetime()
-
-    def _build_coarse_parquet_filter(
-        self,
-        dataset: ds.Dataset,
-        start: datetime,
-        end: datetime,
-        *,
-        inclusive_end: bool,
-    ):
-        available_ts = self._available_timestamp_columns(dataset.schema.names)
-        if not available_ts:
-            return None
-        expression = None
-        for coarse_field in available_ts:
-            arrow_type = dataset.schema.field(coarse_field).type
-            lower = ds.field(coarse_field) >= self._to_arrow_filter_bound(start, arrow_type)
-            upper_bound = self._to_arrow_filter_bound(end, arrow_type)
-            upper = ds.field(coarse_field) <= upper_bound if inclusive_end else ds.field(coarse_field) < upper_bound
-            clause = lower & upper
-            expression = clause if expression is None else (expression | clause)
-        return expression
-
     def _post_filter_rows(
         self,
         df: pd.DataFrame,
@@ -136,18 +112,12 @@ class WindowResolver:
         if self._parquet_start_date is not None and self._parquet_end_date is not None:
             return self._parquet_start_date, self._parquet_end_date
 
-        schema = ds.dataset(self.training_parquet_path, format="parquet").schema
-        timestamp_columns = self._available_timestamp_columns(schema.names)
-        if not timestamp_columns:
-            return None, None
-        df = pd.read_parquet(self.training_parquet_path, columns=timestamp_columns)
-        valid = _normalize_timestamp(df).dropna()
-        if valid.empty:
-            self._parquet_start_date = None
-            self._parquet_end_date = None
-        else:
-            self._parquet_start_date = valid.min().to_pydatetime()
-            self._parquet_end_date = valid.max().to_pydatetime()
+        # Read bounds from the parquet footer (row-group statistics) — no row
+        # data is loaded. Falls back to a streamed single-column scan only if
+        # statistics are missing. Never holds the full parquet in memory.
+        start_date, end_date = read_training_parquet_bounds(self.training_parquet_path)
+        self._parquet_start_date = start_date
+        self._parquet_end_date = end_date
         return self._parquet_start_date, self._parquet_end_date
 
     def resolve(self, member_id: str, start_date: datetime, end_date: datetime) -> WindowData:
@@ -209,6 +179,52 @@ class WindowResolver:
             training_parquet_end_date=parquet_end,
         )
 
+    @staticmethod
+    def _to_utc_timestamp(value: datetime) -> pd.Timestamp:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    def _row_group_overlaps_window(
+        self,
+        rg_metadata,
+        ts_column_indices: list[int],
+        start: datetime,
+        end: datetime,
+        *,
+        inclusive_end: bool,
+    ) -> bool:
+        """Decide if a row group could contain rows in [start, end).
+
+        Uses parquet column statistics on every available timestamp candidate.
+        If ANY candidate's [min,max] overlaps the request window, the row group
+        is in-scope. If statistics are missing for every candidate, we must
+        include the row group (cannot prove it's empty).
+        """
+        start_ts = self._to_utc_timestamp(start)
+        end_ts = self._to_utc_timestamp(end)
+        any_stats = False
+        for ts_idx in ts_column_indices:
+            stats = rg_metadata.column(ts_idx).statistics
+            if stats is None or not stats.has_min_max:
+                continue
+            any_stats = True
+            rg_min = pd.to_datetime(stats.min, utc=True, errors="coerce")
+            rg_max = pd.to_datetime(stats.max, utc=True, errors="coerce")
+            if pd.isna(rg_min) or pd.isna(rg_max):
+                continue
+            if rg_max < start_ts:
+                continue
+            if inclusive_end:
+                if rg_min > end_ts:
+                    continue
+            else:
+                if rg_min >= end_ts:
+                    continue
+            return True
+        return not any_stats
+
     def _pull_from_parquet(
         self,
         member_id: str,
@@ -217,15 +233,97 @@ class WindowResolver:
         *,
         inclusive_end: bool,
     ) -> pd.DataFrame:
-        dataset = ds.dataset(self.training_parquet_path, format="parquet")
-        parquet_columns = [col for col in FEATURE_ENGINEERING_RAW_COLUMNS if col in dataset.schema.names]
-        for col in self._available_timestamp_columns(dataset.schema.names):
+        """Read this member's draws from the promoted training parquet without
+        ever holding more than one row group in memory at a time.
+
+        Why a manual row-group loop: pyarrow's `dataset.scanner` with a combined
+        ts+member_id filter still has to materialize each in-window row group
+        in an internal buffer to evaluate the row-level member_id predicate
+        (parquet column statistics on `member_id` aren't selective because the
+        data is sorted by time, not member). On a 15 GB / 4045-row-group
+        training parquet the resulting buffering caused +1.2 GB RSS per request.
+        Iterating row groups by hand gives explicit control of the load/filter/
+        free cycle so peak RAM stays at one row-group's worth (~30 MB).
+        """
+        pf = pq.ParquetFile(str(self.training_parquet_path))
+        schema_names = pf.schema_arrow.names
+
+        parquet_columns = [col for col in FEATURE_ENGINEERING_RAW_COLUMNS if col in schema_names]
+        for col in self._available_timestamp_columns(schema_names):
             if col not in parquet_columns:
                 parquet_columns.append(col)
-        coarse_filter = self._build_coarse_parquet_filter(dataset, start, end, inclusive_end=inclusive_end)
-        table = dataset.to_table(columns=parquet_columns, filter=coarse_filter)
-        df = table.to_pandas()
-        return self._post_filter_rows(df, member_id, start, end, inclusive_end=inclusive_end)
+        if "member_id" in schema_names and "member_id" not in parquet_columns:
+            parquet_columns.append("member_id")
+
+        ts_column_indices = [
+            pf.schema_arrow.get_field_index(col)
+            for col in self._available_timestamp_columns(schema_names)
+        ]
+        ts_column_indices = [i for i in ts_column_indices if i >= 0]
+
+        normalized = self._normalize_member_id(member_id)
+        frames: list[pd.DataFrame] = []
+        retained_rows = 0
+        truncated = False
+
+        for rg_idx in range(pf.num_row_groups):
+            rg_meta = pf.metadata.row_group(rg_idx)
+            if not self._row_group_overlaps_window(
+                rg_meta, ts_column_indices, start, end, inclusive_end=inclusive_end
+            ):
+                continue
+
+            table = pf.read_row_group(rg_idx, columns=parquet_columns)
+            df = table.to_pandas()
+            del table
+
+            if "member_id" not in df.columns or df.empty:
+                continue
+            normalized_ids = df["member_id"].astype(str).str.strip().str.upper()
+            df = df.loc[normalized_ids == normalized]
+            if df.empty:
+                continue
+
+            frames.append(df)
+            retained_rows += len(df)
+            if retained_rows >= LIVE_PARQUET_MAX_RETAINED_ROWS:
+                logger.warning(
+                    "Live parquet pull hit retention cap of %d rows for member=%s "
+                    "window=[%s, %s); truncating.",
+                    LIVE_PARQUET_MAX_RETAINED_ROWS,
+                    member_id,
+                    start.isoformat(),
+                    end.isoformat(),
+                )
+                truncated = True
+                break
+
+        if not frames:
+            return pd.DataFrame()
+
+        result = pd.concat(frames, ignore_index=True)
+        if truncated:
+            result.attrs["truncated"] = True
+        return self._post_filter_rows(result, member_id, start, end, inclusive_end=inclusive_end)
+
+    def _mongo_timestamp_candidates(self) -> list[str]:
+        """Return Mongo timestamp candidates, scoped to fields that actually exist
+        in the source collection.
+
+        The longer parquet-side `TIMESTAMP_CANDIDATES` list includes post-FE
+        artifacts like `ts` and `*.$date` which are never stored in Mongo. Each
+        added candidate forces an additional clause in the `$or` query — and
+        without an index on every clause that becomes a collection scan. Restrict
+        to the three fields in `MONGO_PROJECTION` (trans_date, createdAt,
+        updatedAt), with the configured `timestamp_field` first.
+        """
+        ordered: list[str] = []
+        for candidate in (self.timestamp_field, *MONGO_TIMESTAMP_CANDIDATES):
+            if candidate in MONGO_TIMESTAMP_CANDIDATES and candidate not in ordered:
+                ordered.append(candidate)
+        if not ordered and self.timestamp_field:
+            ordered.append(self.timestamp_field)
+        return ordered
 
     def _pull_from_mongo(
         self,
@@ -252,21 +350,43 @@ class WindowResolver:
             member_regex = rf"^\s*{re.escape(self._normalize_member_id(member_id))}\s*$"
             ts_clauses = [
                 {candidate: {start_operator: start, "$lt": end}}
-                for candidate in dict.fromkeys((self.timestamp_field, *self.timestamp_candidates))
+                for candidate in self._mongo_timestamp_candidates()
             ]
             query = {
                 "member_id": {"$regex": member_regex, "$options": "i"},
-                "$or": ts_clauses,
             }
-            docs = list(collection.find(query))
+            if len(ts_clauses) == 1:
+                query.update(ts_clauses[0])
+            elif ts_clauses:
+                query["$or"] = ts_clauses
+
+            cursor = collection.find(query, MONGO_PROJECTION).batch_size(LIVE_MONGO_BATCH_SIZE)
+            docs: list[dict] = []
+            try:
+                for doc in cursor:
+                    docs.append(doc)
+                    if len(docs) >= LIVE_MONGO_MAX_DOCS:
+                        logger.warning(
+                            "Live Mongo fetch hit safety cap of %d docs for member=%s "
+                            "window=[%s, %s); truncating.",
+                            LIVE_MONGO_MAX_DOCS,
+                            member_id,
+                            start.isoformat(),
+                            end.isoformat(),
+                        )
+                        break
+            finally:
+                cursor.close()
+
             if not docs:
                 return pd.DataFrame()
 
             df = pd.DataFrame(docs)
+            df = df.drop(columns=["_id"], errors="ignore")
             if "bets" in df.columns:
-                import json
-
-                df["bets"] = df["bets"].apply(lambda x: json.dumps(x) if not isinstance(x, str) else x)
+                df["bets"] = df["bets"].apply(_serialize_bets)
             return self._post_filter_rows(df, member_id, start, end, inclusive_end=False)
+        except MongoWindowFetchError:
+            raise
         except Exception as exc:
             raise MongoWindowFetchError(f"MongoDB window fetch failed: {exc}") from exc

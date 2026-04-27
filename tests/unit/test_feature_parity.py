@@ -58,3 +58,45 @@ def test_single_player_features_match_bulk_for_same_member():
             np.testing.assert_allclose([left], [right], rtol=1e-9, atol=1e-12)
         else:
             assert left == right
+
+
+def _assert_feature_rows_equal(left: pd.DataFrame, right: pd.DataFrame) -> None:
+    assert list(left.columns) == list(right.columns)
+    assert len(left) == len(right) == 1
+    for column in left.columns:
+        a = left.iloc[0][column]
+        b = right.iloc[0][column]
+        if pd.api.types.is_number(a) and pd.api.types.is_number(b):
+            np.testing.assert_allclose([a], [b], rtol=1e-9, atol=1e-12)
+        else:
+            assert a == b
+
+
+def test_features_invariant_to_member_id_whitespace_and_case():
+    """Member-id normalization parity (review finding #2): the live path must
+    produce identical features whether the raw_df has the id as 'A001',
+    '  a001  ', or 'a001'. This guards against regressions where the live
+    feature builder skips normalization and yields different aggregates.
+    """
+    base = _raw_df()
+    canonical = compute_single_player_features(
+        base.loc[base["member_id"] == "A001"].reset_index(drop=True),
+        ccs_stats_lookup=build_ccs_stats_lookup(_normalize_raw_df(base)),
+    )
+
+    padded = base.loc[base["member_id"] == "A001"].copy()
+    padded["member_id"] = "  a001  "
+    padded_features = compute_single_player_features(
+        padded.reset_index(drop=True),
+        ccs_stats_lookup=build_ccs_stats_lookup(_normalize_raw_df(base)),
+    )
+
+    lower = base.loc[base["member_id"] == "A001"].copy()
+    lower["member_id"] = "a001"
+    lower_features = compute_single_player_features(
+        lower.reset_index(drop=True),
+        ccs_stats_lookup=build_ccs_stats_lookup(_normalize_raw_df(base)),
+    )
+
+    _assert_feature_rows_equal(canonical, padded_features)
+    _assert_feature_rows_equal(canonical, lower_features)
