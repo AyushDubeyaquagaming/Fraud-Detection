@@ -247,3 +247,104 @@ class TestSampling:
 
         assert len(sampled) == 3
         assert sampled["event_fraud_flag"].eq(1).all()
+
+
+class TestSelfReferenceGuard:
+    def test_skips_when_reference_run_dir_equals_current_run_dir(self, monitoring_config, tmp_path):
+        """Force-promote ordering bug regression test: if promotion_metadata.json
+        points at the same run we're now monitoring, monitoring must skip
+        rather than loading the same large parquet twice and OOMing.
+        """
+        run_dir = tmp_path / "run_self"
+        run_dir.mkdir()
+        current_dir = tmp_path / "current"
+        current_dir.mkdir()
+
+        paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
+
+        # promotion_metadata points at the SAME run we are monitoring
+        meta = {"gate_passed": True, "run_dir": str(run_dir)}
+        (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
+
+        ingestion, fe, ev = _make_artifacts(paths)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        artifact = mon.initiate_monitoring()
+
+        assert artifact.monitoring_completed is False
+        # No reports written because we skipped before any drift work
+        assert artifact.reports_dir is None
+
+
+class TestBoundedParquetSampling:
+    def test_does_not_call_pd_read_parquet_on_full_file(self, monitoring_config, tmp_path, monkeypatch):
+        """Regression test for the RAM blowup: sampling must use pyarrow row
+        groups, NOT pd.read_parquet on the full file. We replace pd.read_parquet
+        with a sentinel that fails the test if invoked on a path that wasn't
+        already written by the test fixture (i.e. used as the legitimate
+        small-file fast path)."""
+        ref_run_dir = tmp_path / "ref_run"
+        cur_run_dir = tmp_path / "cur_run"
+        current_dir = tmp_path / "current"
+        current_dir.mkdir()
+
+        ref_paths = _write_run_artifacts(ref_run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
+        cur_paths = _write_run_artifacts(cur_run_dir, _make_raw_df(300), _make_feature_df(200), _make_scored_df(200))
+
+        meta = {"gate_passed": True, "run_dir": str(ref_run_dir)}
+        (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
+
+        # Track all calls to pd.read_parquet
+        from fraud_detection.components import monitoring as mon_module
+        calls = []
+        original = mon_module.pd.read_parquet
+
+        def tracked(path, *args, **kwargs):
+            calls.append(str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(mon_module.pd, "read_parquet", tracked)
+
+        ingestion, fe, ev = _make_artifacts(cur_paths)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, cur_run_dir)
+        mon.initiate_monitoring()
+
+        # The bounded sampler uses pq.ParquetFile.read() / read_row_group(),
+        # not pd.read_parquet, regardless of file size. So calls must be empty.
+        assert calls == [], (
+            f"Monitoring must NOT call pd.read_parquet — it loads the whole "
+            f"file into RAM. Got {len(calls)} call(s): {calls}"
+        )
+
+    def test_bounded_sample_returns_n_rows_for_large_file(self, tmp_path):
+        """The bounded sampler must return exactly n rows when the input has
+        more than n rows, regardless of file size or row-group layout."""
+        from fraud_detection.components.monitoring import _sample_parquet_bounded
+
+        rng = np.random.default_rng(0)
+        big = pd.DataFrame({
+            "x": rng.uniform(0, 1, 10_000),
+            "y": rng.uniform(0, 1, 10_000),
+        })
+        path = tmp_path / "big.parquet"
+        big.to_parquet(path, index=False, row_group_size=500)  # 20 row groups
+
+        sampled = _sample_parquet_bounded(path, n=300)
+        assert sampled is not None
+        assert len(sampled) == 300
+
+    def test_bounded_sample_returns_full_file_when_smaller_than_n(self, tmp_path):
+        from fraud_detection.components.monitoring import _sample_parquet_bounded
+
+        small = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+        path = tmp_path / "small.parquet"
+        small.to_parquet(path, index=False)
+
+        sampled = _sample_parquet_bounded(path, n=100)
+        assert sampled is not None
+        assert len(sampled) == 3
+
+    def test_bounded_sample_returns_none_for_missing_file(self, tmp_path):
+        from fraud_detection.components.monitoring import _sample_parquet_bounded
+
+        sampled = _sample_parquet_bounded(tmp_path / "nope.parquet", n=100)
+        assert sampled is None

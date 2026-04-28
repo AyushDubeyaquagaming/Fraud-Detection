@@ -5,7 +5,7 @@ data_ingestion:
   # Batch scoring is designed to operate from a prepared parquet extract.
   # Point this at the latest available raw cohort parquet for weekly serving.
   source: "parquet"
-  parquet_path: "artifacts/runs/run_20260422_105102/data_ingestion/raw_data.parquet"
+  parquet_path: "artifacts/runs/run_20260427_175142/data_ingestion/raw_data.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
     database_env_var: "MONGODB_DATABASE"
