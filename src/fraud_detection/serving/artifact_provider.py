@@ -16,7 +16,9 @@ from fraud_detection.constants.constants import (
     RUN_METADATA_FILE,
     WEEKLY_SCORING_MANIFEST_FILE,
 )
-from fraud_detection.utils.common import load_parquet, read_json
+from fraud_detection.utils.common import load_joblib, load_parquet, read_json
+
+from .live_scoring.parquet_metadata import read_training_parquet_bounds
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,11 @@ class ArtifactBundle:
     promoted_at: str | None
     evaluated_at: str | None
     model_version: str
+    # Live scoring extras — None when unavailable (API starts degraded for live endpoints)
+    model_bundle: dict[str, Any] | None = None
+    training_raw_parquet_path: Path | None = None
+    training_parquet_start_date: datetime | None = None
+    training_parquet_end_date: datetime | None = None
 
 
 class ArtifactProvider(ABC):
@@ -111,6 +118,28 @@ class LocalDiskArtifactProvider(ArtifactProvider):
             "snapshot_reason": snapshot_reason,
         }
 
+        # Load model bundle for live scoring endpoints.
+        model_bundle: dict[str, Any] | None = None
+        bundle_path = self.current_dir / "model_bundle.joblib"
+        if bundle_path.exists():
+            try:
+                model_bundle = load_joblib(bundle_path)
+            except Exception:
+                model_bundle = None
+
+        # Resolve canonical raw parquet from the promoted run directory.
+        # Bounds are read from row-group metadata (no full-file load) to keep
+        # API startup memory-safe even when the training parquet is multi-GB.
+        training_raw_parquet_path: Path | None = None
+        training_parquet_start_date: datetime | None = None
+        training_parquet_end_date: datetime | None = None
+        _candidate = run_dir / "data_ingestion" / "raw_data.parquet"
+        if _candidate.exists():
+            training_raw_parquet_path = _candidate
+            training_parquet_start_date, training_parquet_end_date = (
+                read_training_parquet_bounds(_candidate)
+            )
+
         return ArtifactBundle(
             scored_players_df=df,
             serving_manifest=manifest,
@@ -128,4 +157,8 @@ class LocalDiskArtifactProvider(ArtifactProvider):
                 snapshot_metadata.get("model_version")
                 or manifest.get("model_version", self.default_model_version)
             ),
+            model_bundle=model_bundle,
+            training_raw_parquet_path=training_raw_parquet_path,
+            training_parquet_start_date=training_parquet_start_date,
+            training_parquet_end_date=training_parquet_end_date,
         )

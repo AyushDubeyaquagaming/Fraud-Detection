@@ -27,7 +27,22 @@ case "$1" in
     ;;
   worker)
     shift
-    exec prefect worker start --pool "${PREFECT_POOL_NAME:-fraud-pool}" "$@"
+    POOL="${PREFECT_POOL_NAME:-fraud-pool}"
+    # Create the work pool if missing — idempotent. The worker itself does
+    # not auto-create pools in Prefect 2.x, so we run this first to keep
+    # `docker compose up` a one-shot experience.
+    if ! prefect work-pool inspect "$POOL" >/dev/null 2>&1; then
+        echo "Creating Prefect work pool '$POOL' (type=process)…"
+        prefect work-pool create "$POOL" --type process || true
+    fi
+    exec prefect worker start --pool "$POOL" --type process "$@"
+    ;;
+  deploy-flows)
+    # One-shot helper: register the flows in orchestration/prefect.yaml
+    # against the configured PREFECT_API_URL. Useful to run after the
+    # server is up: `docker compose run --rm prefect-worker deploy-flows`.
+    shift
+    exec prefect deploy --prefect-file orchestration/prefect.yaml --all "$@"
     ;;
   *)
     exec "$@"

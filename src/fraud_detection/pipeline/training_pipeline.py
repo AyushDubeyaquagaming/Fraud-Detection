@@ -122,6 +122,7 @@ class TrainingPipeline:
             alert_queue_size=int(eval_cfg.get("alert_queue_size", 50)),
             min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
         )
+        mlflow_cfg_raw = config_dict.get("mlflow", {})
         model_pusher_config = ModelPusherConfig(
             current_dir=current_dir,
             manifest_file=str(serving_cfg.get("manifest_file", "serving_manifest.json")),
@@ -129,6 +130,14 @@ class TrainingPipeline:
             min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
             min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
             min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
+            register_on_promotion=bool(mlflow_cfg_raw.get("register_on_promotion", True)),
+            registered_model_name=str(
+                mlflow_cfg_raw.get("registered_model_name", "fraud_detection_hybrid")
+            ),
+            archive_existing_staging=bool(mlflow_cfg_raw.get("archive_existing_staging", True)),
+            auto_promote_to_production=bool(
+                mlflow_cfg_raw.get("auto_promote_to_production", False)
+            ),
         )
 
         mon_cfg_raw = config_dict.get("monitoring", {})
@@ -143,8 +152,7 @@ class TrainingPipeline:
 
         # MLflow setup (non-fatal)
         load_dotenv(REPO_ROOT / ".env")
-        mlflow_cfg = config_dict.get("mlflow", {})
-        experiment_name = mlflow_cfg.get("experiment_name", "fraud_detection_hybrid")
+        experiment_name = mlflow_cfg_raw.get("experiment_name", "fraud_detection_hybrid")
 
         from fraud_detection.utils.mlflow_utils import (
             get_tracking_uri,

@@ -17,10 +17,17 @@ fraud_no_cheat_eda_and_baseline.ipynb
 analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
+ARCHITECTURE_GUIDE.md
+DEMO_RUNBOOK_2026_04_27.txt
 artifacts/
+live_scoring_plan.md
 DEPLOYMENT.md
+live_scoring_handoff_notes.txt
+live_scoring_developer_checklist.txt
+LIVE_SCORING_FIXES_SUMMARY.txt
 fastapi_serving_plan.md
 developer_validation_guide.txt
+MLOPS_AUDIT_2026_04_27.txt
 # C extensions
 *.so
 

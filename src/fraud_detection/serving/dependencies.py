@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import HTTPException, status
+from fastapi import Depends, HTTPException, status
 
+from fraud_detection.components.feature_engineering import TIMESTAMP_CANDIDATES
 from fraud_detection.logger import get_logger
 
 from .artifact_provider import ArtifactBundle, ArtifactProvider
@@ -62,3 +65,50 @@ def get_cache() -> ArtifactCache:
     if _cache is None:
         raise RuntimeError("Artifact cache not initialized")
     return _cache
+
+
+@dataclass(frozen=True)
+class LiveScoringContext:
+    model_bundle: dict[str, Any]
+    training_raw_parquet_path: Path
+    timestamp_field: str
+    timestamp_candidates: tuple[str, ...]
+    parquet_start_date: Any  # datetime | None from bundle
+    parquet_end_date: Any    # datetime | None from bundle
+
+
+def get_live_scoring_context(
+    cache: ArtifactCache = Depends(get_cache),
+) -> LiveScoringContext:
+    """Return the loaded model bundle and promoted raw parquet path for live scoring.
+
+    Raises 503 if promoted artifacts are missing or incomplete.
+    """
+    bundle = cache.get_bundle()
+
+    if bundle.model_bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Promoted model bundle is not loaded.",
+        )
+    if "ccs_stats_lookup" not in bundle.model_bundle:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Promoted model bundle is not compatible with live scoring. Re-promote artifacts.",
+        )
+    if bundle.training_raw_parquet_path is None or not bundle.training_raw_parquet_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Promoted training raw parquet is not available.",
+        )
+
+    timestamp_field = str(bundle.snapshot_metadata.get("timestamp_field", "trans_date"))
+
+    return LiveScoringContext(
+        model_bundle=bundle.model_bundle,
+        training_raw_parquet_path=bundle.training_raw_parquet_path,
+        timestamp_field=timestamp_field,
+        timestamp_candidates=tuple(TIMESTAMP_CANDIDATES),
+        parquet_start_date=bundle.training_parquet_start_date,
+        parquet_end_date=bundle.training_parquet_end_date,
+    )

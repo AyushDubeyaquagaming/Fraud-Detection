@@ -37,6 +37,81 @@ class ModelPusher:
         self.training_artifact = training_artifact
         self.evaluation_artifact = evaluation_artifact
 
+    def _register_to_staging(
+        self,
+        bundle_path: Path,
+        git_sha: str,
+        promoted_at: str,
+    ) -> dict[str, str] | None:
+        """Log the bundle as an MLflow artifact and register the resulting URI in
+        the Model Registry under stage='Staging'. All failures are swallowed —
+        registry is purely additive on top of filesystem promotion.
+
+        The bundle is logged into the currently active MLflow run when one is
+        open (typical when called from TrainingPipeline). When no run is active,
+        a small dedicated run is opened just for the registration so the model
+        URI has a backing run id.
+        """
+        try:
+            import mlflow
+            from fraud_detection.utils.mlflow_utils import register_model_to_staging
+        except Exception as exc:
+            logger.warning("MLflow unavailable — skipping registry: %s", exc)
+            return None
+
+        try:
+            active_run = mlflow.active_run()
+            opened_run = False
+            if active_run is None:
+                mlflow.start_run(run_name=f"model_pusher_{promoted_at}")
+                active_run = mlflow.active_run()
+                opened_run = True
+
+            try:
+                # Log bundle so the registered version has a real artifact URI.
+                mlflow.log_artifact(str(bundle_path), artifact_path="model_bundle")
+                run_id = active_run.info.run_id
+                model_uri = f"runs:/{run_id}/model_bundle/{bundle_path.name}"
+
+                description = (
+                    f"git_sha={git_sha} promoted_at={promoted_at} "
+                    f"capture_rate_top_5pct="
+                    f"{self.evaluation_artifact.combined_oos_capture_rate_top_5pct:.4f} "
+                    f"lift_top_5pct={self.evaluation_artifact.combined_oos_lift_top_5pct:.2f}"
+                )
+                tags = {
+                    "git_sha": git_sha,
+                    "promoted_at": promoted_at,
+                    "capture_rate_top_5pct": f"{self.evaluation_artifact.combined_oos_capture_rate_top_5pct:.4f}",
+                    "lift_top_5pct": f"{self.evaluation_artifact.combined_oos_lift_top_5pct:.4f}",
+                    "model_version_label": self.config.model_version,
+                }
+
+                result = register_model_to_staging(
+                    artifact_uri=model_uri,
+                    registered_name=self.config.registered_model_name,
+                    description=description,
+                    tags=tags,
+                    archive_existing_staging=self.config.archive_existing_staging,
+                )
+                if result is None:
+                    return None
+                return {
+                    "name": str(result["name"]),
+                    "version": str(result["version"]),
+                    "stage": str(result["stage"]),
+                    "run_id": str(result.get("run_id") or run_id),
+                }
+            finally:
+                if opened_run:
+                    try:
+                        mlflow.end_run()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("Registry registration failed (non-fatal): %s", exc)
+            return None
+
     def initiate_model_pusher(self) -> ModelPusherArtifact:
         logger.info("ModelPusher: starting — gate_passed=%s", self.evaluation_artifact.gate_passed)
         try:
@@ -88,7 +163,22 @@ class ModelPusher:
             scalers = load_joblib(self.training_artifact.scaler_path)
             lr_models = load_joblib(self.training_artifact.lr_operational_path)
 
-            scored_df = __import__("pandas").read_parquet(self.evaluation_artifact.scored_players_path)
+            pd = __import__("pandas")
+            scored_df = pd.read_parquet(self.evaluation_artifact.scored_players_path)
+
+            # Build frozen CCS lookup from pre-computed player features.
+            # CCS columns are cohort-level stats already merged into scored_df.
+            _ccs_cols = ["primary_ccs_id", "ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]
+            if all(c in scored_df.columns for c in _ccs_cols):
+                ccs_stats_lookup = (
+                    scored_df[_ccs_cols]
+                    .drop_duplicates(subset=["primary_ccs_id"])
+                    .set_index("primary_ccs_id")
+                )
+            else:
+                ccs_stats_lookup = pd.DataFrame(
+                    columns=["ccs_player_count", "ccs_total_staked", "ccs_avg_bet"]
+                )
 
             bundle = {
                 "iso_forest": iso_forest,
@@ -119,6 +209,7 @@ class ModelPusher:
                 "supervised_weight": float(eval_report["supervised_weight"]),
                 "anomaly_component_weights": eval_report.get("anomaly_component_weights", {}),
                 "reference_size": int(len(scored_df)),
+                "ccs_stats_lookup": ccs_stats_lookup,
             }
             bundle_path = self.config.current_dir / "model_bundle.joblib"
             save_joblib(bundle, bundle_path)
@@ -146,11 +237,12 @@ class ModelPusher:
             write_json(feat_config, self.config.current_dir / "feature_pipeline_config.json")
 
             promoted_at = datetime.now(timezone.utc).isoformat()
+            git_sha = _git_sha()
             metadata = {
                 "gate_passed": True,
                 "run_dir": str(run_dir),
                 "promoted_at": promoted_at,
-                "git_sha": _git_sha(),
+                "git_sha": git_sha,
                 "capture_rates": eval_report.get("capture_rates", {}),
                 "capture_stats": eval_report.get("capture_stats", {}),
                 "combined_oos_capture_rate_top_5pct": self.evaluation_artifact.combined_oos_capture_rate_top_5pct,
@@ -161,6 +253,21 @@ class ModelPusher:
                 },
                 "combined_oos_top_20pct": self.evaluation_artifact.combined_oos_top_20pct,
             }
+
+            # --- MLflow Model Registry (best-effort, non-fatal) ---
+            # Registry adds version tracking + lineage. Filesystem promotion
+            # below remains the source of truth for the serving layer; if
+            # registration fails, the bundle on disk is still served.
+            registry_info: dict[str, str] | None = None
+            if self.config.register_on_promotion:
+                registry_info = self._register_to_staging(
+                    bundle_path=bundle_path,
+                    git_sha=git_sha,
+                    promoted_at=promoted_at,
+                )
+                if registry_info:
+                    metadata["mlflow_registry"] = registry_info
+
             write_json(metadata, promotion_metadata_path)
 
             # Write serving manifest atomically — only on successful promotion.
@@ -170,9 +277,11 @@ class ModelPusher:
                 "run_id": run_id,
                 "run_dir": str(run_dir),
                 "promoted_at": promoted_at,
-                "git_sha": _git_sha(),
+                "git_sha": git_sha,
                 "model_version": self.config.model_version,
             }
+            if registry_info:
+                serving_manifest["mlflow_registry"] = registry_info
             manifest_path = self.config.current_dir / self.config.manifest_file
             tmp_manifest_path = self.config.current_dir / f"{self.config.manifest_file}.tmp"
             write_json(serving_manifest, tmp_manifest_path)
@@ -183,6 +292,9 @@ class ModelPusher:
                 model_bundle_path=bundle_path,
                 promotion_metadata_path=promotion_metadata_path,
                 promoted=True,
+                registered_model_name=(registry_info or {}).get("name"),
+                registered_model_version=(registry_info or {}).get("version"),
+                registered_model_stage=(registry_info or {}).get("stage"),
             )
         except FraudDetectionException:
             raise

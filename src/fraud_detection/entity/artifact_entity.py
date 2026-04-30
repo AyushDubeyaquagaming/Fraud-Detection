@@ -64,6 +64,11 @@ class ModelPusherArtifact:
     model_bundle_path: Path
     promotion_metadata_path: Path
     promoted: bool
+    # Optional registry coordinates — populated only when registration succeeds.
+    # Registry is best-effort; absence here does not affect serving.
+    registered_model_name: str | None = None
+    registered_model_version: str | None = None
+    registered_model_stage: str | None = None
 
 
 @dataclass

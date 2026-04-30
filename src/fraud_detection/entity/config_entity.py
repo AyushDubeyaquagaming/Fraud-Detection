@@ -75,6 +75,12 @@ class ModelPusherConfig:
     min_lift_top_5pct: float = 5.0
     # Retained for diagnostic reporting only — NOT used as gate.
     min_capture_top_20pct: int = 0
+    # MLflow Model Registry hook-up. Registration is non-fatal — filesystem
+    # promotion is always the source of truth for serving.
+    register_on_promotion: bool = True
+    registered_model_name: str = "fraud_detection_hybrid"
+    archive_existing_staging: bool = True
+    auto_promote_to_production: bool = False
 
 
 @dataclass

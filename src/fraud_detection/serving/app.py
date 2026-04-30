@@ -13,7 +13,7 @@ from fraud_detection.utils.common import read_yaml
 
 from .artifact_provider import ArtifactProvider, LocalDiskArtifactProvider
 from .dependencies import init_cache
-from .routes import admin, scoring, system
+from .routes import admin, live_scoring, scoring, system
 
 logger = get_logger(__name__)
 
@@ -59,13 +59,14 @@ def create_app(
 
     app = FastAPI(
         title="Fraud Detection Scoring API",
-        description="Lookup-only scoring for already-scored members",
+        description="Lookup, live scoring, and historical scoring for promoted fraud models",
         version="1.0.0",
         lifespan=lifespan,
     )
 
     app.include_router(system.router)
     app.include_router(scoring.router)
+    app.include_router(live_scoring.router)
     app.include_router(admin.router)
 
     @app.exception_handler(Exception)

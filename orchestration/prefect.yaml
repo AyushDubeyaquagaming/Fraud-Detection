@@ -1,19 +1,29 @@
 # Prefect deployment spec for the fraud detection pipeline.
-# Prerequisites:
-#   1. pip install prefect>=2.20.0,<3.0.0
-#   2. prefect cloud login   (or set PREFECT_API_URL + PREFECT_API_KEY in .env)
-#   3. prefect work-pool create fraud-pool --type process
-#   4. prefect deploy --prefect-file orchestration/prefect.yaml
+#
+# This is a self-hosted Prefect setup — NOT Prefect Cloud.
+#
+# Bring-up (one-shot):
+#   1. docker compose up -d                              # starts prefect-server, prefect-postgres, prefect-worker
+#   2. export PREFECT_API_URL=http://localhost:4200/api  # point CLI at the local server
+#      (PowerShell: $env:PREFECT_API_URL = "http://localhost:4200/api")
+#   3. prefect deploy --prefect-file orchestration/prefect.yaml --all
+#
+# Inside the docker network, services use http://prefect-server:4200/api .
+# From the host (CLI / scripts), use http://localhost:4200/api .
+#
+# Once deployed, the prefect-worker container picks up scheduled runs from
+# the `fraud-pool` work pool. Open http://localhost:4200 to see the UI.
 
 name: fraud-detection
 
 pull:
   - prefect.deployments.steps.set_working_directory:
-      directory: .
+      directory: /app
 
 deployments:
   - name: training-weekly
-    flow: orchestration/flows/training_flow.py:training_flow
+    flow_name: fraud-detection-training
+    entrypoint: orchestration/flows/training_flow.py:training_flow
     description: "Weekly fraud model retraining with monitoring and promotion gate"
     parameters:
       config_path: "configs/config.yaml"
@@ -23,12 +33,14 @@ deployments:
         active: true
     work_pool:
       name: fraud-pool
+      work_queue_name: default
     tags:
       - fraud-detection
       - training
 
   - name: batch-scoring-daily
-    flow: orchestration/flows/batch_scoring_flow.py:batch_scoring_flow
+    flow_name: fraud-detection-batch-scoring
+    entrypoint: orchestration/flows/batch_scoring_flow.py:batch_scoring_flow
     description: "Daily batch scoring against the promoted model bundle"
     parameters:
       config_path: "configs/config.yaml"
@@ -38,6 +50,7 @@ deployments:
         active: true
     work_pool:
       name: fraud-pool
+      work_queue_name: default
     tags:
       - fraud-detection
       - scoring

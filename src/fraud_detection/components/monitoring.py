@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from fraud_detection.entity.artifact_entity import (
     DataIngestionArtifact,
@@ -19,6 +21,10 @@ from fraud_detection.utils.common import ensure_dir, write_json
 logger = get_logger(__name__)
 
 _SCORE_COL = "hybrid_score"
+# Oversampling factor — read this many times sample_size rows from random row
+# groups, then sample down. 3x balances memory bound vs. label-stratification
+# headroom (positives are rare; need slack to find them).
+_PARQUET_OVERSAMPLE_FACTOR = 3.0
 _EMPTY = MonitoringArtifact(
     reports_dir=None,
     data_drift_report_path=None,
@@ -65,26 +71,87 @@ def _sample(df: pd.DataFrame, n: int, label_col: str | None = None) -> pd.DataFr
     return df.sample(n, random_state=42)
 
 
-def _run_report(ref: pd.DataFrame, cur: pd.DataFrame, out_path: Path, label: str) -> dict[str, Any]:
-    from evidently.report import Report
-    from evidently.metric_preset.data_drift import DataDriftPreset
+def _sample_parquet_bounded(
+    path: Path,
+    n: int,
+    label_col: str | None = None,
+    oversample: float = _PARQUET_OVERSAMPLE_FACTOR,
+) -> pd.DataFrame | None:
+    """Read up to ~n*oversample rows from `path` by selecting random row groups,
+    then sample exactly n rows from the result.
 
-    report = Report(metrics=[DataDriftPreset()])
+    Memory-bounded regardless of file size — reads at most a handful of row
+    groups (each ~10k rows) instead of the entire parquet. Replaces the old
+    `pd.read_parquet(path)` + `_sample` pattern that loaded the full file
+    (44M+ rows, 30-50 GB uncompressed) into pandas before sampling.
+
+    Returns None if the file is missing, empty, or unreadable so the caller
+    can fall through to a graceful skip.
+    """
+    if not path.exists():
+        return None
+    try:
+        pf = pq.ParquetFile(str(path))
+        total_rows = pf.metadata.num_rows
+        num_rg = pf.num_row_groups
+        if total_rows == 0 or num_rg == 0:
+            return None
+
+        # Small file: just read it all — overhead of selecting row groups
+        # is meaningless for files that fit in n directly.
+        if total_rows <= n:
+            return pf.read().to_pandas()
+
+        avg_rg_rows = max(1, total_rows // num_rg)
+        target_rg_count = max(1, min(num_rg, int(n * oversample / avg_rg_rows) + 1))
+
+        rng = random.Random(42)
+        selected = sorted(rng.sample(range(num_rg), target_rg_count))
+
+        chunks = [pf.read_row_group(i).to_pandas() for i in selected]
+        if not chunks:
+            return None
+        df = pd.concat(chunks, ignore_index=True)
+        return _sample(df, n, label_col)
+    except Exception as exc:
+        logger.warning("Monitoring: bounded parquet sample failed for %s: %s", path, exc)
+        return None
+
+
+def _run_report(ref: pd.DataFrame, cur: pd.DataFrame, out_path: Path, label: str) -> dict[str, Any]:
+    """Generate an Evidently drift report comparing ref to cur and save to HTML.
+
+    Uses per-column `ColumnDriftMetric` instances rather than the bundled
+    `DataDriftPreset`. The preset internally computes a correlation matrix via
+    `np.corrcoef`, which crashes under numpy 2.0 + evidently 0.4.x because of
+    the stricter weights handling in `np.average`. The per-column approach
+    sidesteps the correlation calc entirely and gives the same per-column
+    drift signal we summarise downstream.
+    """
+    from evidently.report import Report
+    from evidently.metrics import ColumnDriftMetric
+
+    columns = list(ref.columns)
+    report = Report(metrics=[ColumnDriftMetric(column_name=c) for c in columns])
     report.run(reference_data=ref, current_data=cur)
     report.save_html(str(out_path))
 
     raw = report.as_dict()
     metrics = raw.get("metrics", [])
-    dataset_result = next(
-        (m["result"] for m in metrics if m.get("metric") == "DatasetDriftMetric"), {}
-    )
+    drifted = 0
+    for m in metrics:
+        result = m.get("result", {}) or {}
+        if result.get("drift_detected") is True:
+            drifted += 1
+    n_cols = len(columns)
+    share = (drifted / n_cols) if n_cols > 0 else 0.0
     return {
         "label": label,
         "report_path": str(out_path),
-        "dataset_drift": dataset_result.get("dataset_drift", False),
-        "share_of_drifted_columns": dataset_result.get("share_of_drifted_columns", 0.0),
-        "number_of_columns": dataset_result.get("number_of_columns", 0),
-        "number_of_drifted_columns": dataset_result.get("number_of_drifted_columns", 0),
+        "dataset_drift": drifted > 0,
+        "share_of_drifted_columns": share,
+        "number_of_columns": n_cols,
+        "number_of_drifted_columns": drifted,
     }
 
 
@@ -122,6 +189,23 @@ class Monitoring:
         if ref_run_dir is None:
             return _EMPTY
 
+        # Self-reference guard: comparing a run to itself is mathematically
+        # guaranteed to show 0% drift AND attempts to load the same large
+        # parquets twice. Skip cleanly. This typically only triggers when
+        # ModelPusher ran BEFORE Monitoring and pointed promotion_metadata
+        # at the same run we're now monitoring (e.g. force_promote_run.py
+        # before its ordering fix).
+        try:
+            if ref_run_dir.resolve() == self.run_dir.resolve():
+                logger.warning(
+                    "Monitoring: reference run == current run (%s) — "
+                    "skipping self-comparison",
+                    ref_run_dir.name,
+                )
+                return _EMPTY
+        except Exception:
+            pass  # path resolution failure is not fatal; continue and let downstream checks gate
+
         reports_dir = self.run_dir / self.config.reports_dir
         ensure_dir(reports_dir)
 
@@ -137,9 +221,9 @@ class Monitoring:
         feature_report_path = reports_dir / "feature_drift.html"
         prediction_report_path = reports_dir / "prediction_drift.html"
 
-        if cur_raw_path.exists() and ref_raw_path.exists():
-            cur_raw = _sample(pd.read_parquet(cur_raw_path), n)
-            ref_raw = _sample(pd.read_parquet(ref_raw_path), n)
+        cur_raw = _sample_parquet_bounded(cur_raw_path, n)
+        ref_raw = _sample_parquet_bounded(ref_raw_path, n)
+        if cur_raw is not None and ref_raw is not None:
             shared_cols = [c for c in cur_raw.columns if c in ref_raw.columns and cur_raw[c].dtype.kind in "iuf"]
             if shared_cols:
                 summary = _run_report(ref_raw[shared_cols], cur_raw[shared_cols], data_report_path, "data_drift")
@@ -148,15 +232,19 @@ class Monitoring:
             else:
                 logger.warning("Monitoring: no shared numeric columns for data drift — skipping data report")
         else:
-            logger.warning("Monitoring: raw data paths missing (cur=%s ref=%s) — skipping data drift", cur_raw_path.exists(), ref_raw_path.exists())
+            logger.warning(
+                "Monitoring: raw data sampling failed (cur=%s ref=%s) — skipping data drift",
+                cur_raw is not None, ref_raw is not None,
+            )
+        del cur_raw, ref_raw  # release before next stage
 
         # --- Feature drift ---
         cur_feat_path = self.fe_artifact.player_features_path
         ref_feat_path = ref_run_dir / "feature_engineering" / "player_features.parquet"
 
-        if cur_feat_path.exists() and ref_feat_path.exists():
-            cur_feat = _sample(pd.read_parquet(cur_feat_path), n, "event_fraud_flag")
-            ref_feat = _sample(pd.read_parquet(ref_feat_path), n, "event_fraud_flag")
+        cur_feat = _sample_parquet_bounded(cur_feat_path, n, "event_fraud_flag")
+        ref_feat = _sample_parquet_bounded(ref_feat_path, n, "event_fraud_flag")
+        if cur_feat is not None and ref_feat is not None:
             feat_cols = [c for c in monitored if c in cur_feat.columns and c in ref_feat.columns]
             if feat_cols:
                 summary = _run_report(ref_feat[feat_cols], cur_feat[feat_cols], feature_report_path, "feature_drift")
@@ -165,15 +253,16 @@ class Monitoring:
             else:
                 logger.warning("Monitoring: no monitored feature columns found — skipping feature report")
         else:
-            logger.warning("Monitoring: feature paths missing — skipping feature drift")
+            logger.warning("Monitoring: feature sampling failed — skipping feature drift")
+        del cur_feat, ref_feat
 
         # --- Prediction drift ---
         cur_pred_path = self.eval_artifact.scored_players_path
         ref_pred_path = ref_run_dir / "model_evaluation" / "scored_players.parquet"
 
-        if cur_pred_path.exists() and ref_pred_path.exists():
-            cur_pred = _sample(pd.read_parquet(cur_pred_path), n)
-            ref_pred = _sample(pd.read_parquet(ref_pred_path), n)
+        cur_pred = _sample_parquet_bounded(cur_pred_path, n)
+        ref_pred = _sample_parquet_bounded(ref_pred_path, n)
+        if cur_pred is not None and ref_pred is not None:
             score_cols = [c for c in [_SCORE_COL] if c in cur_pred.columns and c in ref_pred.columns]
             if not score_cols:
                 score_cols = [c for c in cur_pred.columns if c in ref_pred.columns and "score" in c.lower()]
@@ -184,7 +273,8 @@ class Monitoring:
             else:
                 logger.warning("Monitoring: no score columns found — skipping prediction drift")
         else:
-            logger.warning("Monitoring: scored_players paths missing — skipping prediction drift")
+            logger.warning("Monitoring: scored_players sampling failed — skipping prediction drift")
+        del cur_pred, ref_pred
 
         if not summaries:
             logger.warning("Monitoring: no reports generated — reference artifacts unavailable")
