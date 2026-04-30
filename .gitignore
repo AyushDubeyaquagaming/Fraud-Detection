@@ -11,6 +11,8 @@ __pycache__/
 *$py.class
 fraud-data-no-cheat.csv
 bounded_ingestion_plan.md
+phase_b_plan.md
+PHASE_B_VALIDATION_RUNBOOK.txt
 fraud_no_cheat_modeling_plan.md
 profile_no_cheat_dataset.py
 fraud_no_cheat_eda_and_baseline.ipynb

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,13 @@ from fraud_detection.utils.common import load_joblib, read_json, read_yaml, writ
 logger = get_logger(__name__)
 
 BATCH_SCORING_PARQUET_BATCH_SIZE = 100_000
+COLLUSION_FEATURE_NAMES = {
+    "max_cohort_coverage_in_draws",
+    "mean_cohort_coverage_in_draws",
+    "pct_draws_in_cohort_2plus",
+    "mean_cohort_size",
+    "mean_pairwise_jaccard_when_in_cohort",
+}
 
 COHORT_SCOPE_NOTE = (
     "Scores are relative to the analysis cohort (~1,045 players), "
@@ -352,6 +360,8 @@ class BatchScoringPipeline:
                 )
             bundle = load_joblib(bundle_path)
             logger.info("Loaded model bundle from %s", bundle_path)
+            feature_columns = bundle.get("feature_columns", [])
+            model_requires_collusion = any(col in COLLUSION_FEATURE_NAMES for col in feature_columns)
 
             current_dir.mkdir(parents=True, exist_ok=True)
             tmp_raw_path = current_dir / "_tmp_scoring_raw.parquet"
@@ -401,13 +411,19 @@ class BatchScoringPipeline:
             else:
                 fe_mode = "operational"
 
+            tmp_fe_dir = current_dir / "_tmp_fe"
+            shutil.rmtree(tmp_fe_dir, ignore_errors=True)
             fe_config = FeatureEngineeringConfig(
                 exclude_cols=fe_cfg["exclude_cols"],
                 log1p_cols=fe_cfg["log1p_cols"],
                 apply_pre_fraud_cutoff=(fe_mode == "training_eval"),
                 fraud_csv_path=REPO_ROOT / val_cfg["fraud_csv_path"],
-                output_dir=current_dir / "_tmp_fe",
+                output_dir=tmp_fe_dir,
                 mode=fe_mode,
+                fraud_label_window_days=int(fe_cfg.get("fraud_label_window_days", 7)),
+                compute_collusion_features=bool(
+                    fe_cfg.get("compute_collusion_features", model_requires_collusion)
+                ),
             )
             fe_artifact = FeatureEngineering(fe_config, ingestion_artifact).initiate_feature_engineering()
             player_df = pd.read_parquet(fe_artifact.player_features_path)
@@ -421,7 +437,6 @@ class BatchScoringPipeline:
 
             feat_cfg_path = current_dir / "feature_pipeline_config.json"
             import json
-            feature_columns = bundle.get("feature_columns", [])
             if feat_cfg_path.exists():
                 with open(feat_cfg_path) as f:
                     feat_cfg = json.load(f)

@@ -347,36 +347,48 @@ class WindowResolver:
 
         try:
             start_operator = "$gte" if start_inclusive else "$gt"
-            member_regex = rf"^\s*{re.escape(self._normalize_member_id(member_id))}\s*$"
+            normalized_member_id = self._normalize_member_id(member_id)
             ts_clauses = [
                 {candidate: {start_operator: start, "$lt": end}}
                 for candidate in self._mongo_timestamp_candidates()
             ]
-            query = {
-                "member_id": {"$regex": member_regex, "$options": "i"},
-            }
-            if len(ts_clauses) == 1:
-                query.update(ts_clauses[0])
-            elif ts_clauses:
-                query["$or"] = ts_clauses
 
-            cursor = collection.find(query, MONGO_PROJECTION).batch_size(LIVE_MONGO_BATCH_SIZE)
-            docs: list[dict] = []
-            try:
-                for doc in cursor:
-                    docs.append(doc)
-                    if len(docs) >= LIVE_MONGO_MAX_DOCS:
-                        logger.warning(
-                            "Live Mongo fetch hit safety cap of %d docs for member=%s "
-                            "window=[%s, %s); truncating.",
-                            LIVE_MONGO_MAX_DOCS,
-                            member_id,
-                            start.isoformat(),
-                            end.isoformat(),
-                        )
-                        break
-            finally:
-                cursor.close()
+            def with_timestamp_filter(base_query: dict) -> dict:
+                query = dict(base_query)
+                if len(ts_clauses) == 1:
+                    query.update(ts_clauses[0])
+                elif ts_clauses:
+                    query["$or"] = ts_clauses
+                return query
+
+            def fetch_docs(query: dict) -> list[dict]:
+                cursor = collection.find(query, MONGO_PROJECTION).batch_size(LIVE_MONGO_BATCH_SIZE)
+                docs: list[dict] = []
+                try:
+                    for doc in cursor:
+                        docs.append(doc)
+                        if len(docs) >= LIVE_MONGO_MAX_DOCS:
+                            logger.warning(
+                                "Live Mongo fetch hit safety cap of %d docs for member=%s "
+                                "window=[%s, %s); truncating.",
+                                LIVE_MONGO_MAX_DOCS,
+                                member_id,
+                                start.isoformat(),
+                                end.isoformat(),
+                            )
+                            break
+                finally:
+                    cursor.close()
+                return docs
+
+            # Exact match keeps the member_id index usable. Only fall back to
+            # regex if legacy whitespace/case drift prevents an exact hit.
+            docs = fetch_docs(with_timestamp_filter({"member_id": normalized_member_id}))
+            if not docs:
+                member_regex = rf"^\s*{re.escape(normalized_member_id)}\s*$"
+                docs = fetch_docs(
+                    with_timestamp_filter({"member_id": {"$regex": member_regex, "$options": "i"}})
+                )
 
             if not docs:
                 return pd.DataFrame()

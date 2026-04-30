@@ -33,13 +33,17 @@ FEATURE_COLUMNS = [
     "total_net_result", "positive_draw_rate", "stake_cv", "template_reuse_ratio",
     "pnl_volatility", "win_rate", "draws_per_active_day", "avg_draws_per_session",
     "max_template_reuse", "ccs_player_count", "ccs_total_staked", "ccs_avg_bet",
+    "max_cohort_coverage_in_draws", "mean_cohort_coverage_in_draws",
+    "pct_draws_in_cohort_2plus", "mean_cohort_size",
+    "mean_pairwise_jaccard_when_in_cohort",
 ]
 
 STYLE_COLUMNS = [
     "draws_played", "avg_stake_per_draw", "avg_nonzero_bets_per_draw", "avg_max_bet_share",
     "avg_entropy", "avg_gini", "avg_tiny_bet_ratio", "avg_position_coverage",
     "template_reuse_ratio", "max_template_reuse", "stake_cv", "avg_inter_draw_seconds",
-    "positive_draw_rate",
+    "positive_draw_rate", "max_cohort_coverage_in_draws", "mean_cohort_coverage_in_draws",
+    "pct_draws_in_cohort_2plus", "mean_cohort_size", "mean_pairwise_jaccard_when_in_cohort",
 ]
 
 STYLE_LOG1P_COLUMNS = [

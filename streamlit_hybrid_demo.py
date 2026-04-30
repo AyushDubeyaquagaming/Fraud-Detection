@@ -21,6 +21,11 @@ def _prefer_current(filename: str) -> Path:
 SCORED_PATH = _prefer_current("hybrid_scored_players.parquet")
 ALERT_PATH = _prefer_current("alert_queue.csv")
 EVAL_PATH = _prefer_current("hybrid_evaluation.json")
+# Weekly scoring manifest is the authoritative source for the cohort window.
+# It's written by BatchScoringPipeline alongside the scored parquet — when
+# absent (e.g. local-only runs without the weekly serving step), we fall
+# back to the lookback_days from hybrid_evaluation.json.
+MANIFEST_PATH = _prefer_current("weekly_scoring_manifest.json")
 
 PRIMARY_FEATURES = [
     "draws_played",
@@ -59,7 +64,7 @@ def has_player_fields(player_row: pd.Series, fields: list[str]) -> bool:
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
     if not SCORED_PATH.exists():
         raise FileNotFoundError(f"Scored cohort not found at {SCORED_PATH}")
     if not ALERT_PATH.exists():
@@ -71,6 +76,11 @@ def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     alert_queue = pd.read_csv(ALERT_PATH)
     with EVAL_PATH.open() as handle:
         evaluation = json.load(handle)
+    if MANIFEST_PATH.exists():
+        with MANIFEST_PATH.open() as handle:
+            manifest = json.load(handle)
+    else:
+        manifest = {}
 
     scored = scored.copy()
     scored["member_id"] = scored["member_id"].astype(str).str.upper().str.strip()
@@ -87,7 +97,7 @@ def load_assets() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     review_recommendation = risk_labels.map(recommendation_map).astype(object)
     scored["review_recommendation"] = np.where(review_recommendation.notna(), review_recommendation, "Unassigned")
 
-    return scored, alert_queue, evaluation
+    return scored, alert_queue, evaluation, manifest
 
 
 def format_pct(value: float) -> str:
@@ -263,7 +273,7 @@ def main() -> None:
     )
 
     try:
-        scored, alert_queue, evaluation = load_assets()
+        scored, alert_queue, evaluation, manifest = load_assets()
     except (FileNotFoundError, OSError, ValueError) as exc:
         st.error(str(exc))
         st.stop()
@@ -273,12 +283,19 @@ def main() -> None:
     selected_member = None
     player_row = None
     query = ""
-    lookback_days = evaluation.get("lookback_days", 7)
+    # Prefer the weekly_scoring_manifest as authoritative source for the
+    # cohort window — it's written by BatchScoringPipeline at the same time
+    # as the scored parquet. Fall back to evaluation JSON only if absent.
+    lookback_days = manifest.get("lookback_days", evaluation.get("lookback_days", 7))
+    window_start = manifest.get("window_start")
+    window_end = manifest.get("window_end")
 
     with st.sidebar:
         st.header("Demo Controls")
         st.metric("Players in weekly cohort", f"{len(scored):,}")
         st.metric("Scoring window", f"{lookback_days} days")
+        if window_start and window_end:
+            st.caption(f"{window_start[:10]} → {window_end[:10]}")
         st.metric("Known fraud in cohort", evaluation.get("fraud_players", 0))
         st.metric("High-risk players", evaluation.get("risk_tier_distribution", {}).get("HIGH", 0))
 

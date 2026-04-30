@@ -154,6 +154,8 @@ def test_register_model_to_staging_calls_mlflow_correctly():
         )
 
     assert result == {
+        "attempted": True,
+        "succeeded": True,
         "name": "fraud_detection_hybrid",
         "version": "7",
         "stage": "Staging",
@@ -173,7 +175,8 @@ def test_register_model_to_staging_calls_mlflow_correctly():
 
 
 def test_register_model_to_staging_swallows_exceptions():
-    """Registry failures must be non-fatal — caller must see None, no raise."""
+    """Registry failures must be non-fatal — caller must see a failure dict
+    with the diagnostic surfaced, never a raise."""
     from fraud_detection.utils.mlflow_utils import register_model_to_staging
 
     with patch("mlflow.register_model", side_effect=RuntimeError("server down")):
@@ -181,7 +184,11 @@ def test_register_model_to_staging_swallows_exceptions():
             artifact_uri="runs:/abc/model_bundle/model_bundle.joblib",
             registered_name="fraud_detection_hybrid",
         )
-    assert result is None
+    assert result["attempted"] is True
+    assert result["succeeded"] is False
+    assert result["error_type"] == "RuntimeError"
+    assert "server down" in result["error_message"]
+    assert result["error_stage"] == "register_or_transition"
 
 
 def test_pusher_registers_to_staging_on_gate_pass(tmp_path):
@@ -196,6 +203,8 @@ def test_pusher_registers_to_staging_on_gate_pass(tmp_path):
     config = _pusher_config(current_dir)
 
     fake_registry_result = {
+        "attempted": True,
+        "succeeded": True,
         "name": "fraud_detection_hybrid",
         "version": "3",
         "stage": "Staging",
@@ -221,6 +230,8 @@ def test_pusher_registers_to_staging_on_gate_pass(tmp_path):
 
     metadata = json.loads((current_dir / "promotion_metadata.json").read_text())
     assert metadata["mlflow_registry"]["version"] == "3"
+    assert metadata["registry_status"]["succeeded"] is True
+    assert metadata["registry_status"]["version"] == "3"
 
 
 def test_pusher_does_not_register_when_disabled(tmp_path):
@@ -250,7 +261,9 @@ def test_pusher_does_not_register_when_disabled(tmp_path):
 def test_pusher_promotes_even_when_registry_fails(tmp_path):
     """The whole point of making the registry best-effort: a registry hiccup
     must NOT block filesystem promotion. The bundle, manifest, and metadata
-    must still be written; only the registry section is absent."""
+    must still be written; only the registry section is absent. The failure
+    diagnostic must be persisted to promotion_metadata.json so we can grep
+    for what broke."""
     from fraud_detection.components.model_pusher import ModelPusher
 
     training_artifact, eval_artifact = _make_artifacts(tmp_path)
@@ -258,9 +271,17 @@ def test_pusher_promotes_even_when_registry_fails(tmp_path):
     current_dir.mkdir()
     config = _pusher_config(current_dir)
 
+    failure_status = {
+        "attempted": True,
+        "succeeded": False,
+        "error_type": "MlflowException",
+        "error_message": "no such artifact",
+        "error_stage": "register_or_transition",
+    }
+
     with patch(
         "fraud_detection.components.model_pusher.ModelPusher._register_to_staging",
-        return_value=None,
+        return_value=failure_status,
     ):
         pusher = ModelPusher(config, training_artifact, eval_artifact)
         artifact = pusher.initiate_model_pusher()
@@ -277,6 +298,11 @@ def test_pusher_promotes_even_when_registry_fails(tmp_path):
 
     manifest = json.loads(manifest_path.read_text())
     assert "mlflow_registry" not in manifest
+
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["registry_status"]["succeeded"] is False
+    assert metadata["registry_status"]["error_type"] == "MlflowException"
+    assert "no such artifact" in metadata["registry_status"]["error_message"]
 
 
 def test_pusher_skips_registry_when_gate_fails(tmp_path):

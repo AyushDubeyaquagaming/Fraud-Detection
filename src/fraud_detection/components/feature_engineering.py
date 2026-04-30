@@ -54,6 +54,14 @@ TIMESTAMP_CANDIDATES = [
     "trans_date",
     "updatedAt",
 ]
+COLLUSION_FEATURE_COLUMNS = [
+    "max_cohort_coverage_in_draws",
+    "mean_cohort_coverage_in_draws",
+    "pct_draws_in_cohort_2plus",
+    "mean_cohort_size",
+    "mean_pairwise_jaccard_when_in_cohort",
+]
+ROULETTE_POSITION_COUNT = 38
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +133,51 @@ def compute_draw_features(bets_list: list[dict[str, Any]]) -> dict[str, float]:
         "unique_positions_in_draw": nz_count,
         "position_coverage": nz_count / 38.0,
     }
+
+
+def normalize_bet_position(value: object) -> str | None:
+    raw = str(value).strip().upper()
+    if raw in {"", "NAN", "NONE"}:
+        return None
+    if raw in {"00", "000", "DOUBLE_ZERO", "DOUBLEZERO"}:
+        return "00"
+    if raw.isdigit():
+        number = int(raw)
+        if number == 0:
+            return "0"
+        if 1 <= number <= 36:
+            return str(number)
+    return raw
+
+
+def bet_position_set(bets_list: Any) -> set[str]:
+    positions: set[str] = set()
+    if not isinstance(bets_list, list):
+        return positions
+    for bet in bets_list:
+        try:
+            amount = float(bet.get("bet_amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            continue
+        position = normalize_bet_position(bet.get("number"))
+        if position is not None:
+            positions.add(position)
+    return positions
+
+
+def mean_pairwise_jaccard(position_sets: list[set[str]]) -> float:
+    if len(position_sets) < 2:
+        return 0.0
+    values: list[float] = []
+    for left_index in range(len(position_sets)):
+        for right_index in range(left_index + 1, len(position_sets)):
+            left = position_sets[left_index]
+            right = position_sets[right_index]
+            union = left | right
+            values.append((len(left & right) / len(union)) if union else 0.0)
+    return float(np.mean(values)) if values else 0.0
 
 
 def _coerce_datetime(value: Any):
@@ -300,6 +353,89 @@ def _aggregate_player_features_from_history(history_df: pd.DataFrame) -> pd.Data
         player_agg[col] = player_agg[col].fillna(0)
 
     return player_agg
+
+
+def _compute_draw_collusion_features(history_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute one row per draw with label-free cohort coverage/overlap metrics."""
+    columns = [
+        "draw_id",
+        "cohort_size",
+        "union_position_coverage",
+        "mean_pairwise_jaccard",
+        "total_cohort_stake",
+    ]
+    if history_df.empty or "draw_id" not in history_df.columns or "bets" not in history_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    working = history_df[["draw_id", "member_id", "bets", "total_bet_amount"]].copy()
+    working["draw_id"] = pd.to_numeric(working["draw_id"], errors="coerce").astype("Int64")
+    working = working.dropna(subset=["draw_id"])
+    if working.empty:
+        return pd.DataFrame(columns=columns)
+    working["member_id"] = working["member_id"].astype(str).str.strip().str.upper()
+    working["_position_set"] = working["bets"].apply(lambda raw: bet_position_set(parse_bets(raw)))
+    working["total_bet_amount"] = pd.to_numeric(working["total_bet_amount"], errors="coerce").fillna(0.0)
+
+    records = []
+    for draw_id, draw_rows in working.groupby("draw_id", sort=False):
+        position_sets = list(draw_rows["_position_set"])
+        union_positions = set().union(*position_sets) if position_sets else set()
+        cohort_size = int(draw_rows["member_id"].nunique())
+        records.append(
+            {
+                "draw_id": int(draw_id),
+                "cohort_size": cohort_size,
+                "union_position_coverage": float(len(union_positions) / ROULETTE_POSITION_COUNT),
+                "mean_pairwise_jaccard": mean_pairwise_jaccard(position_sets),
+                "total_cohort_stake": float(draw_rows["total_bet_amount"].sum()),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _collusion_member_draw_rows(history_df: pd.DataFrame, draw_features: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty or draw_features.empty:
+        return pd.DataFrame()
+
+    keys = history_df[["member_id", "draw_id"]].copy()
+    keys["member_id"] = keys["member_id"].astype(str).str.strip().str.upper()
+    keys["draw_id"] = pd.to_numeric(keys["draw_id"], errors="coerce").astype("Int64")
+    keys = keys.dropna(subset=["draw_id"]).drop_duplicates()
+    draw_metrics = draw_features.copy()
+    draw_metrics["draw_id"] = pd.to_numeric(draw_metrics["draw_id"], errors="coerce").astype("Int64")
+    merged = keys.merge(draw_metrics, on="draw_id", how="left")
+    if merged.empty:
+        return pd.DataFrame(columns=["member_id", *COLLUSION_FEATURE_COLUMNS])
+    merged["cohort_2plus"] = (merged["cohort_size"].fillna(0) >= 2).astype(float)
+    in_cohort = merged["cohort_size"].fillna(0) >= 2
+    merged["pairwise_jaccard_for_agg"] = np.where(
+        in_cohort,
+        merged["mean_pairwise_jaccard"].fillna(0.0),
+        np.nan,
+    )
+    return merged
+
+
+def _aggregate_collusion_member_draw_rows(merged: pd.DataFrame) -> pd.DataFrame:
+    if merged.empty:
+        return pd.DataFrame(columns=["member_id", *COLLUSION_FEATURE_COLUMNS])
+
+    features = merged.groupby("member_id").agg(
+        max_cohort_coverage_in_draws=("union_position_coverage", "max"),
+        mean_cohort_coverage_in_draws=("union_position_coverage", "mean"),
+        pct_draws_in_cohort_2plus=("cohort_2plus", "mean"),
+        mean_cohort_size=("cohort_size", "mean"),
+        mean_pairwise_jaccard_when_in_cohort=("pairwise_jaccard_for_agg", "mean"),
+    ).reset_index()
+
+    for col in COLLUSION_FEATURE_COLUMNS:
+        features[col] = pd.to_numeric(features[col], errors="coerce").fillna(0.0)
+    return features
+
+
+def _aggregate_collusion_features(history_df: pd.DataFrame, draw_features: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate draw-level collusion metrics back to player-level features."""
+    return _aggregate_collusion_member_draw_rows(_collusion_member_draw_rows(history_df, draw_features))
 
 
 def build_ccs_stats_lookup(history_df: pd.DataFrame) -> pd.DataFrame:
@@ -482,6 +618,8 @@ class FeatureEngineering:
         player_features: pd.DataFrame,
         fraud_player_count: int,
         dropped_positive_count: int,
+        fraud_funnel: dict | None = None,
+        draw_features_path: Any = None,
     ) -> FeatureEngineeringArtifact:
         feature_cols = [
             c for c in player_features.columns
@@ -502,8 +640,29 @@ class FeatureEngineering:
             "dropped_positive_count": dropped_positive_count,
             "feature_columns": feature_cols,
             "feature_count": len(feature_cols),
+            "compute_collusion_features": bool(self.config.compute_collusion_features),
+            "draw_features_path": str(draw_features_path) if draw_features_path else None,
             "computed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if fraud_funnel is not None:
+            summary["fraud_funnel"] = fraud_funnel
+            funnel_path = self.config.output_dir / "fraud_funnel.json"
+            write_json(fraud_funnel, funnel_path)
+            logger.info(
+                "FraudFunnel: csv_rows=%s csv_unique_members=%s use_window=%s "
+                "window_days=%s members_in_raw=%s members_in_window=%s "
+                "fraud_member_history_rows=%s players_in_feature_table=%s "
+                "dropped_positive=%s",
+                fraud_funnel.get("csv_rows"),
+                fraud_funnel.get("csv_unique_members"),
+                fraud_funnel.get("use_window"),
+                fraud_funnel.get("window_days"),
+                fraud_funnel.get("members_in_raw"),
+                fraud_funnel.get("members_in_window"),
+                fraud_funnel.get("fraud_member_history_rows"),
+                fraud_funnel.get("players_in_feature_table"),
+                fraud_funnel.get("dropped_positive_count"),
+            )
         write_json(summary, summary_path)
 
         logger.info("FeatureEngineering: complete — saved to %s", self.config.output_dir)
@@ -515,6 +674,7 @@ class FeatureEngineering:
             feature_columns=feature_cols,
             feature_summary_path=summary_path,
             mode=self.config.mode,
+            draw_features_path=draw_features_path,
         )
 
     def _initiate_feature_engineering_in_memory(self) -> FeatureEngineeringArtifact:
@@ -525,26 +685,51 @@ class FeatureEngineering:
 
         fraud_player_count = 0
         dropped_positive_count = 0
+        funnel: dict | None = None
 
         if self.config.mode == "training_eval":
             fraud_df = self._load_fraud_csv()
-            history_df, fraud_player_count, dropped_positive_count = self._apply_training_eval_steps(
-                normalized_df, fraud_df
-            )
+            history_df, _, _ = self._apply_training_eval_steps(normalized_df, fraud_df)
         else:
+            fraud_df = None
             history_df = normalized_df.copy()
 
         player_features = self._aggregate_player_features(history_df)
+        draw_features_path = None
+        if self.config.compute_collusion_features:
+            draw_features = _compute_draw_collusion_features(history_df)
+            draw_features_path = self.config.output_dir / "draw_features.parquet"
+            save_parquet(draw_features, draw_features_path)
+            collusion_features = _aggregate_collusion_features(history_df, draw_features)
+            player_features = player_features.merge(collusion_features, on="member_id", how="left")
+            for col in COLLUSION_FEATURE_COLUMNS:
+                player_features[col] = pd.to_numeric(player_features[col], errors="coerce").fillna(0.0)
 
-        if self.config.mode == "training_eval":
-            fraud_df = self._load_fraud_csv()
-            fraud_event_keys = set(fraud_df["fraud_event_key"])
-            fraud_players = set(
-                normalized_df.loc[normalized_df["fraud_event_key"].isin(fraud_event_keys), "member_id"]
-            )
+        if self.config.mode == "training_eval" and fraud_df is not None:
+            has_dates = bool(fraud_df["fraud_date"].notna().any())
+            window_days = int(self.config.fraud_label_window_days)
+            use_window = has_dates and window_days > 0
+
+            if use_window:
+                fraud_players = set(fraud_df["member_id_norm"])
+            else:
+                fraud_event_keys = set(fraud_df["fraud_event_key"])
+                fraud_players = set(
+                    normalized_df.loc[normalized_df["fraud_event_key"].isin(fraud_event_keys), "member_id"]
+                )
+
             player_features["event_fraud_flag"] = player_features["member_id"].isin(fraud_players).astype(int)
             fraud_player_count = int(player_features["event_fraud_flag"].sum())
             dropped_positive_count = len(fraud_players) - fraud_player_count
+
+            funnel = self._compute_fraud_funnel(
+                fraud_df=fraud_df,
+                normalized_members=set(normalized_df["member_id"].unique()),
+                history_fraud_member_rows=int(history_df.get("is_fraud_player", pd.Series(dtype=int)).eq(1).sum()),
+                player_features=player_features,
+                use_window=use_window,
+                window_days=window_days,
+            )
 
         logger.info(
             "FeatureEngineering: %d players, %d fraud, %d dropped positive",
@@ -561,6 +746,8 @@ class FeatureEngineering:
             player_features=player_features,
             fraud_player_count=fraud_player_count,
             dropped_positive_count=dropped_positive_count,
+            fraud_funnel=funnel,
+            draw_features_path=draw_features_path,
         )
 
     def _initiate_feature_engineering_bucketed(self) -> FeatureEngineeringArtifact:
@@ -570,10 +757,16 @@ class FeatureEngineering:
         )
 
         history_path = self.config.output_dir / "history_df.parquet"
+        draw_features_path = self.config.output_dir / "draw_features.parquet" if self.config.compute_collusion_features else None
         raw_path = self.ingestion_artifact.raw_data_path
         bucket_dir = ensure_dir(self.config.output_dir / "_bucketed_normalized")
+        draw_bucket_dir = ensure_dir(self.config.output_dir / "_bucketed_draws") if self.config.compute_collusion_features else None
         bucket_count = self._choose_bucket_count(self.ingestion_artifact.row_count)
         bucket_paths = [bucket_dir / f"bucket_{bucket_id:03d}.parquet" for bucket_id in range(bucket_count)]
+        draw_bucket_paths = (
+            [draw_bucket_dir / f"draw_bucket_{bucket_id:03d}.parquet" for bucket_id in range(bucket_count)]
+            if draw_bucket_dir is not None else []
+        )
 
         parquet_file = pq.ParquetFile(raw_path)
         requested_columns = [
@@ -623,10 +816,29 @@ class FeatureEngineering:
 
         fraud_df = self._load_fraud_csv() if self.config.mode == "training_eval" else None
         fraud_event_keys = set(fraud_df["fraud_event_key"]) if fraud_df is not None else set()
+        # When DATE is present, "fraud member" = CSV membership directly. The
+        # whole CSV member set is known up front, so we don't need to scan
+        # buckets to discover it. Keeping ``fraud_players_seen`` for the
+        # legacy code path (DATE missing) where we still need to scan bucket
+        # rows for matches.
+        if fraud_df is not None and bool(fraud_df["fraud_date"].notna().any()) and int(self.config.fraud_label_window_days) > 0:
+            use_window_bucketed = True
+            fraud_players_csv: set[str] = set(fraud_df["member_id_norm"])
+        else:
+            use_window_bucketed = False
+            fraud_players_csv = set()
         fraud_players_seen: set[str] = set()
+        # For the funnel: members from CSV that appeared in any normalized
+        # bucket (any row, before window filtering).
+        fraud_members_in_raw: set[str] = set()
+        # For the funnel: members from CSV that had at least one row
+        # surviving the window filter (history_df, is_fraud_player=1).
+        fraud_members_in_window: set[str] = set()
+        fraud_member_history_rows = 0
         history_rows = 0
         player_feature_frames: list[pd.DataFrame] = []
         history_writers: dict = {}
+        draw_bucket_writers: dict = {}
 
         try:
             for bucket_index, bucket_path in enumerate(bucket_paths, start=1):
@@ -641,10 +853,22 @@ class FeatureEngineering:
                 bucket_df = self._finalize_normalized_bucket(bucket_df)
 
                 if self.config.mode == "training_eval":
-                    fraud_players_seen.update(
-                        bucket_df.loc[bucket_df["fraud_event_key"].isin(fraud_event_keys), "member_id"]
-                    )
+                    if use_window_bucketed:
+                        fraud_members_in_raw.update(
+                            set(bucket_df["member_id"].unique()).intersection(fraud_players_csv)
+                        )
+                    else:
+                        fraud_players_seen.update(
+                            bucket_df.loc[bucket_df["fraud_event_key"].isin(fraud_event_keys), "member_id"]
+                        )
                     history_df, _, _ = self._apply_training_eval_steps(bucket_df, fraud_df)
+                    if "is_fraud_player" in history_df.columns:
+                        bucket_fraud_rows = int(history_df["is_fraud_player"].eq(1).sum())
+                        fraud_member_history_rows += bucket_fraud_rows
+                        if bucket_fraud_rows:
+                            fraud_members_in_window.update(
+                                history_df.loc[history_df["is_fraud_player"].eq(1), "member_id"].unique()
+                            )
                     history_df = self._ensure_history_schema(history_df)
                 else:
                     history_df = bucket_df.copy()
@@ -654,6 +878,22 @@ class FeatureEngineering:
                     player_feature_frames.append(player_features_bucket)
 
                 history_rows += len(history_df)
+                if self.config.compute_collusion_features and not history_df.empty:
+                    draw_cols = [col for col in ["member_id", "draw_id", "bets", "total_bet_amount"] if col in history_df.columns]
+                    draw_input = history_df[draw_cols].copy()
+                    draw_ids = pd.to_numeric(draw_input["draw_id"], errors="coerce")
+                    valid_draw_id_mask = draw_ids.notna()
+                    draw_input = draw_input.loc[valid_draw_id_mask].copy()
+                    if not draw_input.empty:
+                        draw_ids = draw_ids.loc[valid_draw_id_mask].astype("int64")
+                        draw_bucket_ids = (draw_ids.to_numpy() % bucket_count).astype("int64")
+                        draw_input["_draw_bucket_id"] = draw_bucket_ids
+                        for draw_bucket_id, draw_bucket_df in draw_input.groupby("_draw_bucket_id", sort=False):
+                            self._append_dataframe_to_parquet(
+                                draw_bucket_df.drop(columns="_draw_bucket_id"),
+                                draw_bucket_paths[int(draw_bucket_id)],
+                                draw_bucket_writers,
+                            )
                 self._append_dataframe_to_parquet(history_df, history_path, history_writers)
                 bucket_path.unlink(missing_ok=True)
 
@@ -667,6 +907,7 @@ class FeatureEngineering:
                     )
         finally:
             self._close_writers(history_writers)
+            self._close_writers(draw_bucket_writers)
             shutil.rmtree(bucket_dir, ignore_errors=True)
 
         if player_feature_frames:
@@ -674,12 +915,67 @@ class FeatureEngineering:
         else:
             player_features = pd.DataFrame(columns=["member_id"])
 
+        if self.config.compute_collusion_features and draw_features_path is not None:
+            draw_feature_frames: list[pd.DataFrame] = []
+            collusion_member_draw_frames: list[pd.DataFrame] = []
+            for draw_bucket_path in draw_bucket_paths:
+                if not draw_bucket_path.exists():
+                    continue
+                draw_history_df = pd.read_parquet(draw_bucket_path)
+                draw_features_bucket = _compute_draw_collusion_features(draw_history_df)
+                if not draw_features_bucket.empty:
+                    draw_feature_frames.append(draw_features_bucket)
+                    member_draw_rows = _collusion_member_draw_rows(draw_history_df, draw_features_bucket)
+                    if not member_draw_rows.empty:
+                        collusion_member_draw_frames.append(member_draw_rows)
+                draw_bucket_path.unlink(missing_ok=True)
+            shutil.rmtree(draw_bucket_dir, ignore_errors=True)
+
+            draw_features = (
+                pd.concat(draw_feature_frames, ignore_index=True)
+                if draw_feature_frames else pd.DataFrame(columns=[
+                    "draw_id", "cohort_size", "union_position_coverage",
+                    "mean_pairwise_jaccard", "total_cohort_stake",
+                ])
+            )
+            save_parquet(draw_features, draw_features_path)
+            collusion_features = (
+                _aggregate_collusion_member_draw_rows(pd.concat(collusion_member_draw_frames, ignore_index=True))
+                if collusion_member_draw_frames else pd.DataFrame(columns=["member_id", *COLLUSION_FEATURE_COLUMNS])
+            )
+            player_features = player_features.merge(collusion_features, on="member_id", how="left")
+            for col in COLLUSION_FEATURE_COLUMNS:
+                player_features[col] = pd.to_numeric(player_features[col], errors="coerce").fillna(0.0)
+        elif draw_bucket_dir is not None:
+            shutil.rmtree(draw_bucket_dir, ignore_errors=True)
+
         fraud_player_count = 0
         dropped_positive_count = 0
-        if self.config.mode == "training_eval":
-            player_features["event_fraud_flag"] = player_features["member_id"].isin(fraud_players_seen).astype(int)
+        funnel: dict | None = None
+        if self.config.mode == "training_eval" and fraud_df is not None:
+            fraud_players = fraud_players_csv if use_window_bucketed else fraud_players_seen
+            player_features["event_fraud_flag"] = player_features["member_id"].isin(fraud_players).astype(int)
             fraud_player_count = int(player_features["event_fraud_flag"].sum())
-            dropped_positive_count = len(fraud_players_seen) - fraud_player_count
+            dropped_positive_count = len(fraud_players) - fraud_player_count
+
+            funnel = {
+                "csv_rows": int(len(fraud_df)),
+                "csv_unique_members": int(fraud_df["member_id_norm"].nunique()),
+                "csv_with_valid_date": int(fraud_df["fraud_date"].notna().sum()),
+                "use_window": use_window_bucketed,
+                "window_days": int(self.config.fraud_label_window_days),
+                "members_in_raw": (
+                    len(fraud_members_in_raw) if use_window_bucketed
+                    else len(fraud_players_seen)
+                ),
+                "members_in_window": (
+                    len(fraud_members_in_window) if use_window_bucketed
+                    else len(fraud_players_seen)
+                ),
+                "fraud_member_history_rows": fraud_member_history_rows,
+                "players_in_feature_table": int(fraud_player_count),
+                "dropped_positive_count": int(dropped_positive_count),
+            }
 
         logger.info(
             "FeatureEngineering: %d players, %d fraud, %d dropped positive",
@@ -696,9 +992,19 @@ class FeatureEngineering:
             player_features=player_features,
             fraud_player_count=fraud_player_count,
             dropped_positive_count=dropped_positive_count,
+            fraud_funnel=funnel,
+            draw_features_path=draw_features_path,
         )
 
     def _load_fraud_csv(self) -> pd.DataFrame:
+        """Load and normalize the fraud CSV.
+
+        When a `DATE` column is present, parses it into a UTC `fraud_date`
+        timestamp used for weekly window matching in
+        ``_apply_training_eval_steps``. When `DATE` is absent, ``fraud_date``
+        is set to NaT and the matching path falls back to the legacy
+        whole-window set-membership behavior.
+        """
         fraud_df = pd.read_csv(self.config.fraud_csv_path)
         fraud_df.columns = [c.strip().lower() for c in fraud_df.columns]
         fraud_df["member_id_norm"] = fraud_df["member_id"].astype(str).str.strip().str.upper()
@@ -706,7 +1012,62 @@ class FeatureEngineering:
         fraud_df["fraud_event_key"] = (
             fraud_df["draw_id_norm"].astype(str) + "|" + fraud_df["member_id_norm"]
         )
+        if "date" in fraud_df.columns:
+            fraud_df["fraud_date"] = pd.to_datetime(fraud_df["date"], errors="coerce", utc=True)
+            unparseable = int(fraud_df["fraud_date"].isna().sum())
+            if unparseable:
+                logger.warning(
+                    "FraudCSV: %d/%d rows have unparseable DATE — dropped from labeling",
+                    unparseable, len(fraud_df),
+                )
+                fraud_df = fraud_df.loc[fraud_df["fraud_date"].notna()].copy()
+        else:
+            logger.warning(
+                "FraudCSV: no DATE column — falling back to whole-window labeling. "
+                "Add a DATE column to enable weekly matching."
+            )
+            fraud_df["fraud_date"] = pd.NaT
         return fraud_df
+
+    def _compute_fraud_funnel(
+        self,
+        fraud_df: pd.DataFrame,
+        normalized_members: set,
+        history_fraud_member_rows: int,
+        player_features: pd.DataFrame,
+        use_window: bool,
+        window_days: int,
+    ) -> dict:
+        """Build the fraud-label funnel report for the in-memory training path.
+
+        Captures the count drop from CSV rows to labeled players in the final
+        feature table — the answer to "where did my fraud labels go." The
+        bucketed orchestration computes its own funnel in-line because it
+        needs to aggregate counts across buckets without ever materializing
+        the full normalized frame.
+        """
+        csv_members = set(fraud_df["member_id_norm"])
+        members_in_raw = len(csv_members.intersection(normalized_members))
+        if "event_fraud_flag" in player_features.columns:
+            in_table = int(player_features["event_fraud_flag"].sum())
+        else:
+            in_table = 0
+        return {
+            "csv_rows": int(len(fraud_df)),
+            "csv_unique_members": int(fraud_df["member_id_norm"].nunique()),
+            "csv_with_valid_date": int(fraud_df["fraud_date"].notna().sum()),
+            "use_window": bool(use_window),
+            "window_days": int(window_days),
+            "members_in_raw": int(members_in_raw),
+            # In-memory mode: we count fraud-member rows surviving the cutoff
+            # as the "in window" signal. A member with at least one surviving
+            # row will appear in player_features (counted in members_in_raw
+            # already); the row count is the load-bearing diagnostic.
+            "members_in_window": int(in_table),
+            "fraud_member_history_rows": int(history_fraud_member_rows),
+            "players_in_feature_table": int(in_table),
+            "dropped_positive_count": int(len(csv_members) - in_table),
+        }
 
     def _normalize(
         self,
@@ -725,47 +1086,123 @@ class FeatureEngineering:
     def _apply_training_eval_steps(
         self, normalized_df: pd.DataFrame, fraud_df: pd.DataFrame
     ) -> tuple[pd.DataFrame, int, int]:
-        fraud_event_keys = set(fraud_df["fraud_event_key"])
-        df = normalized_df.copy()
-        df["event_label"] = df["fraud_event_key"].isin(fraud_event_keys).astype(int)
+        """Tag fraud rows and apply pre-fraud cutoff.
 
-        fraud_players = set(df.loc[df["event_label"] == 1, "member_id"])
+        Two label-matching paths:
+
+        - **Weekly (DATE present, fraud_label_window_days > 0):** a row's
+          ``event_label`` is 1 iff its ``(draw_id, member_id)`` is in the CSV
+          AND its ``ts`` falls in ``[fraud_date - window, fraud_date)``. The
+          fraud member's history is then narrowed to the same window
+          ``[member_first_fraud_date - window, member_first_fraud_date)``.
+          Outside that window we treat the member_id as a different person
+          (fraud-ops recycles flagged ids weekly).
+
+        - **Legacy (DATE missing or window=0):** set membership on
+          ``fraud_event_key``; pre-fraud cutoff uses the earliest fraud row
+          observed in raw data as ``first_fraud_ts``.
+        """
+        df = normalized_df.copy()
+
+        has_dates = bool(fraud_df["fraud_date"].notna().any())
+        window_days = int(self.config.fraud_label_window_days)
+        use_window = has_dates and window_days > 0
+
+        if use_window:
+            window = pd.Timedelta(days=window_days)
+            fraud_event_lookup = (
+                fraud_df.dropna(subset=["fraud_date"])
+                .groupby("fraud_event_key", as_index=False)["fraud_date"]
+                .min()
+                .rename(columns={"fraud_date": "_event_fraud_date"})
+            )
+            df = df.merge(fraud_event_lookup, on="fraud_event_key", how="left")
+            in_window = (
+                df["_event_fraud_date"].notna()
+                & df["ts"].notna()
+                & (df["ts"] >= df["_event_fraud_date"] - window)
+                & (df["ts"] < df["_event_fraud_date"])
+            )
+            df["event_label"] = in_window.astype(int)
+            # A member is "fraud" if they appear in the CSV at all — the
+            # window only restricts which DRAWS count as the fraud event and
+            # which ROWS count as their pre-fraud history. CSV membership is
+            # ground truth for "this id was caught."
+            fraud_players = set(fraud_df["member_id_norm"])
+        else:
+            fraud_event_keys = set(fraud_df["fraud_event_key"])
+            df["event_label"] = df["fraud_event_key"].isin(fraud_event_keys).astype(int)
+            fraud_players = set(df.loc[df["event_label"] == 1, "member_id"])
+
+        df["is_fraud_player"] = df["member_id"].isin(fraud_players).astype(int)
 
         if not fraud_players or not self.config.apply_pre_fraud_cutoff:
             history_df = df.copy()
+            if "_event_fraud_date" in history_df.columns:
+                history_df = history_df.drop(columns=["_event_fraud_date"])
             return history_df, len(fraud_players), 0
 
-        # Compute first fraud event per player.
-        # The earliest row is selected by (ts, draw_id) sort with NaT last, so
-        # first_fraud_ts and first_fraud_draw_id both come from the SAME event row.
-        # Using independent min() per column would mix fields from different rows
-        # whenever a member has multiple fraud events and the earliest timestamp
-        # is not on the same row as the lowest draw_id.
-        event_match_df = (
-            df.loc[df["event_label"] == 1, ["member_id", "draw_id", "ts"]]
-            .sort_values(["member_id", "ts", "draw_id"], na_position="last")
-        )
-        first_fraud = (
-            event_match_df
-            .groupby("member_id", as_index=False)
-            .agg(
-                first_fraud_ts=("ts", "first"),
-                first_fraud_draw_id=("draw_id", "first"),
+        if use_window:
+            # Per-member earliest fraud_date from CSV, then narrow each fraud
+            # member's history to ``[first_fraud_ts - window, first_fraud_ts)``.
+            member_first = (
+                fraud_df.dropna(subset=["fraud_date"])
+                .groupby("member_id_norm", as_index=False)["fraud_date"]
+                .min()
+                .rename(columns={
+                    "member_id_norm": "member_id",
+                    "fraud_date": "first_fraud_ts",
+                })
             )
-        )
-        df = df.merge(
-            first_fraud[["member_id", "first_fraud_ts", "first_fraud_draw_id"]].assign(is_fraud_player=1),
-            on="member_id",
-            how="left",
-        )
-        df["is_fraud_player"] = df["is_fraud_player"].fillna(0).astype(int)
+            df = df.merge(member_first, on="member_id", how="left")
+            # ``first_fraud_draw_id`` is preserved for downstream schema
+            # compatibility but not derived from CSV — set NA. The legacy
+            # path (below) populates it.
+            df["first_fraud_draw_id"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
 
-        pre_fraud_mask = df["is_fraud_player"].eq(1) & (
-            (df["ts"].notna() & df["first_fraud_ts"].notna() & (df["ts"] < df["first_fraud_ts"]))
-            | (df["first_fraud_ts"].isna() & df["first_fraud_draw_id"].notna() & (df["draw_id"] < df["first_fraud_draw_id"]))
-        )
-        non_fraud_mask = df["is_fraud_player"].eq(0)
-        history_df = df.loc[pre_fraud_mask | non_fraud_mask].copy()
+            is_fraud_player_mask = df["is_fraud_player"].eq(1)
+            in_catch_window = (
+                df["ts"].notna()
+                & df["first_fraud_ts"].notna()
+                & (df["ts"] >= df["first_fraud_ts"] - window)
+                & (df["ts"] < df["first_fraud_ts"])
+            )
+            non_fraud_mask = ~is_fraud_player_mask
+            history_df = df.loc[(is_fraud_player_mask & in_catch_window) | non_fraud_mask].copy()
+        else:
+            # Compute first fraud event per player.
+            # The earliest row is selected by (ts, draw_id) sort with NaT last, so
+            # first_fraud_ts and first_fraud_draw_id both come from the SAME event row.
+            # Using independent min() per column would mix fields from different rows
+            # whenever a member has multiple fraud events and the earliest timestamp
+            # is not on the same row as the lowest draw_id.
+            event_match_df = (
+                df.loc[df["event_label"] == 1, ["member_id", "draw_id", "ts"]]
+                .sort_values(["member_id", "ts", "draw_id"], na_position="last")
+            )
+            first_fraud = (
+                event_match_df
+                .groupby("member_id", as_index=False)
+                .agg(
+                    first_fraud_ts=("ts", "first"),
+                    first_fraud_draw_id=("draw_id", "first"),
+                )
+            )
+            df = df.merge(
+                first_fraud[["member_id", "first_fraud_ts", "first_fraud_draw_id"]],
+                on="member_id",
+                how="left",
+            )
+
+            pre_fraud_mask = df["is_fraud_player"].eq(1) & (
+                (df["ts"].notna() & df["first_fraud_ts"].notna() & (df["ts"] < df["first_fraud_ts"]))
+                | (df["first_fraud_ts"].isna() & df["first_fraud_draw_id"].notna() & (df["draw_id"] < df["first_fraud_draw_id"]))
+            )
+            non_fraud_mask = df["is_fraud_player"].eq(0)
+            history_df = df.loc[pre_fraud_mask | non_fraud_mask].copy()
+
+        if "_event_fraud_date" in history_df.columns:
+            history_df = history_df.drop(columns=["_event_fraud_date"])
 
         return history_df, len(fraud_players), 0  # dropped count computed after aggregation
 

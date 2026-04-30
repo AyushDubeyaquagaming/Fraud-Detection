@@ -168,6 +168,7 @@ class DataIngestion:
             build_query_batches_from_strategy,
             stream_query_batches_to_parquet,
         )
+        from fraud_detection.utils.rolling_parquet_store import materialize_rolling_window_to_parquet
 
         strategy = self.config.mongo_strategy
         strategy_params = self.config.mongo_strategy_params
@@ -177,6 +178,19 @@ class DataIngestion:
             strategy,
             strategy_params,
         )
+
+        if strategy == "rolling_store":
+            store_root = Path(strategy_params.get("store_root", "data_store/training_window"))
+            lookback_days = int(strategy_params.get("lookback_days", 90))
+            end_date = pd.Timestamp.now(tz="UTC")
+            start_date = end_date - pd.Timedelta(days=lookback_days)
+            stats = materialize_rolling_window_to_parquet(
+                output_root=store_root,
+                output_path=output_path,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return stats
 
         query_filters = build_query_batches_from_strategy(strategy, strategy_params)
 

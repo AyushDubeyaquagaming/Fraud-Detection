@@ -147,7 +147,18 @@ class DataValidation:
                     fraud_df = pd.read_csv(fraud_csv_path)
                     fraud_df.columns = [c.strip().lower() for c in fraud_df.columns]
                     has_cols = all(c in fraud_df.columns for c in ["member_id", "draw_id"])
-                    checks["fraud_csv"] = {"passed": has_cols, "rows": len(fraud_df)}
+                    has_date = "date" in fraud_df.columns
+                    fraud_check: dict = {"passed": has_cols, "rows": len(fraud_df), "has_date_column": has_date}
+                    if not has_date:
+                        # DATE is required for weekly window matching but the
+                        # downstream code falls back to legacy whole-window
+                        # behavior when missing — so treat as warning, not fail.
+                        fraud_check["warning"] = (
+                            "no DATE column — weekly fraud-label window matching "
+                            "will be disabled and labels will fall back to "
+                            "set-membership matching across the full ingestion window"
+                        )
+                    checks["fraud_csv"] = fraud_check
                 except Exception as ex:
                     checks["fraud_csv"] = {"passed": False, "error": str(ex)}
             else:

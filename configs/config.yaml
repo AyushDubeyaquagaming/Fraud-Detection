@@ -7,10 +7,10 @@ pipeline:
   weekly_serving_snapshot_config: "configs/batch_scoring.yaml"
 
 data_ingestion:
-  source: "mongodb"
+  source: "parquet"
   # Local cache target refreshed by Mongo ingestion. For local training, you can
   # temporarily switch source=parquet and point this path at a known-good extract.
-  parquet_path: "data_cache/fraud_modeling_pull.parquet"
+  parquet_path: "artifacts/runs/run_20260427_175142/data_ingestion/raw_data.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
     database_env_var: "MONGODB_DATABASE"
@@ -19,6 +19,7 @@ data_ingestion:
     # date_window  — default; bounds by trans_date. Use for routine weekly retraining.
     # member_list  — targeted cohort extraction and scoring. Not the standard retraining path.
     # full_collection — escape hatch for one-time baseline pulls. Requires confirm_full_pull: true.
+    # rolling_store — read from local Hive-partitioned data_store/training_window after bootstrap.
     strategy: "date_window"
     strategy_params:
       # trans_date is the default because it aligns to gameplay time, not document write time.
@@ -31,6 +32,9 @@ data_ingestion:
       end_date: null
       # full_collection guard — must be set to true to allow a full-collection pull.
       confirm_full_pull: false
+      # rolling_store params (used only when strategy: rolling_store)
+      store_root: "data_store/training_window"
+      days_to_pull: 7
 
 data_validation:
   required_columns:
@@ -50,6 +54,15 @@ feature_engineering:
                "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
                "std_net_result", "pnl_volatility"]
   apply_pre_fraud_cutoff: true
+  # Weekly fraud-label window (days). Fraud-ops sits weekly and a flagged
+  # member_id may be re-assigned outside the catch week, so we restrict a
+  # fraud member's history to rows in [fraud_date - window, fraud_date).
+  # Set to 0 to disable window narrowing.
+  fraud_label_window_days: 7
+  # Phase B: same-draw collusion signals. These are label-safe because they
+  # only use who appeared in the same draw and which roulette positions they
+  # covered; no fraud labels are used to compute the features.
+  compute_collusion_features: true
 
 model_evaluation:
   # Percentile buckets REPORTED in the evaluation output. The primary gate is at

@@ -1,0 +1,23 @@
+# Pending fraud IDs to validate against MongoDB before adding to the training
+# CSV. Reusable input for scripts/validate_fraud_ids.py — overwrite this file
+# with the next batch of IDs from fraud-ops and re-run the script.
+#
+# Each entry: a draw_id and the members caught at that draw.
+# fraud_date: when fraud-ops flagged the cohort (used to compute the
+# pre-fraud window check).
+events:
+  - draw_id: 7276683
+    fraud_date: "2026-04-21"  # ~2 weeks before today (2026-04-28)
+    members:
+      - { member_id: "GK00257866", ccs_id: "38767" }
+      - { member_id: "GK00203821", ccs_id: "27699" }
+      - { member_id: "GK00257909", ccs_id: "38769" }
+      - { member_id: "GK00210838", ccs_id: "38761" }
+
+  - draw_id: 7268296
+    fraud_date: "2026-04-21"
+    members:
+      - { member_id: "GK00231688", ccs_id: "12231" }
+      - { member_id: "GK00255330", ccs_id: "24508" }
+      - { member_id: "GK00241524", ccs_id: "26175" }
+      - { member_id: "GK00231734", ccs_id: "13824" }

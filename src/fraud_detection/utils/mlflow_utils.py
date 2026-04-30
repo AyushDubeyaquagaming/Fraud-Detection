@@ -127,39 +127,35 @@ def register_model_to_staging(
     description: str | None = None,
     tags: dict[str, str] | None = None,
     archive_existing_staging: bool = True,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Register an MLflow artifact as a new model version and transition it to Staging.
 
-    Non-fatal: any exception is caught, logged, and None is returned. Filesystem
-    promotion (model_bundle.joblib + serving_manifest.json) remains the source
-    of truth for serving — the registry adds version tracking + lineage on top.
-
-    Parameters
-    ----------
-    artifact_uri : str
-        MLflow URI of the logged artifact, e.g. "runs:/<run_id>/model_bundle.joblib".
-    registered_name : str
-        Registered model name (e.g. "fraud_detection_hybrid").
-    description : str, optional
-        Human-readable note attached to the version (run id, gate metrics, etc.).
-    tags : dict[str, str], optional
-        Tags to attach to the version (e.g. git_sha, capture_rate_top_5pct).
-    archive_existing_staging : bool, default True
-        If True, all prior versions in 'Staging' are transitioned to 'Archived'
-        atomically with the new version's promotion. The previously promoted
-        bundle on disk is unaffected.
+    Non-fatal: any exception is caught and reported in the returned dict.
+    Filesystem promotion (model_bundle.joblib + serving_manifest.json) remains
+    the source of truth for serving — the registry adds version tracking +
+    lineage on top.
 
     Returns
     -------
-    dict or None
-        {'name', 'version', 'stage', 'run_id'} on success; None on failure.
+    dict
+        Always returns a dict; never None. Keys:
+          - attempted: bool — whether the call ran at all
+          - succeeded: bool
+          - on success: name, version, stage, run_id
+          - on failure: error_type, error_message
     """
     try:
         import mlflow
         from mlflow.tracking import MlflowClient
     except Exception as exc:
-        logger.warning("MLflow not available — skipping model registration: %s", exc)
-        return None
+        logger.exception("MLflow not available — skipping model registration")
+        return {
+            "attempted": False,
+            "succeeded": False,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "error_stage": "import",
+        }
 
     try:
         client = MlflowClient()
@@ -180,7 +176,7 @@ def register_model_to_staging(
                     description=description,
                 )
             except Exception as exc:
-                logger.warning("update_model_version description failed (non-fatal): %s", exc)
+                logger.exception("update_model_version description failed (non-fatal)")
 
         client.transition_model_version_stage(
             name=registered_name,
@@ -194,6 +190,8 @@ def register_model_to_staging(
             registered_name, mv.version, getattr(mv, "run_id", "unknown"),
         )
         return {
+            "attempted": True,
+            "succeeded": True,
             "name": registered_name,
             "version": mv.version,
             "stage": "Staging",
@@ -202,5 +200,16 @@ def register_model_to_staging(
     except Exception as exc:
         # Registry is best-effort. Filesystem promotion is the source of truth
         # for the serving layer, so a registry hiccup must NOT block promotion.
-        logger.warning("Model registration failed (non-fatal): %s", exc)
-        return None
+        # Use logger.exception so the full traceback hits stderr/log files,
+        # then surface the error type + message in the return dict so the
+        # caller can persist it to promotion_metadata.json.
+        logger.exception("Model registration failed (non-fatal)")
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "error_stage": "register_or_transition",
+            "artifact_uri": artifact_uri,
+            "registered_name": registered_name,
+        }

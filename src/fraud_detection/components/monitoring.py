@@ -155,6 +155,19 @@ def _run_report(ref: pd.DataFrame, cur: pd.DataFrame, out_path: Path, label: str
     }
 
 
+def _shared_nonempty_numeric_columns(ref: pd.DataFrame, cur: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for col in cur.columns:
+        if col not in ref.columns or col.startswith("_"):
+            continue
+        if cur[col].dtype.kind not in "iuf" or ref[col].dtype.kind not in "iuf":
+            continue
+        if cur[col].dropna().empty or ref[col].dropna().empty:
+            continue
+        columns.append(col)
+    return columns
+
+
 class Monitoring:
     def __init__(
         self,
@@ -224,7 +237,7 @@ class Monitoring:
         cur_raw = _sample_parquet_bounded(cur_raw_path, n)
         ref_raw = _sample_parquet_bounded(ref_raw_path, n)
         if cur_raw is not None and ref_raw is not None:
-            shared_cols = [c for c in cur_raw.columns if c in ref_raw.columns and cur_raw[c].dtype.kind in "iuf"]
+            shared_cols = _shared_nonempty_numeric_columns(ref_raw, cur_raw)
             if shared_cols:
                 summary = _run_report(ref_raw[shared_cols], cur_raw[shared_cols], data_report_path, "data_drift")
                 summaries.append(summary)

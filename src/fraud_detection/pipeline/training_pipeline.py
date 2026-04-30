@@ -101,6 +101,8 @@ class TrainingPipeline:
             fraud_csv_path=REPO_ROOT / val_cfg["fraud_csv_path"],
             output_dir=run_dir / "feature_engineering",
             mode="training_eval",
+            fraud_label_window_days=int(fe_cfg.get("fraud_label_window_days", 7)),
+            compute_collusion_features=bool(fe_cfg.get("compute_collusion_features", False)),
         )
         model_training_config = ModelTrainingConfig(
             iso_forest_params=iso_params,

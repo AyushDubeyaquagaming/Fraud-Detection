@@ -28,6 +28,8 @@ feature_engineering:
                "stake_std", "max_stake_per_draw", "stake_cv",
                "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
                "std_net_result", "pnl_volatility"]
+  fraud_label_window_days: 7
+  compute_collusion_features: true
 
 batch_scoring:
   mode: "operational"

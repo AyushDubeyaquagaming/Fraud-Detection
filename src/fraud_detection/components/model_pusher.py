@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fraud_detection.entity.artifact_entity import ModelEvaluationArtifact, ModelPusherArtifact, ModelTrainingArtifact
 from fraud_detection.entity.config_entity import ModelPusherConfig
@@ -42,10 +43,14 @@ class ModelPusher:
         bundle_path: Path,
         git_sha: str,
         promoted_at: str,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any]:
         """Log the bundle as an MLflow artifact and register the resulting URI in
-        the Model Registry under stage='Staging'. All failures are swallowed —
-        registry is purely additive on top of filesystem promotion.
+        the Model Registry under stage='Staging'.
+
+        Always returns a status dict (never None). Filesystem promotion is the
+        source of truth — registry failures are reported via the dict but do
+        not block promotion. The dict's `succeeded` flag tells the caller
+        whether the version was actually created.
 
         The bundle is logged into the currently active MLflow run when one is
         open (typical when called from TrainingPipeline). When no run is active,
@@ -56,8 +61,14 @@ class ModelPusher:
             import mlflow
             from fraud_detection.utils.mlflow_utils import register_model_to_staging
         except Exception as exc:
-            logger.warning("MLflow unavailable — skipping registry: %s", exc)
-            return None
+            logger.exception("MLflow unavailable — skipping registry")
+            return {
+                "attempted": False,
+                "succeeded": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "error_stage": "pusher_import",
+            }
 
         try:
             active_run = mlflow.active_run()
@@ -94,9 +105,15 @@ class ModelPusher:
                     tags=tags,
                     archive_existing_staging=self.config.archive_existing_staging,
                 )
-                if result is None:
-                    return None
+                if not result.get("succeeded"):
+                    # Carry the diagnostic upward — caller writes it to
+                    # promotion_metadata.json so we can grep for what broke.
+                    result.setdefault("model_uri", model_uri)
+                    result.setdefault("run_id", run_id)
+                    return result
                 return {
+                    "attempted": True,
+                    "succeeded": True,
                     "name": str(result["name"]),
                     "version": str(result["version"]),
                     "stage": str(result["stage"]),
@@ -107,10 +124,16 @@ class ModelPusher:
                     try:
                         mlflow.end_run()
                     except Exception:
-                        pass
+                        logger.exception("mlflow.end_run failed during cleanup")
         except Exception as exc:
-            logger.warning("Registry registration failed (non-fatal): %s", exc)
-            return None
+            logger.exception("Registry registration failed (non-fatal)")
+            return {
+                "attempted": True,
+                "succeeded": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "error_stage": "pusher_outer",
+            }
 
     def initiate_model_pusher(self) -> ModelPusherArtifact:
         logger.info("ModelPusher: starting — gate_passed=%s", self.evaluation_artifact.gate_passed)
@@ -258,14 +281,27 @@ class ModelPusher:
             # Registry adds version tracking + lineage. Filesystem promotion
             # below remains the source of truth for the serving layer; if
             # registration fails, the bundle on disk is still served.
-            registry_info: dict[str, str] | None = None
+            #
+            # registry_status is ALWAYS recorded in promotion_metadata when a
+            # registration was attempted, including the error type/message on
+            # failure — this is the diagnostic surface for "registry shows the
+            # model name but no versions".
+            registry_status: dict[str, Any] | None = None
+            registry_info: dict[str, Any] | None = None
             if self.config.register_on_promotion:
-                registry_info = self._register_to_staging(
+                registry_status = self._register_to_staging(
                     bundle_path=bundle_path,
                     git_sha=git_sha,
                     promoted_at=promoted_at,
                 )
-                if registry_info:
+                metadata["registry_status"] = registry_status
+                if registry_status.get("succeeded"):
+                    registry_info = {
+                        "name": registry_status["name"],
+                        "version": registry_status["version"],
+                        "stage": registry_status["stage"],
+                        "run_id": registry_status.get("run_id"),
+                    }
                     metadata["mlflow_registry"] = registry_info
 
             write_json(metadata, promotion_metadata_path)

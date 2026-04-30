@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from fraud_detection.components.feature_engineering import compute_single_player_features
+from fraud_detection.components.feature_engineering import COLLUSION_FEATURE_COLUMNS, compute_single_player_features
 
 
 class FeatureBuilder:
@@ -26,6 +26,12 @@ class FeatureBuilder:
         features["member_id"] = str(member_id).strip().upper()
         if "primary_ccs_id" not in features.columns:
             features["primary_ccs_id"] = None
+        for col in COLLUSION_FEATURE_COLUMNS:
+            if col not in features.columns:
+                # Live scoring currently fetches one member's rows, not every
+                # peer in the same draw. Keep the endpoint compatible with
+                # collusion-trained bundles by using neutral zero values.
+                features[col] = 0.0
 
         missing = [col for col in self.feature_columns if col not in features.columns]
         if missing:

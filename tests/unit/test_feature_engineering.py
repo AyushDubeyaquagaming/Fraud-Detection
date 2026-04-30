@@ -647,3 +647,457 @@ def test_history_schema_stable_across_null_and_typed_fraud_columns(tmp_path):
     assert len(history_df) == 2
     assert str(history_df["first_fraud_ts"].dtype).startswith("datetime64")
     assert str(history_df["first_fraud_draw_id"].dtype) == "Int64"
+
+
+# --- Weekly fraud-label window matching tests ---
+
+
+def _build_fraud_window_inputs(tmp_path, window_days: int = 7):
+    """Synthetic raw + fraud CSV with a DATE column for window-matching tests.
+
+    Cohort:
+      - Fraud member F001 caught 2026-03-15. Has draws across 2026-03-01,
+        2026-03-10 (in window), 2026-03-12 (in window), 2026-03-14 (in window),
+        and 2026-03-20 (post-catch — must be dropped).
+      - Fraud member F002 caught 2026-02-01. Their only draws are in March
+        (post-catch) — should be fully dropped.
+      - Non-fraud member N001: draws scattered across months, all retained.
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+
+    rows = []
+    draw_id = 1
+
+    def _row(member, ts, ccs="CCS_X"):
+        nonlocal draw_id
+        row = {
+            "member_id": member,
+            "draw_id": draw_id,
+            "bets": json.dumps([{"number": str(draw_id % 38), "bet_amount": 10.0}]),
+            "win_points": 9.0,
+            "total_bet_amount": 10.0,
+            "session_id": 0,
+            "ccs_id": ccs,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "trans_date": ts,
+        }
+        draw_id += 1
+        return row
+
+    # F001: in-window + out-of-window draws (caught 2026-03-15)
+    f001_in_window_dates = [
+        pd.Timestamp("2026-03-10T12:00:00Z"),
+        pd.Timestamp("2026-03-12T18:00:00Z"),
+        pd.Timestamp("2026-03-14T09:00:00Z"),
+    ]
+    f001_out_of_window_dates = [
+        pd.Timestamp("2026-03-01T10:00:00Z"),  # 14 days before catch — outside window of 7
+        pd.Timestamp("2026-03-20T10:00:00Z"),  # post-catch
+    ]
+    f001_draws_in_window = []
+    for ts in f001_in_window_dates:
+        f001_draws_in_window.append(draw_id)
+        rows.append(_row("F001", ts))
+    for ts in f001_out_of_window_dates:
+        rows.append(_row("F001", ts))
+
+    # F002: caught 2026-02-01, only post-catch draws
+    rows.append(_row("F002", pd.Timestamp("2026-03-05T10:00:00Z")))
+    rows.append(_row("F002", pd.Timestamp("2026-03-08T10:00:00Z")))
+
+    # Non-fraud: all draws kept
+    n001_dates = [
+        pd.Timestamp("2026-01-15T10:00:00Z"),
+        pd.Timestamp("2026-02-20T10:00:00Z"),
+        pd.Timestamp("2026-03-25T10:00:00Z"),
+        pd.Timestamp("2026-04-01T10:00:00Z"),
+        pd.Timestamp("2026-04-15T10:00:00Z"),
+    ]
+    for ts in n001_dates:
+        rows.append(_row("N001", ts, ccs="CCS_Y"))
+
+    raw_df = pd.DataFrame(rows)
+    raw_path = tmp_path / "raw_data.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+
+    fraud_csv = pd.DataFrame(
+        {
+            "DATE": ["3/15/2026", "2/1/2026"],
+            # draw_ids referencing F001 in-window draws and an F002 draw
+            "DRAW_ID": [f001_draws_in_window[0], 9999],
+            "MEMBER_ID": ["F001", "F002"],
+            "CCS_ID": [1, 2],
+        }
+    )
+    fraud_path = tmp_path / "fraud.csv"
+    fraud_csv.to_csv(fraud_path, index=False)
+
+    return raw_path, fraud_path, raw_df, f001_draws_in_window
+
+
+def test_fraud_window_matching_drops_out_of_window_rows(tmp_path):
+    """With DATE present and window_days=7, fraud-member rows OUTSIDE the
+    [fraud_date - 7d, fraud_date) window must be dropped from history. F001's
+    rows on 2026-03-01 (>7d before catch) and 2026-03-20 (post-catch) must
+    not survive."""
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+
+    raw_path, fraud_path, raw_df, f001_in_window_draws = _build_fraud_window_inputs(tmp_path)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=[
+            "member_id", "event_fraud_flag", "primary_ccs_id",
+            "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player",
+        ],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=tmp_path / "fe_output",
+        mode="training_eval",
+        fraud_label_window_days=7,
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=raw_path.parent / "ingestion_report.json",
+        row_count=len(raw_df),
+        member_count=raw_df["member_id"].nunique(),
+        source_type="parquet",
+    )
+    artifact = FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+
+    history_df = pd.read_parquet(artifact.history_df_path)
+    f001_history = history_df[history_df["member_id"] == "F001"]
+    surviving_draws = set(int(d) for d in f001_history["draw_id"].dropna())
+    assert surviving_draws == set(f001_in_window_draws), (
+        f"F001 expected only in-window draws {f001_in_window_draws}, got {sorted(surviving_draws)}"
+    )
+
+    # F002 caught 2026-02-01 with no in-window draws → fully dropped.
+    f002_history = history_df[history_df["member_id"] == "F002"]
+    assert len(f002_history) == 0, "F002 should have no surviving rows"
+
+    # Non-fraud N001: all rows retained.
+    n001_history = history_df[history_df["member_id"] == "N001"]
+    assert len(n001_history) == 5
+
+
+def test_fraud_window_member_label_uses_csv_membership(tmp_path):
+    """A fraud member is labeled fraud (event_fraud_flag=1) if they appear
+    in the CSV at all. Pre-window rows just don't survive into the player
+    feature table. The dropped_positive_count reflects fraud members whose
+    history was emptied by window narrowing."""
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+
+    raw_path, fraud_path, raw_df, _ = _build_fraud_window_inputs(tmp_path)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=[
+            "member_id", "event_fraud_flag", "primary_ccs_id",
+            "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player",
+        ],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=tmp_path / "fe_output",
+        mode="training_eval",
+        fraud_label_window_days=7,
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=raw_path.parent / "ingestion_report.json",
+        row_count=len(raw_df),
+        member_count=raw_df["member_id"].nunique(),
+        source_type="parquet",
+    )
+    artifact = FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+
+    player_features = pd.read_parquet(artifact.player_features_path)
+    # F001 has in-window history → in player_features with fraud flag.
+    f001_row = player_features[player_features["member_id"] == "F001"]
+    assert len(f001_row) == 1
+    assert int(f001_row["event_fraud_flag"].iloc[0]) == 1
+
+    # F002 had no in-window rows → not in player_features at all.
+    assert "F002" not in set(player_features["member_id"])
+
+    # dropped_positive_count: F002 (was in CSV but lost all rows).
+    assert artifact.fraud_player_count == 1
+    assert artifact.dropped_positive_count == 1
+
+
+def test_fraud_window_disabled_when_window_zero(tmp_path):
+    """fraud_label_window_days=0 must fall back to the legacy whole-window
+    matching path even when DATE is present."""
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+
+    raw_path, fraud_path, raw_df, _ = _build_fraud_window_inputs(tmp_path)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=[
+            "member_id", "event_fraud_flag", "primary_ccs_id",
+            "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player",
+        ],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=tmp_path / "fe_output",
+        mode="training_eval",
+        fraud_label_window_days=0,  # disable
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=raw_path.parent / "ingestion_report.json",
+        row_count=len(raw_df),
+        member_count=raw_df["member_id"].nunique(),
+        source_type="parquet",
+    )
+    artifact = FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+
+    # Legacy path: F001's pre-fraud history extends to all draws BEFORE the
+    # earliest fraud event observed in raw data, not narrowed to ±7 days.
+    # So 2026-03-01 (out-of-window in the new path) survives here.
+    history_df = pd.read_parquet(artifact.history_df_path)
+    f001_history = history_df[history_df["member_id"] == "F001"]
+    f001_dates = pd.to_datetime(f001_history["ts"]).dt.tz_convert(None)
+    assert (f001_dates < pd.Timestamp("2026-03-10")).any(), (
+        "Legacy path should retain F001 rows from 2026-03-01"
+    )
+
+
+def test_fraud_funnel_persisted_to_json(tmp_path):
+    """Feature engineering must write a fraud_funnel.json with key counts so
+    the user can audit where labels go."""
+    import json as _json
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+
+    raw_path, fraud_path, raw_df, _ = _build_fraud_window_inputs(tmp_path)
+
+    out_dir = tmp_path / "fe_output"
+    config = FeatureEngineeringConfig(
+        exclude_cols=[
+            "member_id", "event_fraud_flag", "primary_ccs_id",
+            "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player",
+        ],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=out_dir,
+        mode="training_eval",
+        fraud_label_window_days=7,
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=raw_path.parent / "ingestion_report.json",
+        row_count=len(raw_df),
+        member_count=raw_df["member_id"].nunique(),
+        source_type="parquet",
+    )
+    FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+
+    funnel_path = out_dir / "fraud_funnel.json"
+    assert funnel_path.exists()
+    funnel = _json.loads(funnel_path.read_text())
+    assert funnel["csv_rows"] == 2
+    assert funnel["csv_unique_members"] == 2
+    assert funnel["use_window"] is True
+    assert funnel["window_days"] == 7
+    # F001 and F002 both appear in raw data.
+    assert funnel["members_in_raw"] == 2
+    # Only F001 had in-window rows → only one survived.
+    assert funnel["players_in_feature_table"] == 1
+    assert funnel["dropped_positive_count"] == 1
+
+
+def test_fraud_csv_without_date_falls_back_to_legacy(tmp_path):
+    """When DATE column is missing, _load_fraud_csv must set fraud_date=NaT
+    and the matching path must use legacy set-membership behavior."""
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+
+    rows = []
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    for i, draw in enumerate(range(50, 151)):
+        rows.append({
+            "member_id": "A001",
+            "draw_id": draw,
+            "total_bet_amount": 10.0,
+            "win_points": 5.0,
+            "bets": '[{"number": "1", "bet_amount": 10}]',
+            "session_id": 1,
+            "ccs_id": "CCS1",
+            "createdAt": base + pd.Timedelta(minutes=i),
+        })
+    raw_df = pd.DataFrame(rows)
+    raw_path = tmp_path / "raw_data.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+
+    # No DATE column — legacy path
+    fraud_path = tmp_path / "fraud.csv"
+    pd.DataFrame({"member_id": ["A001"], "draw_id": [100]}).to_csv(fraud_path, index=False)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=[
+            "member_id", "event_fraud_flag", "primary_ccs_id",
+            "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player",
+        ],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=tmp_path / "fe_output",
+        mode="training_eval",
+        fraud_label_window_days=7,  # enabled but should be ignored (no DATE)
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=raw_path.parent / "ingestion_report.json",
+        row_count=len(raw_df),
+        member_count=1,
+        source_type="parquet",
+    )
+    artifact = FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+
+    # Legacy: only draws < 100 retained
+    history_df = pd.read_parquet(artifact.history_df_path)
+    a001_draws = set(int(d) for d in history_df.loc[history_df["member_id"] == "A001", "draw_id"].dropna())
+    assert all(d < 100 for d in a001_draws)
+
+
+def test_collusion_features_capture_same_draw_coverage(tmp_path):
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+
+    rows = [
+        {
+            "member_id": "A",
+            "draw_id": 1,
+            "bets": '[{"number": "1", "bet_amount": 10}, {"number": "2", "bet_amount": 10}]',
+            "win_points": 0,
+            "total_bet_amount": 20,
+            "session_id": 1,
+            "ccs_id": "CCS1",
+            "trans_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+        },
+        {
+            "member_id": "B",
+            "draw_id": 1,
+            "bets": '[{"number": "3", "bet_amount": 10}, {"number": "4", "bet_amount": 10}]',
+            "win_points": 0,
+            "total_bet_amount": 20,
+            "session_id": 2,
+            "ccs_id": "CCS2",
+            "trans_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+        },
+        {
+            "member_id": "A",
+            "draw_id": 2,
+            "bets": '[{"number": "1", "bet_amount": 10}]',
+            "win_points": 0,
+            "total_bet_amount": 10,
+            "session_id": 1,
+            "ccs_id": "CCS1",
+            "trans_date": pd.Timestamp("2026-04-01T00:01:00Z"),
+        },
+    ]
+    raw_df = pd.DataFrame(rows)
+    raw_path = tmp_path / "raw.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+    fraud_path = tmp_path / "fraud.csv"
+    pd.DataFrame({"DATE": [], "DRAW_ID": [], "MEMBER_ID": [], "CCS_ID": []}).to_csv(fraud_path, index=False)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=["member_id", "event_fraud_flag", "primary_ccs_id"],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=fraud_path,
+        output_dir=tmp_path / "fe",
+        mode="operational",
+        compute_collusion_features=True,
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=tmp_path / "report.json",
+        row_count=len(raw_df),
+        member_count=2,
+        source_type="parquet",
+    )
+
+    artifact = FeatureEngineering(config, ingestion_artifact).initiate_feature_engineering()
+    players = pd.read_parquet(artifact.player_features_path).set_index("member_id")
+
+    assert artifact.draw_features_path is not None
+    assert artifact.draw_features_path.exists()
+    assert "max_cohort_coverage_in_draws" in artifact.feature_columns
+    assert players.loc["A", "max_cohort_coverage_in_draws"] == 4 / 38
+    assert players.loc["A", "pct_draws_in_cohort_2plus"] == 0.5
+    assert players.loc["B", "pct_draws_in_cohort_2plus"] == 1.0
+    assert players.loc["A", "mean_pairwise_jaccard_when_in_cohort"] == 0.0
+
+
+def test_collusion_features_work_in_bucketed_mode(tmp_path):
+    from fraud_detection.components.feature_engineering import FeatureEngineering
+    from fraud_detection.entity.artifact_entity import DataIngestionArtifact
+    from fraud_detection.entity.config_entity import FeatureEngineeringConfig
+
+    raw_df = pd.DataFrame(
+        [
+            {
+                "member_id": "A",
+                "draw_id": 10,
+                "bets": '[{"number": "1", "bet_amount": 1}]',
+                "win_points": 0,
+                "total_bet_amount": 1,
+                "session_id": 1,
+                "ccs_id": "CCS1",
+                "trans_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            },
+            {
+                "member_id": "B",
+                "draw_id": 10,
+                "bets": '[{"number": "2", "bet_amount": 1}]',
+                "win_points": 0,
+                "total_bet_amount": 1,
+                "session_id": 2,
+                "ccs_id": "CCS2",
+                "trans_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            },
+        ]
+    )
+    raw_path = tmp_path / "raw.parquet"
+    raw_df.to_parquet(raw_path, index=False)
+
+    config = FeatureEngineeringConfig(
+        exclude_cols=["member_id", "event_fraud_flag", "primary_ccs_id"],
+        log1p_cols=[],
+        apply_pre_fraud_cutoff=True,
+        fraud_csv_path=tmp_path / "unused.csv",
+        output_dir=tmp_path / "fe",
+        mode="operational",
+        compute_collusion_features=True,
+    )
+    ingestion_artifact = DataIngestionArtifact(
+        raw_data_path=raw_path,
+        ingestion_report_path=tmp_path / "report.json",
+        row_count=len(raw_df),
+        member_count=2,
+        source_type="parquet",
+    )
+
+    artifact = FeatureEngineering(config, ingestion_artifact, _force_mode="bucketed").initiate_feature_engineering()
+    players = pd.read_parquet(artifact.player_features_path)
+
+    assert artifact.draw_features_path is not None
+    assert artifact.draw_features_path.exists()
+    assert set(players["pct_draws_in_cohort_2plus"]) == {1.0}

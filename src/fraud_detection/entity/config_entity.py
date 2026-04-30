@@ -35,6 +35,16 @@ class FeatureEngineeringConfig:
     fraud_csv_path: Path
     output_dir: Path
     mode: str = "training_eval"  # "training_eval" or "operational"
+    # Weekly fraud-label window. A fraud member's history is restricted to rows
+    # whose ts falls in [fraud_date - window_days, fraud_date). Fraud-ops sits
+    # weekly and member_ids may be re-assigned outside the catch week, so we
+    # don't trust transactions on the same ID outside this window. Default 7d.
+    # Set to 0 to disable window narrowing (fraud member's full pre-fraud
+    # history is kept, matching the legacy behavior).
+    fraud_label_window_days: int = 7
+    # Phase B collusion features. Computes same-draw cohort coverage/overlap
+    # from raw bet positions without using labels.
+    compute_collusion_features: bool = False
 
 
 @dataclass

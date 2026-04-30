@@ -33,6 +33,7 @@ class FeatureEngineeringArtifact:
     feature_columns: list[str]
     feature_summary_path: Path
     mode: str
+    draw_features_path: Path | None = None
 
 
 @dataclass
