@@ -13,7 +13,7 @@ from fraud_detection.utils.common import read_yaml
 
 from .artifact_provider import ArtifactProvider, LocalDiskArtifactProvider
 from .dependencies import init_cache
-from .routes import admin, live_scoring, scoring, system
+from .routes import admin, live_scoring, system
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,7 @@ def create_app(
 
         current_dir = Path(serving_config.get("current_dir", "artifacts/current"))
         manifest_file = str(serving_config.get("manifest_file", "serving_manifest.json"))
-        default_model_version = str(serving_config.get("model_version", "hybrid_v1"))
+        default_model_version = str(serving_config.get("model_version", "partnership_v1"))
         if not current_dir.is_absolute():
             current_dir = REPO_ROOT / current_dir
         provider = LocalDiskArtifactProvider(
@@ -59,13 +59,12 @@ def create_app(
 
     app = FastAPI(
         title="Fraud Detection Scoring API",
-        description="Lookup, live scoring, and historical scoring for promoted fraud models",
+        description="Draw-level live scoring for promoted fraud partnership models",
         version="1.0.0",
         lifespan=lifespan,
     )
 
     app.include_router(system.router)
-    app.include_router(scoring.router)
     app.include_router(live_scoring.router)
     app.include_router(admin.router)
 

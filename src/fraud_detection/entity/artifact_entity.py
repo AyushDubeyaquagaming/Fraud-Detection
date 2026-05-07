@@ -34,30 +34,37 @@ class FeatureEngineeringArtifact:
     feature_summary_path: Path
     mode: str
     draw_features_path: Path | None = None
+    stage1_features_path: Path | None = None
+    stage1_labels_path: Path | None = None
+    stage1_oof_predictions_path: Path | None = None
+    stage2_features_path: Path | None = None
+    partnership_table_path: Path | None = None
+    pair_events_path: Path | None = None
 
 
 @dataclass
 class ModelTrainingArtifact:
-    iso_forest_path: Path
-    kmeans_path: Path
-    mahalanobis_stats_path: Path
-    scaler_path: Path
-    lr_operational_path: Path
     training_report_path: Path
     feature_columns: list[str]
+    stage1_model_path: Path | None = None
+    stage2_model_path: Path | None = None
+    model_bundle_path: Path | None = None
+    stage1_oof_predictions_path: Path | None = None
+    stage2_features_path: Path | None = None
+    partnership_table_path: Path | None = None
+    stage1_feature_columns: list[str] | None = None
+    stage2_feature_columns: list[str] | None = None
 
 
 @dataclass
 class ModelEvaluationArtifact:
-    scored_players_path: Path
+    stage2_holdout_predictions_path: Path
     capture_rate_table_path: Path
     evaluation_report_path: Path
     gate_passed: bool
-    # Primary gate metrics (Phase 2 rebaseline)
-    combined_oos_capture_rate_top_5pct: float
-    combined_oos_lift_top_5pct: float
-    # Retained for diagnostic/observability
-    combined_oos_top_20pct: int
+    stage2_capture_rate_top_5pct: float
+    stage2_lift_top_5pct: float
+    stage2_top_50_captured: int
 
 
 @dataclass

@@ -1,5 +1,3 @@
-
-
 pipeline:
   artifact_root: "artifacts"
   current_dir: "artifacts/current"
@@ -8,31 +6,18 @@ pipeline:
 
 data_ingestion:
   source: "parquet"
-  # Local cache target refreshed by Mongo ingestion. For local training, you can
-  # temporarily switch source=parquet and point this path at a known-good extract.
   parquet_path: "artifacts/runs/run_20260427_175142/data_ingestion/raw_data.parquet"
   mongodb:
     uri_env_var: "MONGODB_URI"
     database_env_var: "MONGODB_DATABASE"
     collection_env_var: "MONGODB_COLLECTION_ROULETTE_REPORT"
-    # Bounded ingestion strategy.
-    # date_window  — default; bounds by trans_date. Use for routine weekly retraining.
-    # member_list  — targeted cohort extraction and scoring. Not the standard retraining path.
-    # full_collection — escape hatch for one-time baseline pulls. Requires confirm_full_pull: true.
-    # rolling_store — read from local Hive-partitioned data_store/training_window after bootstrap.
     strategy: "date_window"
     strategy_params:
-      # trans_date is the default because it aligns to gameplay time, not document write time.
       timestamp_field: "trans_date"
-      # Rolling lookback for steady-state weekly operation.
-      # For historical backfills aligned to a known label period, comment out lookback_days
-      # and set explicit start_date / end_date (ISO-8601 strings, e.g. "2024-01-01").
       lookback_days: 90
       start_date: null
       end_date: null
-      # full_collection guard — must be set to true to allow a full-collection pull.
       confirm_full_pull: false
-      # rolling_store params (used only when strategy: rolling_store)
       store_root: "data_store/training_window"
       days_to_pull: 7
 
@@ -46,64 +31,47 @@ data_validation:
   min_row_count: 1000
   fraud_csv_path: "ROULET CHEATING DATA.csv"
 
-feature_engineering:
-  exclude_cols: ["member_id", "event_fraud_flag", "primary_ccs_id",
-                 "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player"]
-  log1p_cols: ["total_staked", "avg_stake_per_draw", "median_stake_per_draw",
-               "stake_std", "max_stake_per_draw", "stake_cv",
-               "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
-               "std_net_result", "pnl_volatility"]
-  apply_pre_fraud_cutoff: true
-  # Weekly fraud-label window (days). Fraud-ops sits weekly and a flagged
-  # member_id may be re-assigned outside the catch week, so we restrict a
-  # fraud member's history to rows in [fraud_date - window, fraud_date).
-  # Set to 0 to disable window narrowing.
-  fraud_label_window_days: 7
-  # Phase B: same-draw collusion signals. These are label-safe because they
-  # only use who appeared in the same draw and which roulette positions they
-  # covered; no fraud labels are used to compute the features.
-  compute_collusion_features: true
-
 model_evaluation:
-  # Percentile buckets REPORTED in the evaluation output. The primary gate is at
-  # top_5pct; top_20pct is retained only for continuity with historical reports.
-  threshold_percentiles: [0.01, 0.05, 0.10, 0.20]
-  # Fixed-count buckets that map to operational review capacity (weekly / monthly).
-  threshold_fixed_counts: [50, 500]
-  # Alert queue size written to alert_queue.csv.
-  alert_queue_size: 50
-  risk_tier_p80: 0.80
-  risk_tier_p95: 0.95
-  # --- Phase 2 rebaseline: primary gate is lift + capture_rate at top 5%. ---
-  # DEV/TESTING thresholds — intentionally low to allow model promotion during
-  # local experimentation. Tighten these before going to production.
-  # Production targets: min_capture_rate_top_5pct=0.40, min_lift_top_5pct=5.0
-  min_capture_rate_top_5pct: 0.10   # dev: relaxed from 0.40
-  min_lift_top_5pct: 2.0            # dev: relaxed from 5.0
-  # Retained for diagnostic reporting only — not used as a gate after rebaseline.
-  min_capture_top_20pct: 0
+  min_capture_rate_top_5pct: 0.50
+  min_lift_top_5pct: 4.0
 
 mlflow:
   tracking_uri_env_var: "MLFLOW_TRACKING_URI"
-  experiment_name: "fraud_detection_hybrid"
-  registered_model_name: "fraud_detection_hybrid"
-  # Register every gate-passing run as a new version in Staging. Filesystem
-  # promotion (model_bundle.joblib + serving_manifest.json) remains the source
-  # of truth for serving; the registry adds version tracking + lineage.
+  experiment_name: "fraud_detection_partnership_v1"
+  registered_model_name: "fraud_detection_partnership_v1"
   register_on_promotion: true
   archive_existing_staging: true
-  # Auto-promotion to Production is intentionally disabled until end-to-end
-  # validation is complete. Flip to true only after a proper Production gate
-  # has been defined and reviewed.
   auto_promote_to_production: false
 
 serving:
   artifact_provider: "local_disk"
   current_dir: "artifacts/current"
   manifest_file: "serving_manifest.json"
-  model_version: "hybrid_v1"
+  model_version: "partnership_v1"
   host: "127.0.0.1"
   port: 8000
+
+live_scoring:
+  timestamp_field: "trans_date"
+  settle_lag_seconds: 60
+  initial_lookback_seconds: 3600
+  max_draws_per_run: 200
+  stage1_history_days: 7
+
+partnership:
+  candidate_thresholds:
+    min_position_count: 4
+    max_position_count: 34
+    max_candidates_per_draw: 80
+    max_jaccard: 0.10
+    expandable_pair_min_coverage: 0.50
+  rolling_window_days: 7
+  label_tier_weights: { gold: 1.0, silver: 1.0, bronze: 0.5, gold_analyst: 1.0 }
+  section_a_min_recurrence: 3
+  section_b_min_stake: 1000.0
+  section_b_min_per_position_ratio: 0.80
+  section_b_max_combined_bet_cv: 0.35
+  section_b_min_pair_net: 0.0
 
 monitoring:
   enabled: true
@@ -111,12 +79,18 @@ monitoring:
   sample_size: 50000
   reference_from_current_metadata: true
   monitored_features:
-    - template_reuse_ratio
-    - avg_entropy
-    - avg_tiny_bet_ratio
-    - total_staked
-    - avg_stake_per_draw
-    - draws_played
-    - avg_inter_draw_seconds
-    - positive_draw_rate
+    - max_stage1_score
+    - mean_stage1_score
+    - n_draws_stage1_above_0p5
+    - n_draws_stage1_above_0p9
+    - longest_consecutive_high_stage1_streak
+    - n_distinct_high_score_partners
+    - best_partnership_union_coverage
+    - max_partnership_recurrence
+    - min_partner_jaccard
+    - pct_draws_in_persistent_partnership
+    - distinct_persistent_partner_count
+    - persistent_partnership_count
+    - best_partnership_size
+    - partnership_stake_share
   drift_threshold: 0.3

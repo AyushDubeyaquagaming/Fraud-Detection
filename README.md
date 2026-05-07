@@ -1,7 +1,6 @@
 # BetBlitz Fraud Detection — MLOps Pipeline
 
-Roulette fraud detection system using a hybrid unsupervised + supervised approach.
-Source of truth: `notebook/03_hybrid_detection.ipynb`.
+Roulette partnership collusion detection system built around the candidate-draw store, Stage 1 pair scoring, and Stage 2 member scoring.
 
 ## Quick Start
 
@@ -17,9 +16,6 @@ python scripts/run_training.py
 
 # Run batch scoring (requires promoted model bundle)
 python scripts/run_batch_scoring.py
-
-# Audit artifacts/current/
-python scripts/audit_artifacts.py
 
 # Run tests
 pytest tests/
@@ -39,13 +35,12 @@ src/fraud_detection/          # installable package
 
 configs/
   config.yaml                 # main pipeline config (edit source/paths here)
-  model_params.yaml           # model hyperparameters (locked — do not change)
   schema.yaml                 # data schema
+  config.local_training.yaml  # local candidate-store training config (gitignored)
 
 scripts/
   run_training.py             # full train → evaluate → monitor → promote
   run_batch_scoring.py        # score fresh cohort from promoted bundle
-  audit_artifacts.py          # verify artifacts/current/ is consistent
   cleanup_old_runs.py         # artifact retention utility
 
 orchestration/
@@ -59,10 +54,14 @@ artifacts/
     monitoring/               # Evidently drift reports + drift_summary.json
   current/                    # promoted production bundle (gitignored)
     model_bundle.joblib
-    hybrid_scored_players.parquet
-    alert_queue.csv
-    hybrid_evaluation.json
+    stage1_model.joblib
+    stage2_model.joblib
+    partnership_table.parquet
+    stage2_holdout_predictions.parquet
+    live_predictions_backfill.parquet
+    batch_scoring_report.json
     promotion_metadata.json
+    serving_manifest.json
 
 tests/
   unit/                       # fast unit tests (includes test_monitoring.py)
@@ -80,7 +79,7 @@ rest of the pipeline. The parquet path remains available for controlled replays 
 | File | Purpose |
 |---|---|
 | `configs/config.yaml` | Pipeline settings, live data source, MLflow |
-| `configs/model_params.yaml` | **Locked** model hyperparameters |
+| `configs/config.local_training.yaml` | Local candidate-store training window and thresholds |
 | `.env` | MongoDB URI, MLflow tracking URI |
 
 ## Model Parameters (locked per spec)
@@ -95,26 +94,26 @@ rest of the pipeline. The parquet path remains available for controlled replays 
 After a successful `run_training.py`:
 
 - `artifacts/current/model_bundle.joblib` — all models + scalers + metadata
-- `artifacts/current/hybrid_scored_players.parquet` — scored cohort
-- `artifacts/current/alert_queue.csv` — top 50 players by risk score
-- `artifacts/current/hybrid_evaluation.json` — capture rates, tier distribution
-- `artifacts/runs/run_*/model_evaluation/plots/feature_importance.png` — supervised model importance
-- `artifacts/runs/run_*/model_evaluation/plots/confusion_matrix.png` — out-of-sample confusion matrix
-- `artifacts/runs/run_*/model_evaluation/plots/correlation_heatmap.png` — top-feature correlation map
+- `artifacts/current/stage1_model.joblib` and `artifacts/current/stage2_model.joblib` — promoted serving models
+- `artifacts/current/partnership_table.parquet` — promoted partnership context for serving
+- `artifacts/current/stage2_holdout_predictions.parquet` — evaluation holdout predictions from the promoted run
+- `artifacts/current/serving_manifest.json` and `artifacts/current/promotion_metadata.json` — current serving pointers and promotion metadata
+
+After a successful `run_batch_scoring.py`:
+
+- `artifacts/current/live_predictions_backfill.parquet` — batch-scored draw backfill
+- `artifacts/current/batch_scoring_report.json` — scored draw counts and batch metadata
 
 These plots are also logged as MLflow artifacts for each run.
 
 ## Streamlit Demo
 
 ```bash
-streamlit run streamlit_hybrid_demo.py
+streamlit run streamlit_partnership_demo.py
 ```
 
-The demo automatically reads from `artifacts/current/` if present,
-falling back to `data_cache/` for legacy compatibility.
-
-Use `Internal validation mode` when replay-eval artifacts are available. With purely operational artifacts,
-the demo still loads and shows behaviour space plus peer lookup, but label-only fields are hidden.
+The Streamlit app calls the FastAPI live-scoring endpoints and reads recent predictions from MongoDB.
+Run the API first, then launch the Streamlit app.
 
 ## Cohort Scope
 
@@ -181,7 +180,6 @@ docker compose up -d mlflow-ui
 |---|---|
 | `train` | `python scripts/run_training.py` |
 | `score` | `python scripts/run_batch_scoring.py` |
-| `audit` | `python scripts/audit_artifacts.py` |
 | `test` | `pytest tests/` |
 | `shell` | Interactive shell in the container |
 | `worker` | Prefect worker (Phase 3) |

@@ -16,12 +16,8 @@ from fraud_detection.components.model_evaluation import ModelEvaluation
 from fraud_detection.components.model_pusher import ModelPusher
 from fraud_detection.components.model_training import ModelTraining
 from fraud_detection.components.monitoring import Monitoring
-from fraud_detection.constants.constants import (
-    BATCH_SCORING_CONFIG_FILE_PATH,
-    CONFIG_FILE_PATH,
-    MODEL_PARAMS_FILE_PATH,
-    REPO_ROOT,
-)
+from fraud_detection.constants.constants import BATCH_SCORING_CONFIG_FILE_PATH, CONFIG_FILE_PATH, REPO_ROOT
+from fraud_detection.entity.artifact_entity import DataIngestionArtifact
 from fraud_detection.entity.config_entity import (
     DataIngestionConfig,
     DataValidationConfig,
@@ -54,7 +50,6 @@ class TrainingPipeline:
     def run(self) -> Path:
         logger.info("TrainingPipeline: starting")
         config_dict = read_yaml(self.config_path)
-        model_params = read_yaml(MODEL_PARAMS_FILE_PATH)
 
         run_id = _make_run_id()
         artifact_root = _resolve_repo_path(config_dict["pipeline"]["artifact_root"])
@@ -65,18 +60,15 @@ class TrainingPipeline:
 
         ing_cfg = config_dict["data_ingestion"]
         val_cfg = config_dict["data_validation"]
-        fe_cfg = config_dict["feature_engineering"]
+        partnership_cfg = config_dict.get("partnership", {})
+        use_candidate_store = bool(partnership_cfg.get("use_candidate_store", False))
         eval_cfg = config_dict["model_evaluation"]
-        mp_cfg = model_params
         serving_cfg = config_dict.get("serving", {})
         batch_scoring_config_path = _resolve_repo_path(
             config_dict["pipeline"].get("weekly_serving_snapshot_config", BATCH_SCORING_CONFIG_FILE_PATH)
         )
 
         # Build component configs
-        iso_params = dict(mp_cfg["isolation_forest"])
-        iso_params["_log1p_cols"] = fe_cfg["log1p_cols"]
-
         data_ingestion_config = DataIngestionConfig(
             source=ing_cfg["source"],
             parquet_path=REPO_ROOT / ing_cfg["parquet_path"],
@@ -84,6 +76,8 @@ class TrainingPipeline:
             mongo_database_env_var=ing_cfg["mongodb"]["database_env_var"],
             mongo_collection_env_var=ing_cfg["mongodb"]["collection_env_var"],
             output_dir=run_dir / "data_ingestion",
+            parquet_strategy=ing_cfg.get("parquet", {}).get("strategy", "full_copy"),
+            parquet_strategy_params=dict(ing_cfg.get("parquet", {}).get("strategy_params", {})),
             mongo_strategy=ing_cfg["mongodb"].get("strategy", "date_window"),
             mongo_strategy_params=dict(ing_cfg["mongodb"].get("strategy_params", {})),
         )
@@ -95,46 +89,31 @@ class TrainingPipeline:
             output_dir=run_dir / "data_validation",
         )
         feature_engineering_config = FeatureEngineeringConfig(
-            exclude_cols=fe_cfg["exclude_cols"],
-            log1p_cols=fe_cfg["log1p_cols"],
-            apply_pre_fraud_cutoff=bool(fe_cfg["apply_pre_fraud_cutoff"]),
             fraud_csv_path=REPO_ROOT / val_cfg["fraud_csv_path"],
             output_dir=run_dir / "feature_engineering",
             mode="training_eval",
-            fraud_label_window_days=int(fe_cfg.get("fraud_label_window_days", 7)),
-            compute_collusion_features=bool(fe_cfg.get("compute_collusion_features", False)),
+            partnership=partnership_cfg,
         )
         model_training_config = ModelTrainingConfig(
-            iso_forest_params=iso_params,
-            kmeans_params=dict(mp_cfg["kmeans"]),
-            lr_params=dict(mp_cfg["logistic_regression"]),
-            anomaly_weight=float(mp_cfg["scoring"]["anomaly_weight"]),
-            supervised_weight=float(mp_cfg["scoring"]["supervised_weight"]),
             random_seed=random_seed,
             output_dir=run_dir / "model_training",
+            partnership=partnership_cfg,
         )
         model_evaluation_config = ModelEvaluationConfig(
-            threshold_percentiles=eval_cfg["threshold_percentiles"],
-            risk_tier_p80=float(eval_cfg["risk_tier_p80"]),
-            risk_tier_p95=float(eval_cfg["risk_tier_p95"]),
             output_dir=run_dir / "model_evaluation",
             min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
             min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
-            threshold_fixed_counts=list(eval_cfg.get("threshold_fixed_counts", [50, 500])),
-            alert_queue_size=int(eval_cfg.get("alert_queue_size", 50)),
-            min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
         )
         mlflow_cfg_raw = config_dict.get("mlflow", {})
         model_pusher_config = ModelPusherConfig(
             current_dir=current_dir,
             manifest_file=str(serving_cfg.get("manifest_file", "serving_manifest.json")),
-            model_version=str(serving_cfg.get("model_version", "hybrid_v1")),
+            model_version=str(serving_cfg.get("model_version", "partnership_v1")),
             min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
             min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
-            min_capture_top_20pct=int(eval_cfg.get("min_capture_top_20pct", 0)),
             register_on_promotion=bool(mlflow_cfg_raw.get("register_on_promotion", True)),
             registered_model_name=str(
-                mlflow_cfg_raw.get("registered_model_name", "fraud_detection_hybrid")
+                mlflow_cfg_raw.get("registered_model_name", "fraud_detection_partnership_v1")
             ),
             archive_existing_staging=bool(mlflow_cfg_raw.get("archive_existing_staging", True)),
             auto_promote_to_production=bool(
@@ -154,7 +133,7 @@ class TrainingPipeline:
 
         # MLflow setup (non-fatal)
         load_dotenv(REPO_ROOT / ".env")
-        experiment_name = mlflow_cfg_raw.get("experiment_name", "fraud_detection_hybrid")
+        experiment_name = mlflow_cfg_raw.get("experiment_name", "fraud_detection_partnership_v1")
 
         from fraud_detection.utils.mlflow_utils import (
             get_tracking_uri,
@@ -181,8 +160,38 @@ class TrainingPipeline:
         pusher_artifact = None
         try:
             # --- Step 1: Data Ingestion ---
-            logger.info("[1/7] DataIngestion")
-            ingestion_artifact = DataIngestion(data_ingestion_config).initiate_data_ingestion()
+            if use_candidate_store:
+                logger.info("[1/7] DataIngestion skipped (candidate_store mode)")
+                candidate_store_path = _resolve_repo_path(partnership_cfg.get("candidate_store_path", "data_store/candidate_draws"))
+                if not candidate_store_path.exists():
+                    window = partnership_cfg.get("candidate_window", {})
+                    raise ValueError(
+                        f"candidate store missing for window {window.get('start_date')}..{window.get('end_date')}; "
+                        "run scripts/extract_candidate_draws.py first"
+                    )
+                ingestion_report_path = run_dir / "data_ingestion" / "ingestion_report.json"
+                ensure_dir(ingestion_report_path.parent)
+                write_json(
+                    {
+                        "source_type": "candidate_store",
+                        "candidate_store_path": str(candidate_store_path),
+                        "date_range": partnership_cfg.get("candidate_window", {}),
+                        "ingested_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ingestion_report_path,
+                )
+                ingestion_artifact = DataIngestionArtifact(
+                    raw_data_path=candidate_store_path,
+                    ingestion_report_path=ingestion_report_path,
+                    row_count=0,
+                    member_count=0,
+                    source_type="candidate_store",
+                    strategy_used="candidate_store",
+                    date_range=partnership_cfg.get("candidate_window", {}),
+                )
+            else:
+                logger.info("[1/7] DataIngestion")
+                ingestion_artifact = DataIngestion(data_ingestion_config).initiate_data_ingestion()
 
             # --- Step 2: Data Validation ---
             logger.info("[2/7] DataValidation")
@@ -198,15 +207,10 @@ class TrainingPipeline:
                 log_params_safe({
                     "source": ing_cfg["source"],
                     "random_seed": random_seed,
-                    "iso_n_estimators": mp_cfg["isolation_forest"]["n_estimators"],
-                    "iso_contamination": mp_cfg["isolation_forest"]["contamination"],
-                    "kmeans_n_clusters": mp_cfg["kmeans"]["n_clusters"],
-                    "lr_C": mp_cfg["logistic_regression"]["C"],
-                    "anomaly_weight": mp_cfg["scoring"]["anomaly_weight"],
-                    "supervised_weight": mp_cfg["scoring"]["supervised_weight"],
                     "fraud_player_count": fe_artifact.fraud_player_count,
                     "dropped_positive_count": fe_artifact.dropped_positive_count,
                     "feature_count": len(fe_artifact.feature_columns),
+                    "model_version": "partnership_v1",
                 })
 
             # --- Step 4: Model Training ---
@@ -219,9 +223,9 @@ class TrainingPipeline:
                 with open(training_artifact.training_report_path) as f:
                     tr = json.load(f)
                 log_metrics_safe({
-                    "pr_auc": tr.get("pr_auc", 0),
-                    "roc_auc": tr.get("roc_auc", 0),
-                    "fraud_player_count": tr.get("fraud_players", 0),
+                    "stage1_pr_auc": (tr.get("stage1") or {}).get("pr_auc") or 0,
+                    "stage2_pr_auc": (tr.get("stage2") or {}).get("pr_auc") or 0,
+                    "fraud_player_count": tr.get("fraud_members", 0),
                 })
                 log_artifact_safe(str(training_artifact.training_report_path))
 
@@ -232,16 +236,10 @@ class TrainingPipeline:
             ).initiate_model_evaluation()
 
             if mlflow_active:
-                with open(eval_artifact.evaluation_report_path) as f:
-                    ev = json.load(f)
-                capture = ev.get("capture_rates", {}).get("combined_oos", {})
                 log_metrics_safe({
-                    "combined_oos_top_1pct": capture.get("top_1pct", 0),
-                    "combined_oos_top_5pct": capture.get("top_5pct", 0),
-                    "combined_oos_top_10pct": capture.get("top_10pct", 0),
-                    "combined_oos_top_20pct": capture.get("top_20pct", 0),
-                    "combined_oos_capture_rate_top_5pct": eval_artifact.combined_oos_capture_rate_top_5pct,
-                    "combined_oos_lift_top_5pct": eval_artifact.combined_oos_lift_top_5pct,
+                    "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
+                    "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,
+                    "stage2_top_50_captured": eval_artifact.stage2_top_50_captured,
                     "gate_passed": int(eval_artifact.gate_passed),
                 })
                 log_artifact_safe(str(eval_artifact.evaluation_report_path))
@@ -256,6 +254,7 @@ class TrainingPipeline:
                 current_dir=current_dir,
                 ingestion_artifact=ingestion_artifact,
                 fe_artifact=fe_artifact,
+                training_artifact=training_artifact,
                 eval_artifact=eval_artifact,
                 run_dir=run_dir,
             ).initiate_monitoring()

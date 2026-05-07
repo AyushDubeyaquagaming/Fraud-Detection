@@ -13,6 +13,7 @@ from fraud_detection.entity.artifact_entity import (
     DataIngestionArtifact,
     FeatureEngineeringArtifact,
     ModelEvaluationArtifact,
+    ModelTrainingArtifact,
 )
 from fraud_detection.entity.config_entity import MonitoringConfig
 
@@ -27,7 +28,7 @@ def monitoring_config():
         enabled=True,
         reports_dir="monitoring",
         sample_size=200,
-        monitored_features=["template_reuse_ratio", "avg_entropy", "draws_played"],
+        monitored_features=["max_stage1_score", "mean_stage1_score", "best_partner_union_coverage"],
         drift_threshold=0.3,
         reference_from_current_metadata=True,
     )
@@ -47,9 +48,9 @@ def _make_feature_df(n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(1)
     return pd.DataFrame({
         "member_id": [f"m{i}" for i in range(n)],
-        "template_reuse_ratio": rng.uniform(0, 1, n),
-        "avg_entropy": rng.uniform(0, 3, n),
-        "draws_played": rng.integers(1, 50, n).astype(float),
+        "max_stage1_score": rng.uniform(0, 1, n),
+        "mean_stage1_score": rng.uniform(0, 1, n),
+        "best_partner_union_coverage": rng.uniform(0, 1, n),
         "event_fraud_flag": (rng.random(n) < 0.05).astype(int),
     })
 
@@ -58,24 +59,27 @@ def _make_scored_df(n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(2)
     return pd.DataFrame({
         "member_id": [f"m{i}" for i in range(n)],
-        "hybrid_score": rng.uniform(0, 1, n),
+        "stage2_score": rng.uniform(0, 1, n),
     })
 
 
 def _write_run_artifacts(run_dir: Path, raw_df, feat_df, scored_df) -> dict:
     (run_dir / "data_ingestion").mkdir(parents=True, exist_ok=True)
     (run_dir / "feature_engineering").mkdir(parents=True, exist_ok=True)
+    (run_dir / "model_training").mkdir(parents=True, exist_ok=True)
     (run_dir / "model_evaluation").mkdir(parents=True, exist_ok=True)
 
     raw_path = run_dir / "data_ingestion" / "raw_data.parquet"
     feat_path = run_dir / "feature_engineering" / "player_features.parquet"
-    scored_path = run_dir / "model_evaluation" / "scored_players.parquet"
+    stage2_feat_path = run_dir / "model_training" / "stage2_features.parquet"
+    scored_path = run_dir / "model_evaluation" / "stage2_holdout_predictions.parquet"
 
     raw_df.to_parquet(raw_path, index=False)
     feat_df.to_parquet(feat_path, index=False)
+    feat_df.to_parquet(stage2_feat_path, index=False)
     scored_df.to_parquet(scored_path, index=False)
 
-    return {"raw": raw_path, "feat": feat_path, "scored": scored_path}
+    return {"raw": raw_path, "feat": feat_path, "stage2_feat": stage2_feat_path, "scored": scored_path}
 
 
 def _make_artifacts(paths: dict) -> tuple:
@@ -91,20 +95,25 @@ def _make_artifacts(paths: dict) -> tuple:
         history_df_path=paths["feat"].parent / "history.parquet",
         fraud_player_count=5,
         dropped_positive_count=0,
-        feature_columns=["template_reuse_ratio", "avg_entropy", "draws_played"],
+        feature_columns=["max_stage1_score", "mean_stage1_score", "best_partner_union_coverage"],
         feature_summary_path=paths["feat"].parent / "summary.json",
         mode="training_eval",
     )
     ev = ModelEvaluationArtifact(
-        scored_players_path=paths["scored"],
+        stage2_holdout_predictions_path=paths["scored"],
         capture_rate_table_path=paths["scored"].parent / "table.csv",
         evaluation_report_path=paths["scored"].parent / "report.json",
         gate_passed=True,
-        combined_oos_capture_rate_top_5pct=0.55,
-        combined_oos_lift_top_5pct=6.0,
-        combined_oos_top_20pct=10,
+        stage2_capture_rate_top_5pct=0.55,
+        stage2_lift_top_5pct=6.0,
+        stage2_top_50_captured=10,
     )
-    return ingestion, fe, ev
+    training = ModelTrainingArtifact(
+        training_report_path=paths["stage2_feat"].parent / "training_report.json",
+        feature_columns=["max_stage1_score", "mean_stage1_score", "best_partner_union_coverage"],
+        stage2_features_path=paths["stage2_feat"],
+    )
+    return ingestion, fe, training, ev
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +128,9 @@ class TestMonitoringSkipWhenNoPromotionMetadata:
         run_dir.mkdir()
 
         paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
-        ingestion, fe, ev = _make_artifacts(paths)
+        ingestion, fe, training, ev = _make_artifacts(paths)
 
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is False
@@ -140,9 +149,9 @@ class TestMonitoringSkipWhenReferenceArtifactsMissing:
         (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
 
         paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
-        ingestion, fe, ev = _make_artifacts(paths)
+        ingestion, fe, training, ev = _make_artifacts(paths)
 
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is False
@@ -157,9 +166,9 @@ class TestMonitoringSkipWhenReferenceArtifactsMissing:
         (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
 
         paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
-        ingestion, fe, ev = _make_artifacts(paths)
+        ingestion, fe, training, ev = _make_artifacts(paths)
 
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is False
@@ -178,9 +187,9 @@ class TestMonitoringGeneratesReports:
         meta = {"gate_passed": True, "run_dir": str(ref_run_dir)}
         (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
 
-        ingestion, fe, ev = _make_artifacts(cur_paths)
+        ingestion, fe, training, ev = _make_artifacts(cur_paths)
 
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, cur_run_dir)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, cur_run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is True
@@ -205,9 +214,9 @@ class TestMonitoringNonFatal:
         (current_dir / "promotion_metadata.json").write_text("not valid json{{{{")
 
         paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
-        ingestion, fe, ev = _make_artifacts(paths)
+        ingestion, fe, training, ev = _make_artifacts(paths)
 
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()  # must not raise
 
         assert artifact.monitoring_completed is False
@@ -227,9 +236,9 @@ class TestMonitoringNonFatal:
         run_dir.mkdir()
 
         paths = _write_run_artifacts(run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
-        ingestion, fe, ev = _make_artifacts(paths)
+        ingestion, fe, training, ev = _make_artifacts(paths)
 
-        mon = Monitoring(config, current_dir, ingestion, fe, ev, run_dir)
+        mon = Monitoring(config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is False
@@ -266,8 +275,8 @@ class TestSelfReferenceGuard:
         meta = {"gate_passed": True, "run_dir": str(run_dir)}
         (current_dir / "promotion_metadata.json").write_text(json.dumps(meta))
 
-        ingestion, fe, ev = _make_artifacts(paths)
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, run_dir)
+        ingestion, fe, training, ev = _make_artifacts(paths)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, run_dir)
         artifact = mon.initiate_monitoring()
 
         assert artifact.monitoring_completed is False
@@ -304,8 +313,8 @@ class TestBoundedParquetSampling:
 
         monkeypatch.setattr(mon_module.pd, "read_parquet", tracked)
 
-        ingestion, fe, ev = _make_artifacts(cur_paths)
-        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, ev, cur_run_dir)
+        ingestion, fe, training, ev = _make_artifacts(cur_paths)
+        mon = Monitoring(monitoring_config, current_dir, ingestion, fe, training, ev, cur_run_dir)
         mon.initiate_monitoring()
 
         # The bounded sampler uses pq.ParquetFile.read() / read_row_group(),
@@ -348,3 +357,20 @@ class TestBoundedParquetSampling:
 
         sampled = _sample_parquet_bounded(tmp_path / "nope.parquet", n=100)
         assert sampled is None
+
+    def test_bounded_sample_supports_partitioned_dataset_directory(self, tmp_path):
+        from fraud_detection.components.monitoring import _sample_parquet_bounded
+
+        dataset_dir = tmp_path / "candidate_store" / "year=2026" / "month=04" / "week=17"
+        dataset_dir.mkdir(parents=True)
+        frame = pd.DataFrame({
+            "draw_id": range(500),
+            "total_stake": np.linspace(1000.0, 2000.0, 500),
+            "qualifying_player_count": np.repeat(2, 500),
+        })
+        frame.to_parquet(dataset_dir / "draws.parquet", index=False, row_group_size=100)
+
+        sampled = _sample_parquet_bounded(tmp_path / "candidate_store", n=120)
+        assert sampled is not None
+        assert len(sampled) == 120
+        assert {"draw_id", "total_stake", "qualifying_player_count"}.issubset(sampled.columns)

@@ -2,8 +2,6 @@ pipeline:
   current_dir: "artifacts/current"
 
 data_ingestion:
-  # Batch scoring is designed to operate from a prepared parquet extract.
-  # Point this at the latest available raw cohort parquet for weekly serving.
   source: "parquet"
   parquet_path: "artifacts/runs/run_20260427_175142/data_ingestion/raw_data.parquet"
   mongodb:
@@ -21,16 +19,6 @@ data_ingestion:
 data_validation:
   fraud_csv_path: "ROULET CHEATING DATA.csv"
 
-feature_engineering:
-  exclude_cols: ["member_id", "event_fraud_flag", "primary_ccs_id",
-                 "first_fraud_ts", "first_fraud_draw_id", "is_fraud_player"]
-  log1p_cols: ["total_staked", "avg_stake_per_draw", "median_stake_per_draw",
-               "stake_std", "max_stake_per_draw", "stake_cv",
-               "avg_bet_amount_std_in_draw", "avg_bet_amount_mean_in_draw",
-               "std_net_result", "pnl_volatility"]
-  fraud_label_window_days: 7
-  compute_collusion_features: true
-
 batch_scoring:
   mode: "operational"
   require_labels: false
@@ -39,7 +27,30 @@ batch_scoring:
     lookback_days: 7
     start_date: null
     end_date: null
-  operational_filter:
-    enabled: true
-    min_draws_played: 10
-  alert_queue_size: 50
+
+partnership:
+  use_candidate_store: true
+  candidate_store_path: "data_store/candidate_draws"
+  candidate_window:
+    start_date: 2026-02-25
+    end_date: 2026-05-05
+  pair_rules:
+    strict_min_ratio_similarity: 0.80
+    strict_min_pair_net_per_stake: -0.10
+    nearmiss_min_union: 36
+    nearmiss_max_overlap: 2
+    nearmiss_min_ratio_similarity: 0.70
+    nearmiss_min_pair_net_per_stake: -0.10
+    min_total_bet_amount: 1000.0
+    stage1_flag_threshold: 0.70
+
+partnership_scoring:
+  stage2_alert_threshold: 0.65
+  backfill_lookback_days: 30
+
+live_predictions_mongo:
+  uri_env_var: "MONGODB_URI"
+  database_env_var: "MONGODB_DATABASE"
+  live_predictions_collection_env_var: "LIVE_PREDICTIONS_COLLECTION"
+  analyst_labels_collection_env_var: "ANALYST_LABELS_COLLECTION"
+  live_scoring_state_collection_env_var: "LIVE_SCORING_STATE_COLLECTION"

@@ -43,7 +43,7 @@ deployments:
     entrypoint: orchestration/flows/batch_scoring_flow.py:batch_scoring_flow
     description: "Daily batch scoring against the promoted model bundle"
     parameters:
-      config_path: "configs/config.yaml"
+      config_path: "configs/batch_scoring.yaml"
     schedules:
       - cron: "0 4 * * *"       # every day at 04:00 UTC
         timezone: UTC
@@ -54,3 +54,19 @@ deployments:
     tags:
       - fraud-detection
       - scoring
+
+  - name: live-scoring-poll
+    flow_name: fraud-detection-live-scoring
+    entrypoint: orchestration/flows/live_scoring_flow.py:live_scoring_flow
+    description: "Poll Mongo for completed draws and upsert partnership live predictions"
+    parameters:
+      config_path: "configs/config.yaml"
+    schedules:
+      - interval: 60
+        active: true
+    work_pool:
+      name: fraud-pool
+      work_queue_name: default
+    tags:
+      - fraud-detection
+      - live-scoring

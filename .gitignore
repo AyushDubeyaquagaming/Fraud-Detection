@@ -20,15 +20,20 @@ analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
 ARCHITECTURE_GUIDE.md
+CANDIDATE_DRAWS_STORE.md
 DEMO_RUNBOOK_2026_04_27.txt
+Phase B Refactor — Partnership Collusion Engine + Live Inference + Feedback Loop.md
 artifacts/
 live_scoring_plan.md
+PARTNERSHIP_LOCAL_TEST_COMMANDS.txt
 DEPLOYMENT.md
 live_scoring_handoff_notes.txt
 live_scoring_developer_checklist.txt
 LIVE_SCORING_FIXES_SUMMARY.txt
 fastapi_serving_plan.md
 developer_validation_guide.txt
+PARTNERSHIP_EXPLORATION_PLAN.md
+PHASE_A_PARTNERSHIP_MODELING_PLAN.md
 MLOPS_AUDIT_2026_04_27.txt
 # C extensions
 *.so
@@ -243,6 +248,7 @@ fraud_notebook_plan.md
 notebook/.ipynb_checkpoints/
 data_cache/
 notebook/data_cache/
+data_store/
 *.parquet
 
 # Generated audit / diagnostic outputs
@@ -268,3 +274,12 @@ artifacts/current/
 logs/
 mlruns/
 mlops_implementation_plan.md
+
+# Local planning / handoff files
+CANDIDATE_EXTRACTION_PLAN.md
+PHASE1_CANDIDATE_EXTRACTION_SUMMARY.txt
+PHASE2_DEVELOPER_VERIFICATION_COMMANDS.txt
+PHASE_2_INTEGRATION_PLAN.md
+configs/config.local_training.yaml
+configs/batch_scoring.local_smoke.yaml
+notebook/04_partnership_collusion_exploration.ipynb

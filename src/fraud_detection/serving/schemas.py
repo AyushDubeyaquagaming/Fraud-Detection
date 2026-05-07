@@ -1,61 +1,6 @@
-from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
-
-class ScoreResponse(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "member_id": "GK00100883",
-                "risk_score": 0.022589909255277027,
-                "risk_tier": "LOW",
-                "anomaly_score": 0.020559106848467477,
-                "supervised_score": 0.025636112865491348,
-                "ccs_id": "CCS000872",
-                "evaluated_at": "2026-04-22T15:03:55.299996+00:00",
-                "promoted_at": "2026-04-22T15:03:55.377091+00:00",
-                "source_run_id": "run_20260422_105102",
-                "model_version": "hybrid_v1",
-            }
-        }
-    )
-
-    member_id: str
-    risk_score: float = Field(..., ge=0.0)
-    risk_tier: Literal["LOW", "MEDIUM", "HIGH"]
-    anomaly_score: float = Field(..., ge=0.0)
-    supervised_score: float = Field(..., ge=0.0, le=1.0)
-    ccs_id: str | None = None
-    evaluated_at: str | None = None
-    promoted_at: str | None = None
-    source_run_id: str
-    model_version: str
-
-
-class InsufficientDataResponse(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "status": "insufficient_data",
-                "member_id": "GK00999999",
-                "detail": "Not enough weekly data is currently available for this member.",
-                "evaluated_at": "2026-04-22T15:03:55.299996+00:00",
-                "promoted_at": "2026-04-22T15:03:55.377091+00:00",
-                "source_run_id": "run_20260422_105102",
-                "model_version": "hybrid_v1",
-            }
-        }
-    )
-
-    status: Literal["insufficient_data"]
-    member_id: str
-    detail: str
-    evaluated_at: str | None = None
-    promoted_at: str | None = None
-    source_run_id: str
-    model_version: str
 
 
 class HealthResponse(BaseModel):
@@ -74,27 +19,11 @@ class HealthResponse(BaseModel):
     uptime_seconds: int
 
 
-class TierDistribution(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "LOW": 87766,
-                "MEDIUM": 16456,
-                "HIGH": 5486,
-            }
-        }
-    )
-
-    LOW: int = 0
-    MEDIUM: int = 0
-    HIGH: int = 0
-
-
 class ModelInfoResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "model_version": "hybrid_v1",
+                "model_version": "partnership_v1",
                 "source_run_id": "run_20260422_105102",
                 "promoted_at": "2026-04-22T15:03:55.377091+00:00",
                 "evaluated_at": "2026-04-22T15:03:55.299996+00:00",
@@ -102,14 +31,7 @@ class ModelInfoResponse(BaseModel):
                 "snapshot_status": "ready",
                 "snapshot_reason": None,
                 "snapshot_lookback_days": 7,
-                "total_scored_members": 109708,
-                "tier_distribution": {
-                    "LOW": 87766,
-                    "MEDIUM": 16456,
-                    "HIGH": 5486,
-                },
-                "anomaly_weight": 0.6,
-                "supervised_weight": 0.4,
+                "stage2_alert_threshold": 0.65,
                 "artifacts_loaded_at": "2026-04-23T09:56:15.124755+00:00",
             }
         }
@@ -123,10 +45,8 @@ class ModelInfoResponse(BaseModel):
     snapshot_status: Literal["ready", "insufficient_data"]
     snapshot_reason: str | None = None
     snapshot_lookback_days: int | None = None
-    total_scored_members: int
-    tier_distribution: TierDistribution
-    anomaly_weight: float
-    supervised_weight: float
+    total_holdout_members: int = 0
+    stage2_alert_threshold: float | None = None
     artifacts_loaded_at: str
 
 
@@ -138,7 +58,7 @@ class ReloadResponse(BaseModel):
                 "previous_run_id": "run_20260421_161503",
                 "current_run_id": "run_20260422_105102",
                 "reloaded_at": "2026-04-23T12:05:00+00:00",
-                "total_scored_members": 109708,
+                "total_holdout_members": 109708,
             }
         }
     )
@@ -147,7 +67,7 @@ class ReloadResponse(BaseModel):
     previous_run_id: str | None
     current_run_id: str
     reloaded_at: str
-    total_scored_members: int
+    total_holdout_members: int
 
 
 class ErrorResponse(BaseModel):
@@ -164,67 +84,118 @@ class ErrorResponse(BaseModel):
     member_id: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Live / historical scoring schemas
-# ---------------------------------------------------------------------------
-
-class HistoricalScoreRequest(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "member_id": "GK00100436",
-                "start_date": "2026-02-20T00:00:00Z",
-                "end_date": "2026-04-20T00:00:00Z",
-            }
-        }
-    )
-
-    member_id: str = Field(..., min_length=1)
-    start_date: datetime
-    end_date: datetime
+class DrawPlayerBet(BaseModel):
+    number: int | str
+    bet_amount: float
 
 
-class LiveScoreResponse(BaseModel):
+class DrawPlayer(BaseModel):
     member_id: str
-    risk_score: float = Field(..., ge=0.0)
-    risk_tier: Literal["LOW", "MEDIUM", "HIGH"]
-    anomaly_score: float = Field(..., ge=0.0)
-    supervised_score: float = Field(..., ge=0.0, le=1.0)
+    total_bet_amount: float
+    bets: list[DrawPlayerBet]
     ccs_id: str | None = None
-
-    window_start: str
-    window_end: str
-    window_days: int
-    data_sources: list[str]
-    parquet_rows: int
-    mongo_rows: int
-    total_draws_scored: int
-
-    scoring_baseline: str
-    scored_at: str
-    source_run_id: str
-    model_version: str
+    win_points: float = 0.0
 
 
-class HistoricalScoreResponse(LiveScoreResponse):
-    """Same shape as LiveScoreResponse — different endpoint tag only."""
-    pass
+class DrawPayloadScoreRequest(BaseModel):
+    draw_id: int = Field(..., ge=0)
+    players: list[DrawPlayer] = Field(default_factory=list)
+    trans_date: str | None = None
 
 
-class LiveInsufficientDataResponse(BaseModel):
-    status: Literal["insufficient_data"]
+class PartnershipMatch(BaseModel):
+    member_ids: list[str]
+    stage1_score_max: float
+    stage1_score_mean: float
+    union_coverage: float
+    jaccard: float
+    per_position_ratio: float
+    combined_bet_cv: float
+    pair_net: float
+    is_section_a: bool = False
+    is_section_b: bool = False
+
+
+class FlaggedMember(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     member_id: str
-    detail: str
-    evaluated_at: str | None = None
-    promoted_at: str | None = None
-    source_run_id: str
-    model_version: str
-    window_start: str
-    window_end: str
-    window_days: int
-    data_sources: list[str]
-    parquet_rows: int
-    mongo_rows: int
-    total_draws_scored: int
-    scoring_baseline: str
+    stage1_score_in_draw: float
+    stage2_score: float
+    best_partner_member_id: str | None = None
+    bet_amount: float | None = Field(default=None, alias="betAmount")
+    win_amount: float | None = Field(default=None, alias="winAmount")
+    high_amount_flag: bool = Field(default=False, alias="highAmountFlag")
+    high_amount_reason: str | None = Field(default=None, alias="highAmountReason")
+
+
+class DrawScoreResponse(BaseModel):
+    draw_id: int
     scored_at: str
+    model_version: str
+    source_run_id: str | None = None
+    n_members_in_draw: int
+    candidate_members: list[str]
+    partnerships: list[PartnershipMatch]
+    flagged_members: list[FlaggedMember]
+    max_stage1_score: float
+    max_stage2_score: float
+    requires_review: bool
+    response_details: list[str] = Field(default_factory=list)
+
+
+class EvidenceDraw(BaseModel):
+    draw_id: int
+    score_reason: str
+    partner_member_ids: list[str] = Field(default_factory=list)
+    stage1_score_in_draw: float | None = None
+    stage2_score: float | None = None
+    max_union_coverage: float | None = None
+
+
+class MemberScoreResponse(BaseModel):
+    member_id: str
+    risk_tier: Literal["HIGH", "LOW"]
+    lookback_days: int
+    draws_scanned: int
+    evidence_draws: list[EvidenceDraw]
+
+
+class CcsScoreRequest(BaseModel):
+    ccs_ids: list[str] | None = None
+    lookback_days: int = Field(default=7, ge=1, le=30)
+    max_draws: int = Field(default=10000, ge=1, le=50000)
+
+
+class CcsScore(BaseModel):
+    ccs_id: str
+    risk_tier: Literal["HIGH", "LOW"]
+    flagged_member_count: int
+    flagged_members: list[str]
+    evidence_draw_ids: list[int]
+
+
+class CcsScoreResponse(BaseModel):
+    lookback_days: int
+    draws_scanned: int
+    ccs_scores: list[CcsScore]
+
+
+class AlertDraw(BaseModel):
+    draw_id: int
+    draw_date: str | None = None
+    risk_tier: Literal["HIGH"]
+    partnership_count: int
+    flagged_member_count: int
+    flagged_member_ids: list[str]
+    ccs_ids: list[str]
+    max_stage1_score: float
+    max_stage2_score: float
+    response_details: list[str] = Field(default_factory=list)
+
+
+class AlertDrawResponse(BaseModel):
+    lookback_days: int
+    draws_scanned: int
+    alert_draw_count: int
+    alerts: list[AlertDraw]
