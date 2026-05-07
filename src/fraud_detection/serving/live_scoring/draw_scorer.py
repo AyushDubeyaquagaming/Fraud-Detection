@@ -19,6 +19,8 @@ from fraud_detection.components.partnership_features import (
 from fraud_detection.components.partnership_modeling import score_stage1, score_stage2
 from fraud_detection.utils.player_vectors import build_position_index, player_to_vectors
 
+HIGH_AMOUNT_THRESHOLD = 10_000.0
+
 
 @dataclass(frozen=True)
 class DrawScoreResult:
@@ -348,11 +350,7 @@ class DrawScorer:
 
     @staticmethod
     def _amount_thresholds(bet_amounts: list[float], win_amounts: list[float]) -> tuple[float, float]:
-        bet_series = pd.to_numeric(pd.Series(bet_amounts), errors="coerce").fillna(0.0)
-        win_series = pd.to_numeric(pd.Series(win_amounts), errors="coerce").fillna(0.0)
-        bet_threshold = max(10_000.0, float(bet_series.quantile(0.90)) if not bet_series.empty else 10_000.0)
-        win_threshold = max(10_000.0, float(win_series.quantile(0.90)) if not win_series.empty else 10_000.0)
-        return bet_threshold, win_threshold
+        return HIGH_AMOUNT_THRESHOLD, HIGH_AMOUNT_THRESHOLD
 
     @classmethod
     def _candidate_amount_context(cls, row: dict[str, Any]) -> dict[str, Any]:
@@ -394,15 +392,16 @@ class DrawScorer:
         win_amount = float(amounts.get("win_amount", 0.0))
         bet_threshold = float(amount_context.get("bet_threshold", 10_000.0))
         win_threshold = float(amount_context.get("win_threshold", 10_000.0))
-        high_amount = bool(bet_amount >= bet_threshold and win_amount >= win_threshold)
+        high_reasons = []
+        if bet_amount >= bet_threshold:
+            high_reasons.append(f"bet_amount >= {bet_threshold:.2f}")
+        if win_amount >= win_threshold:
+            high_reasons.append(f"win_amount >= {win_threshold:.2f}")
+        high_amount = bool(high_reasons)
         flagged_member["bet_amount"] = bet_amount
         flagged_member["win_amount"] = win_amount
         flagged_member["high_amount_flag"] = high_amount
-        flagged_member["high_amount_reason"] = (
-            f"bet_amount >= {bet_threshold:.2f} and win_amount >= {win_threshold:.2f}"
-            if high_amount
-            else None
-        )
+        flagged_member["high_amount_reason"] = " and ".join(high_reasons) if high_amount else None
         return flagged_member
 
     def _candidate_partnership_docs(self, pair_events: pd.DataFrame) -> list[dict[str, Any]]:

@@ -181,14 +181,25 @@ class CcsScoreResponse(BaseModel):
     ccs_scores: list[CcsScore]
 
 
+class AlertFlaggedMember(FlaggedMember):
+    ccs_id: str = Field(alias="ccsId")
+    partner_member_ids: list[str] = Field(default_factory=list)
+
+
 class AlertDraw(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     draw_id: int
     draw_date: str | None = None
     risk_tier: Literal["HIGH"]
     partnership_count: int
     flagged_member_count: int
     flagged_member_ids: list[str]
+    flagged_members: list[AlertFlaggedMember] = Field(default_factory=list, alias="flaggedMembers")
     ccs_ids: list[str]
+    high_amount_member_count: int = Field(default=0, alias="highAmountMemberCount")
+    max_bet_amount: float = Field(default=0.0, alias="maxBetAmount")
+    max_win_amount: float = Field(default=0.0, alias="maxWinAmount")
     max_stage1_score: float
     max_stage2_score: float
     response_details: list[str] = Field(default_factory=list)

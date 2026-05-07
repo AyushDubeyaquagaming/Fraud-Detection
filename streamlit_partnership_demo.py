@@ -157,11 +157,15 @@ with tab_alerts:
     lookback_days = st.slider("Lookback days", 1, 30, 7, key="alerts_lookback")
     max_draws = st.slider("Candidate draws to scan", 1000, 50000, 10000, step=1000, key="alerts_max_draws")
     limit = st.slider("Alert limit", 10, 1000, 250, step=10)
+    min_bet_amount = st.number_input("Minimum flagged bet amount", min_value=0.0, value=0.0, step=1000.0)
     if st.button("Load alert draws", type="primary"):
         try:
+            params = {"lookback_days": lookback_days, "max_draws": max_draws, "limit": limit}
+            if min_bet_amount > 0:
+                params["betAmount"] = min_bet_amount
             result = get_json(
                 "/score/alerts",
-                params={"lookback_days": lookback_days, "max_draws": max_draws, "limit": limit},
+                params=params,
             )
             st.write(f"Draws scanned: {result['draws_scanned']}")
             st.write(f"Alert draws found: {result['alert_draw_count']}")
@@ -169,6 +173,24 @@ with tab_alerts:
             if alerts.empty:
                 st.info("No alert draws found in the selected window.")
             else:
-                st.dataframe(alerts, use_container_width=True)
+                columns = [
+                    "draw_date",
+                    "draw_id",
+                    "risk_tier",
+                    "partnership_count",
+                    "flagged_member_count",
+                    "highAmountMemberCount",
+                    "maxWinAmount",
+                    "maxBetAmount",
+                    "ccs_ids",
+                    "flagged_member_ids",
+                    "response_details",
+                ]
+                st.dataframe(alerts[[column for column in columns if column in alerts.columns]], use_container_width=True)
+                selected_draw = st.selectbox("Alert member details", alerts["draw_id"].astype(str).tolist())
+                selected = alerts.loc[alerts["draw_id"].astype(str).eq(selected_draw)].iloc[0].to_dict()
+                members = pd.DataFrame(selected.get("flaggedMembers", []))
+                if not members.empty:
+                    st.dataframe(members, use_container_width=True)
         except Exception as exc:
             st.error(str(exc))

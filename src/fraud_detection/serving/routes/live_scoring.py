@@ -17,6 +17,7 @@ from fraud_detection.serving.dependencies import LiveScoringContext, get_live_sc
 from fraud_detection.serving.live_scoring.draw_scorer import DrawScorer
 from fraud_detection.serving.schemas import (
     AlertDraw,
+    AlertFlaggedMember,
     AlertDrawResponse,
     CcsScore,
     CcsScoreRequest,
@@ -292,6 +293,35 @@ def _flagged_members_from_doc(result_doc: dict[str, Any]) -> set[str]:
     return members
 
 
+def _partnership_partner_lookup(result_doc: dict[str, Any]) -> dict[str, set[str]]:
+    lookup: dict[str, set[str]] = {}
+    for partnership in result_doc.get("partnerships", []):
+        members = [_member_key(member) for member in partnership.get("member_ids", [])]
+        members = [member for member in members if member]
+        for member_id in members:
+            lookup.setdefault(member_id, set()).update(member for member in members if member != member_id)
+    return lookup
+
+
+def _enrich_result_doc_amounts(result_doc: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    result_doc = result_doc.copy()
+    amount_context = DrawScorer._candidate_amount_context(row)
+    partner_lookup = _partnership_partner_lookup(result_doc)
+    flagged_by_member = {
+        _member_key(item.get("member_id")): dict(item)
+        for item in result_doc.get("flagged_members", [])
+    }
+    for member_id in _flagged_members_from_doc(result_doc):
+        current = flagged_by_member.get(member_id, {"member_id": member_id})
+        current["stage1_score_in_draw"] = float(current.get("stage1_score_in_draw") or 0.0)
+        current["stage2_score"] = float(current.get("stage2_score") or 0.0)
+        if not current.get("best_partner_member_id") and partner_lookup.get(member_id):
+            current["best_partner_member_id"] = sorted(partner_lookup[member_id])[0]
+        flagged_by_member[member_id] = DrawScorer._enrich_flagged_member_amounts(current, amount_context)
+    result_doc["flagged_members"] = list(flagged_by_member.values())
+    return result_doc
+
+
 def _prediction_backfill_path(context: LiveScoringContext) -> Path | None:
     for key in ("live_predictions_path", "live_predictions_backfill_path", "batch_predictions_path"):
         raw_path = context.model_bundle.get(key)
@@ -349,12 +379,14 @@ def _candidate_result_docs(
         if cached is None:
             missing_rows.append(row)
             continue
+        cached = _enrich_result_doc_amounts(cached, row)
         docs.append((_apply_known_fraud_overlay(cached, row), row))
     if missing_rows:
         missing_frame = pd.DataFrame(missing_rows)
         results = scorer.score_candidate_batch(missing_frame)
         for row, result in zip(missing_rows, results):
-            docs.append((_apply_known_fraud_overlay(result.to_mongo_doc(), row), row))
+            result_doc = _enrich_result_doc_amounts(result.to_mongo_doc(), row)
+            docs.append((_apply_known_fraud_overlay(result_doc, row), row))
     return docs
 
 
@@ -602,11 +634,13 @@ def score_alerts(
     lookback_days: int = 7,
     max_draws: int = 10000,
     limit: int = 250,
+    betAmount: float | None = None,
     context: LiveScoringContext = Depends(get_live_scoring_context),
 ) -> AlertDrawResponse:
     lookback_days = max(1, min(int(lookback_days), 30))
     max_draws = max(1, min(int(max_draws), 50_000))
     limit = max(1, min(int(limit), 1_000))
+    min_bet_amount = None if betAmount is None else max(0.0, float(betAmount))
     candidate_rows = _candidate_rows_for_window(
         context=context,
         lookback_days=lookback_days,
@@ -619,6 +653,35 @@ def score_alerts(
         if not result_doc.get("requires_review") or not flagged_members:
             continue
         member_to_ccs = _candidate_member_to_ccs(row)
+        partner_lookup = _partnership_partner_lookup(result_doc)
+        flagged_by_member = {
+            _member_key(item.get("member_id")): dict(item)
+            for item in result_doc.get("flagged_members", [])
+        }
+        alert_members: list[AlertFlaggedMember] = []
+        for member_id in flagged_members:
+            item = flagged_by_member.get(member_id, {"member_id": member_id})
+            partners = set(partner_lookup.get(member_id, set()))
+            best_partner = item.get("best_partner_member_id")
+            if best_partner:
+                partners.add(_member_key(best_partner))
+            alert_members.append(
+                AlertFlaggedMember(
+                    member_id=member_id,
+                    ccsId=member_to_ccs.get(member_id, "UNKNOWN"),
+                    stage1_score_in_draw=float(item.get("stage1_score_in_draw") or 0.0),
+                    stage2_score=float(item.get("stage2_score") or 0.0),
+                    best_partner_member_id=item.get("best_partner_member_id"),
+                    betAmount=float(item.get("bet_amount") or item.get("betAmount") or 0.0),
+                    winAmount=float(item.get("win_amount") or item.get("winAmount") or 0.0),
+                    highAmountFlag=bool(item.get("high_amount_flag") or item.get("highAmountFlag")),
+                    highAmountReason=item.get("high_amount_reason") or item.get("highAmountReason"),
+                    partner_member_ids=sorted(partners),
+                )
+            )
+        high_amount_member_count = sum(1 for item in alert_members if item.high_amount_flag)
+        if min_bet_amount is not None and not any(float(item.bet_amount or 0.0) >= min_bet_amount for item in alert_members):
+            continue
         alerts.append(
             AlertDraw(
                 draw_id=int(result_doc["draw_id"]),
@@ -627,13 +690,26 @@ def score_alerts(
                 partnership_count=len(result_doc.get("partnerships", [])),
                 flagged_member_count=len(flagged_members),
                 flagged_member_ids=flagged_members,
+                flaggedMembers=alert_members,
                 ccs_ids=sorted({member_to_ccs.get(member, "UNKNOWN") for member in flagged_members}),
+                highAmountMemberCount=high_amount_member_count,
+                maxBetAmount=max((float(item.bet_amount or 0.0) for item in alert_members), default=0.0),
+                maxWinAmount=max((float(item.win_amount or 0.0) for item in alert_members), default=0.0),
                 max_stage1_score=float(result_doc.get("max_stage1_score") or 0.0),
                 max_stage2_score=float(result_doc.get("max_stage2_score") or 0.0),
                 response_details=list(result_doc.get("response_details", [])),
             )
         )
-    alerts.sort(key=lambda item: (item.draw_date or "", item.draw_id), reverse=True)
+    alerts.sort(
+        key=lambda item: (
+            item.high_amount_member_count,
+            item.max_win_amount,
+            item.max_bet_amount,
+            item.draw_date or "",
+            item.draw_id,
+        ),
+        reverse=True,
+    )
     return AlertDrawResponse(
         lookback_days=lookback_days,
         draws_scanned=len(candidate_rows),
