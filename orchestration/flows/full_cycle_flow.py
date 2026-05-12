@@ -6,12 +6,15 @@ scoring.
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -128,6 +131,24 @@ def _log_artifact_if_active(mlflow_module: Any | None, path: str | Path) -> None
         log_artifact_safe(str(path))
 
 
+def _write_resolved_training_config(
+    config: dict[str, Any],
+    *,
+    full_cycle_dir: Path,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Path:
+    resolved = copy.deepcopy(config)
+    partnership = resolved.setdefault("partnership", {})
+    candidate_window = partnership.setdefault("candidate_window", {})
+    candidate_window["start_date"] = start_dt.date().isoformat()
+    candidate_window["end_date"] = end_dt.date().isoformat()
+    config_path = full_cycle_dir / "resolved_training_config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8")
+    return config_path
+
+
 def run_full_cycle(
     *,
     config_path: str | Path = CONFIG_FILE_PATH,
@@ -239,8 +260,16 @@ def run_full_cycle(
             }
         )
 
+        training_config_path = _write_resolved_training_config(
+            config,
+            full_cycle_dir=full_cycle_dir,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        result["training_config_path"] = str(training_config_path)
+        _log_artifact_if_active(mlflow, training_config_path)
         run_dir = TrainingPipeline(
-            config_path=config_path,
+            config_path=training_config_path,
             manage_mlflow=False,
             run_batch_scoring_on_promotion=False,
             mlflow_source="full_cycle",

@@ -131,6 +131,52 @@ def test_score_alerts_includes_ccs_context_for_flagged_members(monkeypatch):
     assert response.alerts[0].response_details == ["no_member_history", "stage2_unavailable_no_labels"]
 
 
+def test_score_alerts_applies_window_and_max_draws_before_risk_sort(monkeypatch):
+    now = pd.Timestamp.now(tz="UTC")
+    docs = [
+        {
+            "draw_id": 1,
+            "requires_review": True,
+            "partnerships": [{"member_ids": ["A", "B"], "union_coverage": 1.0}],
+            "flagged_members": [{"member_id": "A", "stage1_score_in_draw": 1.0, "win_amount": 99999.0}],
+            "max_stage1_score": 1.0,
+        },
+        {
+            "draw_id": 2,
+            "requires_review": True,
+            "partnerships": [{"member_ids": ["C", "D"], "union_coverage": 1.0}],
+            "flagged_members": [{"member_id": "C", "stage1_score_in_draw": 1.0, "win_amount": 100.0}],
+            "max_stage1_score": 1.0,
+        },
+        {
+            "draw_id": 3,
+            "requires_review": True,
+            "partnerships": [{"member_ids": ["E", "F"], "union_coverage": 1.0}],
+            "flagged_members": [{"member_id": "E", "stage1_score_in_draw": 1.0, "win_amount": 10.0}],
+            "max_stage1_score": 1.0,
+        },
+    ]
+    rows = {
+        1: {"draw_id": 1, "member_ids": ["A", "B"], "ccs_ids": ["CA", "CB"], "trans_date_min": now - pd.Timedelta(days=20)},
+        2: {"draw_id": 2, "member_ids": ["C", "D"], "ccs_ids": ["CC", "CD"], "trans_date_min": now - pd.Timedelta(days=2)},
+        3: {"draw_id": 3, "member_ids": ["E", "F"], "ccs_ids": ["CE", "CF"], "trans_date_min": now - pd.Timedelta(days=1)},
+    }
+    context = SimpleNamespace(
+        model_bundle={"stage1_model": object(), "stage2_model": object()},
+        source_run_id="run_test",
+        partnership_table=None,
+        ccs_concentration_table=None,
+        evaluation_metadata={"label_status": "available"},
+    )
+    monkeypatch.setattr(live_scoring, "_prediction_backfill_docs", lambda *_args, **_kwargs: docs)
+    monkeypatch.setattr(live_scoring, "_candidate_row_for_doc", lambda draw_id, _context: rows[int(draw_id)])
+
+    response = live_scoring.score_alerts(lookback_days=7, max_draws=1, limit=10, context=context)
+
+    assert response.draws_scanned == 1
+    assert [alert.draw_id for alert in response.alerts] == [3]
+
+
 def test_score_ccs_groups_alert_queue_from_backfill(monkeypatch):
     context = SimpleNamespace(
         model_bundle={"stage1_model": object(), "stage2_model": object()},
@@ -176,3 +222,46 @@ def test_score_ccs_groups_alert_queue_from_backfill(monkeypatch):
     assert response.ccs_scores[0].ccs_id == "CA"
     assert response.ccs_scores[0].flagged_members == ["A"]
     assert response.ccs_scores[0].evidence[0]["draw_id"] == 7
+
+
+def test_score_ccs_filters_requested_ccs_before_max_draw_limit(monkeypatch):
+    now = pd.Timestamp.now(tz="UTC")
+    docs = [
+        {
+            "draw_id": 1,
+            "requires_review": True,
+            "partnerships": [{"member_ids": ["A", "B"], "union_coverage": 1.0}],
+            "flagged_members": [{"member_id": "A", "stage1_score_in_draw": 1.0, "win_amount": 50000.0}],
+            "max_stage1_score": 1.0,
+        },
+        {
+            "draw_id": 2,
+            "requires_review": True,
+            "partnerships": [{"member_ids": ["C", "D"], "union_coverage": 1.0}],
+            "flagged_members": [{"member_id": "C", "stage1_score_in_draw": 1.0, "win_amount": 100.0}],
+            "max_stage1_score": 1.0,
+        },
+    ]
+    rows = {
+        1: {"draw_id": 1, "member_ids": ["A", "B"], "ccs_ids": ["OTHER", "OTHER2"], "trans_date_min": now},
+        2: {"draw_id": 2, "member_ids": ["C", "D"], "ccs_ids": ["TARGET", "TARGET2"], "trans_date_min": now - pd.Timedelta(hours=1)},
+    }
+    context = SimpleNamespace(
+        model_bundle={"stage1_model": object(), "stage2_model": object()},
+        source_run_id="run_test",
+        partnership_table=None,
+        ccs_concentration_table=None,
+        evaluation_metadata={"label_status": "available"},
+    )
+    monkeypatch.setattr(live_scoring, "_prediction_backfill_docs", lambda *_args, **_kwargs: docs)
+    monkeypatch.setattr(live_scoring, "_candidate_row_for_doc", lambda draw_id, _context: rows[int(draw_id)])
+
+    response = live_scoring.score_ccs(
+        live_scoring.CcsScoreRequest(ccs_ids=["TARGET"], lookback_days=7, max_draws=1),
+        context=context,
+    )
+
+    assert response.draws_scanned == 1
+    assert response.ccs_scores[0].ccs_id == "TARGET"
+    assert response.ccs_scores[0].risk_tier == "HIGH"
+    assert response.ccs_scores[0].evidence_draw_ids == [2]

@@ -72,7 +72,7 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
         },
         "partnership": {
             "use_candidate_store": True,
-            "candidate_window": {"start_date": "2026-05-04", "end_date": "2026-05-11"},
+            "candidate_window": {"start_date": "2026-01-01", "end_date": "2026-01-08"},
             "ccs_features": {"enabled": True, "windows_days": [1, 7]},
         },
         "mlflow": {"experiment_name": "test"},
@@ -99,7 +99,12 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
 
     class FakeTrainingPipeline:
         def __init__(self, *, config_path, manage_mlflow, run_batch_scoring_on_promotion, mlflow_source):
-            assert Path(config_path) == config_path
+            assert Path(config_path).name == "resolved_training_config.yaml"
+            resolved = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+            assert resolved["partnership"]["candidate_window"] == {
+                "start_date": "2026-05-04",
+                "end_date": "2026-05-11",
+            }
             assert manage_mlflow is False
             assert run_batch_scoring_on_promotion is False
             assert mlflow_source == "full_cycle"
@@ -141,6 +146,8 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
         candidate_config_path=candidate_config_path,
         ccs_config_path=ccs_config_path,
         batch_config_path=batch_config_path,
+        start_date="2026-05-04",
+        end_date="2026-05-11",
     )
 
     assert result["status"] == "FINISHED"
@@ -148,6 +155,7 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
     assert result["ccs_profit"]["rows_written"] == 5
     assert result["ccs_profit_start_date"] == "2026-04-28"
     assert result["ccs_profit_end_date"] == "2026-05-10"
+    assert Path(result["training_config_path"]).name == "resolved_training_config.yaml"
     assert ccs_call["start_date"].isoformat() == "2026-04-28"
     assert ccs_call["end_date"].isoformat() == "2026-05-10"
     assert result["training"]["promoted"] is True

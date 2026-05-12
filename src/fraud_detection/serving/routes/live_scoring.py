@@ -324,6 +324,18 @@ def _prediction_backfill_docs(context: LiveScoringContext) -> list[dict[str, Any
     return docs
 
 
+def _doc_draw_timestamp(result_doc: dict[str, Any], row: dict[str, Any] | None) -> pd.Timestamp | None:
+    if row is not None:
+        candidate_ts = pd.to_datetime(row.get("trans_date_min"), errors="coerce", utc=True)
+        if not pd.isna(candidate_ts):
+            return candidate_ts
+    for key in ("draw_date", "trans_date_min"):
+        value = pd.to_datetime(result_doc.get(key), errors="coerce", utc=True)
+        if not pd.isna(value):
+            return value
+    return None
+
+
 def _candidate_row_for_doc(draw_id: int, context: LiveScoringContext) -> dict[str, Any] | None:
     candidate_rows = _candidate_rows_for_draw(draw_id, context=context)
     if candidate_rows.empty:
@@ -335,15 +347,24 @@ def _build_alert_draws_from_backfill(
     *,
     context: LiveScoringContext,
     limit: int,
+    lookback_days: int,
+    max_draws: int,
     min_bet_amount: float | None,
+    ccs_ids: set[str] | None = None,
 ) -> tuple[list[AlertDraw], int]:
     docs = _prediction_backfill_docs(context)
-    alerts: list[AlertDraw] = []
+    end = pd.Timestamp.now(tz="UTC")
+    start = end - pd.Timedelta(days=int(lookback_days))
+    requested_ccs = {_member_key(value) for value in (ccs_ids or set()) if str(value).strip()}
+    candidates: list[tuple[pd.Timestamp, AlertDraw]] = []
     for result_doc in docs:
         flagged_members = sorted(_flagged_members_from_doc(result_doc))
         if not result_doc.get("requires_review") or not flagged_members:
             continue
         row = _candidate_row_for_doc(int(result_doc["draw_id"]), context)
+        draw_ts = _doc_draw_timestamp(result_doc, row)
+        if draw_ts is None or draw_ts < start or draw_ts > end:
+            continue
         member_to_ccs = _candidate_member_to_ccs(row) if row is not None else {}
         partner_lookup = _partnership_partner_lookup(result_doc)
         flagged_by_member = {
@@ -352,6 +373,9 @@ def _build_alert_draws_from_backfill(
         }
         alert_members: list[AlertFlaggedMember] = []
         for member_id in flagged_members:
+            member_ccs_id = member_to_ccs.get(member_id, "UNKNOWN")
+            if requested_ccs and _member_key(member_ccs_id) not in requested_ccs:
+                continue
             item = flagged_by_member.get(member_id, {"member_id": member_id})
             partners = set(partner_lookup.get(member_id, set()))
             best_partner = item.get("best_partner_member_id")
@@ -360,7 +384,7 @@ def _build_alert_draws_from_backfill(
             alert_members.append(
                 AlertFlaggedMember(
                     member_id=member_id,
-                    ccsId=member_to_ccs.get(member_id, "UNKNOWN"),
+                    ccsId=member_ccs_id,
                     stage1_score_in_draw=_finite_float(item.get("stage1_score_in_draw")),
                     best_partner_member_id=item.get("best_partner_member_id"),
                     betAmount=_finite_float(item.get("bet_amount", item.get("betAmount"))),
@@ -370,26 +394,29 @@ def _build_alert_draws_from_backfill(
                     partner_member_ids=sorted(partners),
                 )
             )
+        if requested_ccs and not alert_members:
+            continue
         if min_bet_amount is not None and not any(float(item.bet_amount or 0.0) >= min_bet_amount for item in alert_members):
             continue
         high_amount_member_count = sum(1 for item in alert_members if item.high_amount_flag)
-        alerts.append(
-            AlertDraw(
-                draw_id=int(result_doc["draw_id"]),
-                draw_date=_candidate_draw_date(row) if row is not None else None,
-                risk_tier="HIGH",
-                partnership_count=len(result_doc.get("partnerships", [])),
-                flagged_member_count=len(flagged_members),
-                flagged_member_ids=flagged_members,
-                flaggedMembers=alert_members,
-                ccs_ids=sorted({member_to_ccs.get(member, "UNKNOWN") for member in flagged_members}),
-                highAmountMemberCount=high_amount_member_count,
-                maxBetAmount=max((float(item.bet_amount or 0.0) for item in alert_members), default=0.0),
-                maxWinAmount=max((float(item.win_amount or 0.0) for item in alert_members), default=0.0),
-                max_stage1_score=float(result_doc.get("max_stage1_score") or 0.0),
-                response_details=_public_response_details(result_doc.get("response_details", []), context),
-            )
+        alert = AlertDraw(
+            draw_id=int(result_doc["draw_id"]),
+            draw_date=_candidate_draw_date(row) if row is not None else draw_ts.isoformat(),
+            risk_tier="HIGH",
+            partnership_count=len(result_doc.get("partnerships", [])),
+            flagged_member_count=len(alert_members),
+            flagged_member_ids=sorted({member.member_id for member in alert_members}),
+            flaggedMembers=alert_members,
+            ccs_ids=sorted({_member_key(member.ccs_id) or "UNKNOWN" for member in alert_members}),
+            highAmountMemberCount=high_amount_member_count,
+            maxBetAmount=max((float(item.bet_amount or 0.0) for item in alert_members), default=0.0),
+            maxWinAmount=max((float(item.win_amount or 0.0) for item in alert_members), default=0.0),
+            max_stage1_score=float(result_doc.get("max_stage1_score") or 0.0),
+            response_details=_public_response_details(result_doc.get("response_details", []), context),
         )
+        candidates.append((draw_ts, alert))
+    candidates.sort(key=lambda item: (item[0], item[1].draw_id), reverse=True)
+    alerts = [item[1] for item in candidates[: max(1, int(max_draws))]]
     alerts.sort(
         key=lambda item: (
             item.high_amount_member_count,
@@ -400,7 +427,7 @@ def _build_alert_draws_from_backfill(
         ),
         reverse=True,
     )
-    return alerts[:limit], len(docs)
+    return alerts[:limit], len(alerts)
 
 
 def _candidate_result_docs(
@@ -628,7 +655,14 @@ def score_ccs(
     context: LiveScoringContext = Depends(get_live_scoring_context),
 ) -> CcsScoreResponse:
     requested = {_member_key(value) for value in request.ccs_ids or [] if str(value).strip()}
-    alerts, draws_scanned = _build_alert_draws_from_backfill(context=context, limit=max(1, request.max_draws), min_bet_amount=None)
+    alerts, draws_scanned = _build_alert_draws_from_backfill(
+        context=context,
+        limit=max(1, request.max_draws),
+        lookback_days=request.lookback_days,
+        max_draws=request.max_draws,
+        min_bet_amount=None,
+        ccs_ids=requested,
+    )
     ccs_map: dict[str, dict[str, Any]] = {ccs_id: {"members": set(), "draw_ids": set(), "evidence": []} for ccs_id in requested}
     for alert in alerts:
         for member in alert.flagged_members:
@@ -686,11 +720,14 @@ def score_alerts(
     context: LiveScoringContext = Depends(get_live_scoring_context),
 ) -> AlertDrawResponse:
     lookback_days = max(1, min(int(lookback_days), 30))
+    max_draws = max(1, min(int(max_draws), 50_000))
     limit = max(1, min(int(limit), 1_000))
     min_bet_amount = None if betAmount is None else max(0.0, float(betAmount))
     alerts, draws_scanned = _build_alert_draws_from_backfill(
         context=context,
         limit=limit,
+        lookback_days=lookback_days,
+        max_draws=max_draws,
         min_bet_amount=min_bet_amount,
     )
     return AlertDrawResponse(
@@ -699,5 +736,3 @@ def score_alerts(
         alert_draw_count=len(alerts),
         alerts=alerts,
     )
-
-
