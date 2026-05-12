@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -119,6 +120,30 @@ def log_artifacts_safe(path: str) -> None:
         mlflow.log_artifacts(path)
     except Exception as e:
         logger.warning("mlflow.log_artifacts failed for %s: %s", path, e)
+
+
+def log_lineage_bundle_model(bundle_path: str | Path, artifact_path: str = "model_bundle") -> str:
+    import mlflow
+
+    active_run = mlflow.active_run()
+    if active_run is None:
+        raise ValueError("An active MLflow run is required to log the lineage bundle model.")
+
+    class _LineageOnlyBundleModel(mlflow.pyfunc.PythonModel):
+        def load_context(self, context):
+            self.bundle_path = context.artifacts["bundle_path"]
+
+        def predict(self, context, model_input, params=None):
+            raise RuntimeError(
+                "This MLflow registry model is lineage-only. Use the promoted local artifacts for serving and scoring."
+            )
+
+    mlflow.pyfunc.log_model(
+        artifact_path=artifact_path,
+        python_model=_LineageOnlyBundleModel(),
+        artifacts={"bundle_path": str(Path(bundle_path))},
+    )
+    return f"runs:/{active_run.info.run_id}/{artifact_path}"
 
 
 def register_model_to_staging(

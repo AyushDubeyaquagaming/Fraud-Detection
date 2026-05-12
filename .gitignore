@@ -20,12 +20,17 @@ analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
 ARCHITECTURE_GUIDE.md
+CONTEXT_COPILOT.MD
 CANDIDATE_DRAWS_STORE.md
+PHASE_3_FINAL_REVIEW_SUMMARY.txt
+IMPLEMENTATION_EXECUTION_PLAN.md
 DEMO_RUNBOOK_2026_04_27.txt
+PHASE_3_PLAN.md
 Phase B Refactor — Partnership Collusion Engine + Live Inference + Feedback Loop.md
 artifacts/
 live_scoring_plan.md
 PARTNERSHIP_LOCAL_TEST_COMMANDS.txt
+DEPLOYMENT_REVIEW_FINDINGS_2026_05_12.md
 DEPLOYMENT.md
 live_scoring_handoff_notes.txt
 live_scoring_developer_checklist.txt
@@ -35,6 +40,17 @@ developer_validation_guide.txt
 PARTNERSHIP_EXPLORATION_PLAN.md
 PHASE_A_PARTNERSHIP_MODELING_PLAN.md
 MLOPS_AUDIT_2026_04_27.txt
+GPT55_ALERT_SURFACE_FOLLOWUP_PLAN.md
+#scripts
+
+C:\Users\PC\Documents\Fraud Detection\scripts\bootstrap_rolling_store.py
+C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_feature_separation.py
+C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_fraud_label_matching.py
+C:\Users\PC\Documents\Fraud Detection\scripts\inspect_bet_schema.py
+C:\Users\PC\Documents\Fraud Detection\scripts\inspect_collusion_patterns.py
+C:\Users\PC\Documents\Fraud Detection\scripts\validate_fraud_ids.py
+
+
 # C extensions
 *.so
 

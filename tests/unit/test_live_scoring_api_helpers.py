@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from fastapi import FastAPI
 import pandas as pd
 
+from fraud_detection.serving.routes import live_scoring
 from fraud_detection.serving.routes.live_scoring import (
-    _apply_known_fraud_overlay,
     _candidate_rows_for_draw,
     _candidate_rows_for_member,
     _member_evidence,
@@ -39,6 +40,15 @@ def test_member_evidence_returns_partner_draw_context():
     assert evidence.score_reason == "partnership_pattern"
     assert evidence.partner_member_ids == ["B"]
     assert evidence.max_union_coverage == 1.0
+
+
+def test_label_route_is_not_registered():
+    app = FastAPI()
+    app.include_router(live_scoring.router)
+
+    paths = {route.path for route in app.routes}
+
+    assert "/label" not in paths
 
 
 def test_full_payload_request_is_separate_compatibility_schema():
@@ -76,33 +86,93 @@ def test_candidate_rows_for_member_reads_partitioned_store(tmp_path):
     assert list(draw_rows["member_ids"].iloc[0]) == ["GK00236424", "GK00511854"]
 
 
-def test_known_fraud_overlay_surfaces_labeled_pair():
-    doc = {
-        "draw_id": 7242014,
-        "partnerships": [],
-        "flagged_members": [],
-        "max_stage1_score": 0.0,
+def test_score_alerts_includes_ccs_context_for_flagged_members(monkeypatch):
+    candidate_row = {
+        "draw_id": 1,
+        "member_ids": ["A", "B"],
+        "ccs_ids": ["CA", "CB"],
+        "trans_date_min": pd.Timestamp("2026-05-07T00:00:00Z"),
+    }
+    result_doc = {
+        "draw_id": 1,
+        "requires_review": True,
+        "partnerships": [{"member_ids": ["A", "B"], "union_coverage": 1.0}],
+        "flagged_members": [
+            {
+                "member_id": "A",
+                "stage1_score_in_draw": 1.0,
+                "stage2_score": 0.0,
+                "best_partner_member_id": "B",
+                "bet_amount": 12000.0,
+                "win_amount": 30000.0,
+                "high_amount_flag": True,
+            }
+        ],
+        "max_stage1_score": 1.0,
         "max_stage2_score": 0.0,
-        "requires_review": False,
         "response_details": ["no_member_history"],
     }
-    row = {
-        "draw_id": 7242014,
-        "member_ids": ["GK00116069", "GK00123072"],
-        "coverage_bytes": [bytes([1] * 38), bytes([1] * 38)],
-        "amount_vector": [[1.0] * 38, [1.0] * 38],
-        "total_bet_amounts": [45000.0, 37000.0],
-        "win_points": [72000.0, 0.0],
-    }
+    context = SimpleNamespace(
+        model_bundle={"stage1_model": object(), "stage2_model": object()},
+        source_run_id="run_test",
+        partnership_table=None,
+        ccs_concentration_table=None,
+        evaluation_metadata={"label_status": "unavailable"},
+    )
+    monkeypatch.setattr(live_scoring, "_prediction_backfill_docs", lambda *_args, **_kwargs: [result_doc])
+    monkeypatch.setattr(live_scoring, "_candidate_row_for_doc", lambda *_args, **_kwargs: candidate_row)
 
-    result = _apply_known_fraud_overlay(doc, row)
+    response = live_scoring.score_alerts(context=context)
 
-    assert result["requires_review"] is True
-    assert result["max_stage1_score"] == 1.0
-    assert result["partnerships"][0]["member_ids"] == ["GK00116069", "GK00123072"]
-    assert sorted(item["member_id"] for item in result["flagged_members"]) == ["GK00116069", "GK00123072"]
-    first = next(item for item in result["flagged_members"] if item["member_id"] == "GK00116069")
-    assert first["bet_amount"] == 45000.0
-    assert first["win_amount"] == 72000.0
-    assert first["high_amount_flag"] is True
-    assert "known_fraud_label_overlay" in result["response_details"]
+    member = response.alerts[0].flagged_members[0]
+    assert member.ccs_id == "CA"
+    assert member.bet_amount == 12000.0
+    assert member.win_amount == 30000.0
+    assert response.alerts[0].response_details == ["no_member_history", "stage2_unavailable_no_labels"]
+
+
+def test_score_ccs_groups_alert_queue_from_backfill(monkeypatch):
+    context = SimpleNamespace(
+        model_bundle={"stage1_model": object(), "stage2_model": object()},
+        source_run_id="run_test",
+        partnership_table=None,
+        ccs_concentration_table=None,
+        evaluation_metadata={"label_status": "unavailable"},
+    )
+    alert = live_scoring.AlertDraw(
+        draw_id=7,
+        draw_date="2026-05-07T00:00:00+00:00",
+        risk_tier="HIGH",
+        partnership_count=1,
+        flagged_member_count=1,
+        flagged_member_ids=["A"],
+        flaggedMembers=[
+            live_scoring.AlertFlaggedMember(
+                member_id="A",
+                ccsId="CA",
+                stage1_score_in_draw=0.7,
+                best_partner_member_id="B",
+                betAmount=1000.0,
+                winAmount=5000.0,
+                highAmountFlag=False,
+                partner_member_ids=["B"],
+            )
+        ],
+        ccs_ids=["CA"],
+        highAmountMemberCount=0,
+        maxBetAmount=1000.0,
+        maxWinAmount=5000.0,
+        max_stage1_score=0.7,
+        response_details=["stage2_unavailable_no_labels"],
+    )
+    monkeypatch.setattr(live_scoring, "_build_alert_draws_from_backfill", lambda **kwargs: ([alert], 1))
+
+    response = live_scoring.score_ccs(
+        live_scoring.CcsScoreRequest(ccs_ids=["CA"], lookback_days=7, max_draws=10000),
+        context=context,
+    )
+
+    assert response.draws_scanned == 1
+    assert response.ccs_scores[0].ccs_id == "CA"
+    assert response.ccs_scores[0].flagged_members == ["A"]
+    assert response.ccs_scores[0].evidence[0]["draw_id"] == 7

@@ -105,7 +105,8 @@ with tab_draw:
             st.subheader("Partnerships")
             st.dataframe(pd.DataFrame(result.get("partnerships", [])), use_container_width=True)
             st.subheader("Flagged members")
-            st.dataframe(pd.DataFrame(result.get("flagged_members", [])), use_container_width=True)
+            flagged_df = pd.DataFrame(result.get("flagged_members", []))
+            st.dataframe(flagged_df, use_container_width=True)
         except ValueError:
             st.error("Draw ID must be a number.")
         except Exception as exc:
@@ -149,7 +150,22 @@ with tab_ccs:
             if scores.empty:
                 st.info("No CCS alerts found in the selected window.")
             else:
-                st.dataframe(scores, use_container_width=True)
+                st.caption("CCS results are grouped from the latest promoted weekly alert queue, not from a separate CCS model.")
+                summary_columns = [
+                    "ccs_id",
+                    "risk_tier",
+                    "flagged_member_count",
+                    "flagged_members",
+                    "evidence_draw_ids",
+                ]
+                st.dataframe(scores[[column for column in summary_columns if column in scores.columns]], use_container_width=True)
+                selected_ccs = st.selectbox("CCS evidence details", scores["ccs_id"].astype(str).tolist())
+                selected = scores.loc[scores["ccs_id"].astype(str).eq(selected_ccs)].iloc[0].to_dict()
+                evidence = pd.DataFrame(selected.get("evidence", []))
+                if evidence.empty:
+                    st.info("No evidence rows available for the selected CCS ID.")
+                else:
+                    st.dataframe(evidence, use_container_width=True)
         except Exception as exc:
             st.error(str(exc))
 
@@ -173,6 +189,7 @@ with tab_alerts:
             if alerts.empty:
                 st.info("No alert draws found in the selected window.")
             else:
+                st.caption("Alert draws are sourced from the latest promoted weekly scoring output.")
                 columns = [
                     "draw_date",
                     "draw_id",

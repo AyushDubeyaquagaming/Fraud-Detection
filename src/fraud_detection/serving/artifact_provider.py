@@ -29,6 +29,7 @@ class ArtifactBundle:
     model_version: str
     model_bundle: dict[str, Any] | None = None
     partnership_table_df: pd.DataFrame | None = None
+    ccs_concentration_table_df: pd.DataFrame | None = None
     training_raw_parquet_path: Path | None = None
     training_parquet_start_date: datetime | None = None
     training_parquet_end_date: datetime | None = None
@@ -73,6 +74,9 @@ class LocalDiskArtifactProvider(ArtifactProvider):
         partnership_table_file = str(manifest.get("partnership_table_file", "partnership_table.parquet"))
         partnership_table_path = self.current_dir / partnership_table_file
         partnership_table = pd.read_parquet(partnership_table_path) if partnership_table_path.exists() else pd.DataFrame()
+        ccs_table_file = str(manifest.get("ccs_concentration_table_file", "ccs_concentration_table.parquet"))
+        ccs_table_path = self.current_dir / ccs_table_file
+        ccs_table = pd.read_parquet(ccs_table_path) if ccs_table_path.exists() else pd.DataFrame()
         return ArtifactBundle(
             stage2_holdout_predictions_df=predictions,
             serving_manifest=manifest,
@@ -89,5 +93,6 @@ class LocalDiskArtifactProvider(ArtifactProvider):
             model_version=str(manifest.get("model_version", self.default_model_version)),
             model_bundle=model_bundle,
             partnership_table_df=partnership_table,
+            ccs_concentration_table_df=ccs_table,
             training_raw_parquet_path=run_dir / "data_ingestion" / "raw_data.parquet",
         )

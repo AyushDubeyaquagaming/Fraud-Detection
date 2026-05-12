@@ -59,6 +59,33 @@ live_scoring:
   stage1_history_days: 7
 
 partnership:
+  use_candidate_store: true
+  candidate_store_path: "data_store/candidate_draws"
+  candidate_window:
+    start_date: 2026-02-25
+    end_date: 2026-05-05
+  emit_negatives_sample: 5
+  pair_rules:
+    strict_min_ratio_similarity: 0.80
+    strict_min_pair_net_per_stake: -0.10
+    nearmiss_min_union: 36
+    nearmiss_max_overlap: 3
+    nearmiss_min_ratio_similarity: 0.70
+    nearmiss_min_pair_net_per_stake: -0.15
+    nearmiss_require_different_ccs: true
+    min_total_bet_amount: 1000.0
+    stage1_flag_threshold: 0.70
+  ccs_features:
+    enabled: true
+    profit_path: "data_store/ccs_daily_profit"
+    windows_days: [1, 7]
+    concentration_threshold: 0.70
+  analyst_label_overlay:
+    enabled: true
+    require_both_members_for_pair_override: true
+    conflict_policy: "no_override"
+  stage1_flag_threshold: 0.70
+  stream_batch_size: 20000
   candidate_thresholds:
     min_position_count: 4
     max_position_count: 34

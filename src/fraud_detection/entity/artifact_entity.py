@@ -40,6 +40,7 @@ class FeatureEngineeringArtifact:
     stage2_features_path: Path | None = None
     partnership_table_path: Path | None = None
     pair_events_path: Path | None = None
+    ccs_concentration_table_path: Path | None = None
 
 
 @dataclass
@@ -52,6 +53,7 @@ class ModelTrainingArtifact:
     stage1_oof_predictions_path: Path | None = None
     stage2_features_path: Path | None = None
     partnership_table_path: Path | None = None
+    ccs_concentration_table_path: Path | None = None
     stage1_feature_columns: list[str] | None = None
     stage2_feature_columns: list[str] | None = None
 

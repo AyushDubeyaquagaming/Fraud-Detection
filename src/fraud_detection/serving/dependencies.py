@@ -72,6 +72,8 @@ class LiveScoringContext:
     model_bundle: dict[str, Any]
     source_run_id: str | None
     partnership_table: pd.DataFrame
+    ccs_concentration_table: pd.DataFrame
+    evaluation_metadata: dict[str, Any]
     training_raw_parquet_path: Path
     timestamp_field: str
     parquet_start_date: Any  # datetime | None from bundle
@@ -106,6 +108,10 @@ def get_live_scoring_context(
         model_bundle=bundle.model_bundle,
         source_run_id=bundle.source_run_id,
         partnership_table=bundle.partnership_table_df if bundle.partnership_table_df is not None else pd.DataFrame(),
+        ccs_concentration_table=(
+            bundle.ccs_concentration_table_df if bundle.ccs_concentration_table_df is not None else pd.DataFrame()
+        ),
+        evaluation_metadata=bundle.evaluation_metadata or {},
         training_raw_parquet_path=bundle.training_raw_parquet_path or Path(),
         timestamp_field=timestamp_field,
         parquet_start_date=bundle.training_parquet_start_date,

@@ -16,6 +16,7 @@ class PairRuleConfig:
     nearmiss_max_overlap: int = 2
     nearmiss_min_ratio_similarity: float = 0.70
     nearmiss_min_pair_net_per_stake: float = -0.10
+    nearmiss_require_different_ccs: bool = True
     min_total_bet_amount: float = 1000.0
     stage1_flag_threshold: float = 0.70
 
@@ -38,6 +39,7 @@ PAIR_FEATURE_COLUMNS = [
     "stake_ratio",
     "win_points_a",
     "win_points_b",
+    "pair_different_ccs",
     "is_strict_match",
     "is_nearmiss",
 ]
@@ -119,6 +121,11 @@ def emit_pair_rows(
     cfg = config or PairRuleConfig()
     row = draw_row.to_dict() if isinstance(draw_row, pd.Series) else dict(draw_row)
     member_ids = [str(value).strip().upper() for value in row.get("member_ids", [])]
+    raw_ccs_ids = list(row.get("ccs_ids", []))
+    ccs_ids = [
+        None if value is None or str(value).strip() == "" else str(value).strip().upper()
+        for value in raw_ccs_ids
+    ]
     total_bets = np.array(row.get("total_bet_amounts", []), dtype=np.float64)
     wins = np.array(row.get("win_points", []), dtype=np.float64)
     coverage_bytes = list(row.get("coverage_bytes", []))
@@ -127,6 +134,10 @@ def emit_pair_rows(
     n_players = coverage.shape[0]
     if not (len(member_ids) == len(total_bets) == len(wins) == n_players):
         raise ValueError("candidate draw row has misaligned player arrays.")
+    if len(ccs_ids) < n_players:
+        ccs_ids.extend([None] * (n_players - len(ccs_ids)))
+    elif len(ccs_ids) > n_players:
+        ccs_ids = ccs_ids[:n_players]
     if n_players < 2:
         return []
 
@@ -144,6 +155,9 @@ def emit_pair_rows(
         out=np.zeros_like(pair_net, dtype=np.float64),
         where=pair_stake > 0,
     )
+    ccs_i = np.array([ccs_ids[int(idx)] for idx in upper_i], dtype=object)
+    ccs_j = np.array([ccs_ids[int(idx)] for idx in upper_j], dtype=object)
+    pair_different_ccs = (ccs_i != None) & (ccs_j != None) & (ccs_i != ccs_j)  # noqa: E711
     strict = (
         both_staked
         & (union_count == cfg.board_size)
@@ -159,6 +173,8 @@ def emit_pair_rows(
         & (ratio >= cfg.nearmiss_min_ratio_similarity)
         & (pair_net_per_stake >= cfg.nearmiss_min_pair_net_per_stake)
     )
+    if cfg.nearmiss_require_different_ccs:
+        nearmiss = nearmiss & pair_different_ccs
     emit_mask = strict | nearmiss
     sampled_negative = np.zeros_like(emit_mask, dtype=bool)
     if mode == "training" and ordinary_negative_sample > 0:
@@ -183,6 +199,8 @@ def emit_pair_rows(
                 "draw_date": draw_date,
                 "member_a": member_ids[i],
                 "member_b": member_ids[j],
+                "ccs_a": ccs_ids[i],
+                "ccs_b": ccs_ids[j],
                 "coverage_count_a": int(metrics["coverage_count"][i]),
                 "coverage_count_b": int(metrics["coverage_count"][j]),
                 "coverage_count_diff": int(abs(metrics["coverage_count"][i] - metrics["coverage_count"][j])),
@@ -197,6 +215,7 @@ def emit_pair_rows(
                 "stake_ratio": stake_ratio,
                 "win_points_a": float(wins[i]),
                 "win_points_b": float(wins[j]),
+                "pair_different_ccs": int(pair_different_ccs[idx]),
                 "is_strict_match": int(strict[idx]),
                 "is_nearmiss": int(nearmiss[idx]),
                 "sampled_negative": int(sampled_negative[idx]),
@@ -212,6 +231,8 @@ def pair_rows_to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "draw_date",
         "member_a",
         "member_b",
+        "ccs_a",
+        "ccs_b",
         *PAIR_FEATURE_COLUMNS,
         "sampled_negative",
         "pair_risk_score",

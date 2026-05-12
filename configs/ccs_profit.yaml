@@ -1,0 +1,11 @@
+mongo:
+  uri_env_var: MONGODB_URI
+  database_env_var: MONGODB_DATABASE
+  collection_env_var: MONGODB_COLLECTION_ROULETTE_REPORT
+
+extraction:
+  game: roulette
+
+output:
+  base_path: data_store/ccs_daily_profit
+  parquet_compression: zstd

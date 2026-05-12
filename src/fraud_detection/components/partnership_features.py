@@ -76,6 +76,16 @@ STAGE2_FEATURE_COLUMNS = [
     "longest_consecutive_high_stage1_streak",
     "n_distinct_high_score_partners",
     *SECTION_A_FEATURE_COLUMNS,
+    "ccs_profit_share_1d",
+    "ccs_profit_share_7d",
+    "ccs_total_profit_1d",
+    "ccs_total_profit_7d",
+    "ccs_member_count_1d",
+    "ccs_member_count_7d",
+    "ccs_high_concentration_1d",
+    "ccs_high_concentration_7d",
+    "ccs_solo_member_1d",
+    "ccs_solo_member_7d",
 ]
 
 PAIR_STAGE1_FEATURE_COLUMNS = PAIR_FEATURE_COLUMNS
@@ -185,6 +195,7 @@ def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_co
             projected.append(
                 {
                     "member_id": str(row.get(member_col, "")).strip().upper(),
+                    "ccs_id": row.get("ccs_a") if member_col == "member_a" else row.get("ccs_b"),
                     "draw_id": int(row.get("draw_id")),
                     "draw_date": row.get("draw_date"),
                     "best_partner_member_id": str(row.get(partner_col, "")).strip().upper(),
@@ -430,13 +441,29 @@ def build_stage2_training_frame(
     if "best_partner_member_id" not in preds.columns:
         preds["best_partner_member_id"] = None
 
-    agg = preds.sort_values(["member_id", "draw_date", "draw_id"]).groupby("member_id", as_index=False).agg(
-        max_stage1_score=("stage1_score", "max"),
-        mean_stage1_score=("stage1_score", "mean"),
-        n_draws_stage1_above_0p5=("stage1_score", lambda s: int((s >= 0.5).sum())),
-        n_draws_stage1_above_0p9=("stage1_score", lambda s: int((s >= 0.9).sum())),
-        longest_consecutive_high_stage1_streak=("stage1_score", lambda s: _longest_streak(s >= 0.5)),
-    )
+    agg_spec = {
+        "max_stage1_score": ("stage1_score", "max"),
+        "mean_stage1_score": ("stage1_score", "mean"),
+        "n_draws_stage1_above_0p5": ("stage1_score", lambda s: int((s >= 0.5).sum())),
+        "n_draws_stage1_above_0p9": ("stage1_score", lambda s: int((s >= 0.9).sum())),
+        "longest_consecutive_high_stage1_streak": ("stage1_score", lambda s: _longest_streak(s >= 0.5)),
+    }
+    for col in [
+        "ccs_profit_share_1d",
+        "ccs_profit_share_7d",
+        "ccs_total_profit_1d",
+        "ccs_total_profit_7d",
+        "ccs_member_count_1d",
+        "ccs_member_count_7d",
+        "ccs_high_concentration_1d",
+        "ccs_high_concentration_7d",
+        "ccs_solo_member_1d",
+        "ccs_solo_member_7d",
+    ]:
+        if col in preds.columns:
+            agg_spec[col] = (col, "max")
+
+    agg = preds.sort_values(["member_id", "draw_date", "draw_id"]).groupby("member_id", as_index=False).agg(**agg_spec)
     high = preds.loc[preds["stage1_score"] >= 0.5]
     distinct = (
         high.loc[high["best_partner_member_id"].notna() & high["best_partner_member_id"].astype(str).ne("")]
@@ -492,6 +519,8 @@ def ensure_stage1_schema(frame: pd.DataFrame) -> pd.DataFrame:
     for key in ["member_id", "draw_id", "draw_date"]:
         if key not in out.columns:
             out[key] = pd.NA
+    if "ccs_id" not in out.columns:
+        out["ccs_id"] = None
     if "best_partner_member_id" not in out.columns:
         out["best_partner_member_id"] = None
     for col in STAGE1_FEATURE_COLUMNS:
@@ -499,7 +528,7 @@ def ensure_stage1_schema(frame: pd.DataFrame) -> pd.DataFrame:
             out[col] = 0.0
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     out["member_id"] = out["member_id"].astype(str).str.strip().str.upper()
-    return out[["member_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS]]
+    return out[["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS]]
 
 
 def save_partnership_feature_artifacts(
@@ -535,7 +564,7 @@ def _coerce_partnership_df(value: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def _empty_stage1_frame() -> pd.DataFrame:
-    return pd.DataFrame(columns=["member_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS])
+    return pd.DataFrame(columns=["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS])
 
 
 def _empty_pair_events() -> pd.DataFrame:

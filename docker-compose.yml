@@ -2,7 +2,7 @@
 #
 # Services:
 #   - fraud-detection-api      FastAPI serving layer (v1 + live + historical scoring)
-#   - fraud-detection          One-shot training image (run with `docker compose run --rm fraud-detection`)
+#   - fraud-detection          One-shot full-cycle image (run with `docker compose run --rm fraud-detection`)
 #   - mlflow-server            MLflow tracking + Model Registry (SQLite-backed; survives restarts via volume)
 #   - prefect-postgres         Postgres for the Prefect orchestration DB (state, schedules, history)
 #   - prefect-server           Self-hosted Prefect server (NOT Prefect Cloud)
@@ -74,7 +74,7 @@ services:
       - ./configs:/app/configs:ro
     depends_on:
       - mlflow-server
-    command: train
+    command: full-cycle
 
   # ─────────────────────────────────────────────────────────────────────────
   # MLflow tracking + Model Registry (SQLite-backed for now; switch the

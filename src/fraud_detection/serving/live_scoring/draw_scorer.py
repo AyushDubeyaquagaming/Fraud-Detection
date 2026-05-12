@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from fraud_detection.components.pair_scan import PAIR_FEATURE_COLUMNS, coerce_pair_rule_config
+from fraud_detection.components.ccs_features import CCS_FEATURE_COLUMNS, attach_ccs_concentration_features_from_frame, prepare_profit_frame
 from fraud_detection.components.partnership_features import (
     STAGE1_FEATURE_COLUMNS,
     STAGE2_FEATURE_COLUMNS,
@@ -49,6 +50,7 @@ class DrawScorer:
         *,
         source_run_id: str | None = None,
         partnership_table: pd.DataFrame | None = None,
+        ccs_concentration_table: pd.DataFrame | None = None,
     ):
         self.bundle = bundle
         self.source_run_id = source_run_id
@@ -70,6 +72,15 @@ class DrawScorer:
         self.stage2_alert_threshold = float(bundle.get("stage2_alert_threshold", 0.65))
         self.model_version = str(bundle.get("model_version", "partnership_v1"))
         self.partnership_table = partnership_table if partnership_table is not None else pd.DataFrame()
+        self.ccs_concentration_table = ccs_concentration_table if ccs_concentration_table is not None else pd.DataFrame()
+        self._prepared_ccs_profit_frame = self._prepare_serving_ccs_profit_frame(self.ccs_concentration_table)
+
+    @staticmethod
+    def _prepare_serving_ccs_profit_frame(ccs_concentration_table: pd.DataFrame) -> pd.DataFrame:
+        required_columns = ["ccs_id", "member_id", "profit_date", "daily_profit"]
+        if ccs_concentration_table.empty or not set(required_columns).issubset(ccs_concentration_table.columns):
+            return pd.DataFrame(columns=required_columns)
+        return prepare_profit_frame(ccs_concentration_table)
 
     def score_draw(
         self,
@@ -91,13 +102,14 @@ class DrawScorer:
             candidate_thresholds=self.thresholds,
         )
         stage1_scores = score_stage1(self.stage1_model, stage1_features, self.stage1_feature_columns)
+        stage1_scores_with_ccs = self._attach_serving_ccs_context(stage1_scores)
         live_stage2 = build_live_stage2_frame(
-            stage1_scores,
+            stage1_scores_with_ccs,
             stage1_history=stage1_history,
             partnership_features=partnership_features,
         )
         stage2_scores = score_stage2(self.stage2_model, live_stage2, self.stage2_feature_columns)
-        scored_members = stage1_scores.merge(stage2_scores, on="member_id", how="left")
+        scored_members = stage1_scores_with_ccs.merge(stage2_scores, on="member_id", how="left")
         scored_members["stage2_score"] = pd.to_numeric(scored_members["stage2_score"], errors="coerce").fillna(0.0)
         response_details = self._response_details(stage1_history, partnership_features)
         member_scores = [
@@ -125,6 +137,7 @@ class DrawScorer:
                     "stage1_score_in_draw": float(row.stage1_score),
                     "stage2_score": float(row.stage2_score),
                     "best_partner_member_id": None if pd.isna(row.best_partner_member_id) else str(row.best_partner_member_id),
+                    **self._ccs_context_payload(row),
                 },
                 amount_context,
             )
@@ -201,6 +214,10 @@ class DrawScorer:
                 pair_events["stage1_model_score"], errors="coerce"
             ).fillna(0.0)
             pair_events.loc[pair_events["is_strict_match"].astype(int).eq(1), "pair_risk_score"] = 1.0
+            nearmiss_mask = pair_events["is_nearmiss"].astype(int).eq(1)
+            pair_events.loc[nearmiss_mask, "pair_risk_score"] = pair_events.loc[nearmiss_mask, "pair_risk_score"].clip(
+                lower=self.stage1_flag_threshold
+            )
         return pair_events
 
     def _candidate_result_from_pairs(
@@ -230,7 +247,11 @@ class DrawScorer:
                 response_details=response_details,
             )
         stage1_features = project_pair_scores_to_member_draw_rows(pair_events, rolling_context=False)
-        stage1_scores = stage1_features[["member_id", "draw_id", "draw_date", "best_partner_member_id"]].copy() if not stage1_features.empty else pd.DataFrame(columns=["member_id", "draw_id", "draw_date", "best_partner_member_id"])
+        stage1_scores = (
+            stage1_features[["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id"]].copy()
+            if not stage1_features.empty
+            else pd.DataFrame(columns=["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id"])
+        )
         if not pair_events.empty:
             score_rows = []
             for item in pair_events.to_dict("records"):
@@ -248,13 +269,14 @@ class DrawScorer:
         else:
             stage1_scores["stage1_score"] = []
         stage1_scores["stage1_score"] = pd.to_numeric(stage1_scores.get("stage1_score"), errors="coerce").fillna(0.0)
+        stage1_scores_with_ccs = self._attach_serving_ccs_context(stage1_scores)
         live_stage2 = build_live_stage2_frame(
-            stage1_scores,
+            stage1_scores_with_ccs,
             stage1_history=stage1_history,
             partnership_features=partnership_features,
         )
         stage2_scores = score_stage2(self.stage2_model, live_stage2, self.stage2_feature_columns) if not live_stage2.empty else pd.DataFrame(columns=["member_id", "stage2_score"])
-        scored_members = stage1_scores.merge(stage2_scores, on="member_id", how="left")
+        scored_members = stage1_scores_with_ccs.merge(stage2_scores, on="member_id", how="left")
         scored_members["stage2_score"] = pd.to_numeric(scored_members.get("stage2_score"), errors="coerce").fillna(0.0)
         response_details = self._response_details(stage1_history, partnership_features)
         amount_context = self._candidate_amount_context(row)
@@ -281,6 +303,7 @@ class DrawScorer:
                     "stage1_score_in_draw": float(item.stage1_score),
                     "stage2_score": float(item.stage2_score),
                     "best_partner_member_id": None if pd.isna(item.best_partner_member_id) else str(item.best_partner_member_id),
+                    **self._ccs_context_payload(item),
                 },
                 amount_context,
             )
@@ -348,9 +371,41 @@ class DrawScorer:
             "amount_vector": amounts,
         }
 
+    def _attach_serving_ccs_context(self, stage1_scores: pd.DataFrame) -> pd.DataFrame:
+        if stage1_scores.empty:
+            return stage1_scores
+        ccs_cfg = self.bundle.get("ccs_features", {}) or {}
+        ccs_needed = bool(ccs_cfg.get("enabled", False)) or any(
+            column in self.stage2_feature_columns for column in CCS_FEATURE_COLUMNS
+        )
+        if not ccs_needed:
+            return stage1_scores
+        required = {"ccs_id", "member_id", "profit_date", "daily_profit"}
+        if self._prepared_ccs_profit_frame.empty or not required.issubset(self._prepared_ccs_profit_frame.columns):
+            return attach_ccs_concentration_features_from_frame(
+                stage1_scores,
+                profit_frame=pd.DataFrame(columns=list(required)),
+                windows_days=list(ccs_cfg.get("windows_days", [1, 7])),
+                concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
+            )
+        return attach_ccs_concentration_features_from_frame(
+            stage1_scores,
+            profit_frame=self._prepared_ccs_profit_frame,
+            windows_days=list(ccs_cfg.get("windows_days", [1, 7])),
+            concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
+        )
+
     @staticmethod
     def _amount_thresholds(bet_amounts: list[float], win_amounts: list[float]) -> tuple[float, float]:
         return HIGH_AMOUNT_THRESHOLD, HIGH_AMOUNT_THRESHOLD
+
+    @staticmethod
+    def _ccs_context_payload(row: Any) -> dict[str, float]:
+        payload: dict[str, float] = {}
+        for column in CCS_FEATURE_COLUMNS:
+            value = pd.to_numeric(getattr(row, column, 0.0), errors="coerce")
+            payload[column] = 0.0 if pd.isna(value) else float(value)
+        return payload
 
     @classmethod
     def _candidate_amount_context(cls, row: dict[str, Any]) -> dict[str, Any]:

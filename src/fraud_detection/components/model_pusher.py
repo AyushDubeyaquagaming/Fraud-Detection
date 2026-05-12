@@ -33,7 +33,7 @@ class ModelPusher:
     def _register_to_staging(self, bundle_path: Path, git_sha: str, promoted_at: str) -> dict[str, Any]:
         try:
             import mlflow
-            from fraud_detection.utils.mlflow_utils import register_model_to_staging
+            from fraud_detection.utils.mlflow_utils import log_lineage_bundle_model, register_model_to_staging
         except Exception as exc:
             return {"attempted": False, "succeeded": False, "error_type": type(exc).__name__, "error_message": str(exc)}
 
@@ -45,10 +45,9 @@ class ModelPusher:
                 active_run = mlflow.active_run()
                 opened = True
             try:
-                mlflow.log_artifact(str(bundle_path), artifact_path="model_bundle")
-                run_id = active_run.info.run_id
+                artifact_uri = log_lineage_bundle_model(bundle_path, artifact_path="model_bundle")
                 return register_model_to_staging(
-                    artifact_uri=f"runs:/{run_id}/model_bundle/{bundle_path.name}",
+                    artifact_uri=artifact_uri,
                     registered_name=self.config.registered_model_name,
                     description=f"partnership_v1 git_sha={git_sha} promoted_at={promoted_at}",
                     tags={"git_sha": git_sha, "promoted_at": promoted_at, "model_version_label": self.config.model_version},
@@ -65,9 +64,12 @@ class ModelPusher:
         try:
             ensure_dir(self.config.current_dir)
             promotion_metadata_path = self.config.current_dir / "promotion_metadata.json"
+            evaluation_report = read_json(self.evaluation_artifact.evaluation_report_path)
             if not self.evaluation_artifact.gate_passed:
                 metadata = {
                     "gate_passed": False,
+                    "label_status": evaluation_report.get("label_status"),
+                    "gate_reason": evaluation_report.get("gate_reason"),
                     "stage2_capture_top_5pct": self.evaluation_artifact.stage2_capture_rate_top_5pct,
                     "stage2_lift_top_5pct": self.evaluation_artifact.stage2_lift_top_5pct,
                     "decided_at": datetime.now(timezone.utc).isoformat(),
@@ -92,6 +94,8 @@ class ModelPusher:
                 shutil.copy2(self.training_artifact.stage2_model_path, self.config.current_dir / "stage2_model.joblib")
             if self.training_artifact.partnership_table_path and self.training_artifact.partnership_table_path.exists():
                 shutil.copy2(self.training_artifact.partnership_table_path, self.config.current_dir / "partnership_table.parquet")
+            if self.training_artifact.ccs_concentration_table_path and self.training_artifact.ccs_concentration_table_path.exists():
+                shutil.copy2(self.training_artifact.ccs_concentration_table_path, self.config.current_dir / "ccs_concentration_table.parquet")
             shutil.copy2(self.training_artifact.training_report_path, self.config.current_dir / "training_report.json")
             shutil.copy2(self.evaluation_artifact.evaluation_report_path, self.config.current_dir / "evaluation_report.json")
             shutil.copy2(self.evaluation_artifact.stage2_holdout_predictions_path, self.config.current_dir / "stage2_holdout_predictions.parquet")
@@ -111,6 +115,8 @@ class ModelPusher:
             run_dir = self.training_artifact.training_report_path.parent.parent
             metadata = {
                 "gate_passed": True,
+                "label_status": evaluation_report.get("label_status"),
+                "gate_reason": evaluation_report.get("gate_reason"),
                 "run_dir": str(run_dir),
                 "promoted_at": promoted_at,
                 "git_sha": git_sha,
@@ -130,6 +136,7 @@ class ModelPusher:
                 "stage1_model_file": "stage1_model.joblib",
                 "stage2_model_file": "stage2_model.joblib",
                 "partnership_table_file": "partnership_table.parquet",
+                "ccs_concentration_table_file": "ccs_concentration_table.parquet",
                 "stage2_alert_threshold": read_json(self.training_artifact.training_report_path).get("stage2_alert_threshold", 0.65),
             }
             if registry_info:

@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 
 import joblib
+import mlflow
 
 from fraud_detection.components.model_pusher import ModelPusher
 from fraud_detection.entity.artifact_entity import ModelEvaluationArtifact, ModelTrainingArtifact
 from fraud_detection.entity.config_entity import ModelPusherConfig
+from fraud_detection.utils import mlflow_utils
 
 
 def test_partnership_pusher_writes_manifest_and_bundle(tmp_path: Path):
@@ -65,3 +67,15 @@ def test_partnership_pusher_writes_manifest_and_bundle(tmp_path: Path):
     manifest = json.loads((current_dir / "serving_manifest.json").read_text())
     assert manifest["model_version"] == "partnership_v1"
     assert manifest["model_bundle_file"] == "model_bundle.joblib"
+
+
+def test_log_lineage_bundle_model_returns_model_directory_uri(monkeypatch, tmp_path: Path):
+    bundle_path = tmp_path / "model_bundle.joblib"
+    bundle_path.write_text("bundle", encoding="utf-8")
+    tracking_dir = tmp_path / "mlruns"
+    mlflow.set_tracking_uri(tracking_dir.as_uri())
+
+    with mlflow.start_run() as run:
+        uri = mlflow_utils.log_lineage_bundle_model(bundle_path)
+
+    assert uri == f"runs:/{run.info.run_id}/model_bundle"

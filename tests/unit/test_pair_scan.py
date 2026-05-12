@@ -13,11 +13,12 @@ from fraud_detection.components.pair_scan import (
 )
 
 
-def _row(coverage: list[list[int]], amounts: list[list[float]], stakes=None, wins=None):
+def _row(coverage: list[list[int]], amounts: list[list[float]], stakes=None, wins=None, ccs_ids=None):
     return {
         "draw_id": 1,
         "trans_date_min": datetime(2026, 4, 27, tzinfo=timezone.utc),
         "member_ids": [f"M{i}" for i in range(len(coverage))],
+        "ccs_ids": ccs_ids or [f"CCS{i}" for i in range(len(coverage))],
         "total_bet_amounts": stakes or [1000.0] * len(coverage),
         "win_points": wins or [1000.0] * len(coverage),
         "coverage_bytes": [bytes(values) for values in coverage],
@@ -49,6 +50,97 @@ def test_37_of_38_is_nearmiss_not_strict() -> None:
     assert rows[0]["is_strict_match"] == 0
     assert rows[0]["is_nearmiss"] == 1
     assert rows[0]["union_count"] == 37
+    assert rows[0]["ccs_a"] == "CCS0"
+    assert rows[0]["ccs_b"] == "CCS1"
+    assert rows[0]["pair_different_ccs"] == 1
+
+
+def test_strict_same_ccs_pair_still_fires() -> None:
+    left = [1] * 19 + [0] * 19
+    right = [0] * 19 + [1] * 19
+    row = _row(
+        [left, right],
+        [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]],
+        ccs_ids=["CCS1", "CCS1"],
+        wins=[1200.0, 1000.0],
+    )
+
+    rows = emit_pair_rows(row, PairRuleConfig(), mode="inference")
+
+    assert len(rows) == 1
+    assert rows[0]["is_strict_match"] == 1
+    assert rows[0]["pair_different_ccs"] == 0
+
+
+def test_nearmiss_same_ccs_filtered_when_required() -> None:
+    left = [1] * 19 + [0] * 19
+    right = [0] * 19 + [1] * 18 + [0]
+    row = _row(
+        [left, right],
+        [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]],
+        ccs_ids=["CCS1", "CCS1"],
+        wins=[1200.0, 1000.0],
+    )
+
+    assert emit_pair_rows(row, PairRuleConfig(nearmiss_require_different_ccs=True), mode="inference") == []
+
+
+def test_nearmiss_same_ccs_fires_when_filter_disabled() -> None:
+    left = [1] * 19 + [0] * 19
+    right = [0] * 19 + [1] * 18 + [0]
+    row = _row(
+        [left, right],
+        [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]],
+        ccs_ids=["CCS1", "CCS1"],
+        wins=[1200.0, 1000.0],
+    )
+
+    rows = emit_pair_rows(row, PairRuleConfig(nearmiss_require_different_ccs=False), mode="inference")
+
+    assert len(rows) == 1
+    assert rows[0]["is_nearmiss"] == 1
+    assert rows[0]["pair_different_ccs"] == 0
+
+
+def test_nearmiss_different_ccs_still_fires() -> None:
+    left = [1] * 19 + [0] * 19
+    right = [0] * 19 + [1] * 18 + [0]
+    row = _row(
+        [left, right],
+        [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]],
+        ccs_ids=["CCS1", "CCS2"],
+        wins=[1200.0, 1000.0],
+    )
+
+    rows = emit_pair_rows(row, PairRuleConfig(nearmiss_require_different_ccs=True), mode="inference")
+
+    assert len(rows) == 1
+    assert rows[0]["is_nearmiss"] == 1
+    assert rows[0]["pair_different_ccs"] == 1
+
+
+def test_high_stake_cross_ccs_nearmiss_can_allow_three_overlaps_and_larger_pair_loss() -> None:
+    left_positions = {1, 2, 4, 6, 8, 9, 10, 13, 15, 17, 19, 20, 22, 24, 26, 27, 28, 31, 33, 35, 36, 37}
+    right_positions = {0, 3, 5, 7, 9, 11, 12, 14, 16, 18, 21, 23, 25, 27, 29, 30, 32, 34, 36}
+    left = [int(idx in left_positions) for idx in range(38)]
+    right = [int(idx in right_positions) for idx in range(38)]
+    row = _row(
+        [left, right],
+        [[2000.0 if value else 0.0 for value in left], [2000.0 if value else 0.0 for value in right]],
+        stakes=[45000.0, 37000.0],
+        wins=[72000.0, 0.0],
+        ccs_ids=["CCS016058", "CCS023061"],
+    )
+
+    rows = emit_pair_rows(
+        row,
+        PairRuleConfig(nearmiss_max_overlap=3, nearmiss_min_pair_net_per_stake=-0.15),
+        mode="inference",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["is_nearmiss"] == 1
+    assert rows[0]["pair_different_ccs"] == 1
 
 
 def test_strict_does_not_fire_on_overlap() -> None:

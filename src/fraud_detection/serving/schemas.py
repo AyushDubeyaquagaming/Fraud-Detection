@@ -123,6 +123,16 @@ class FlaggedMember(BaseModel):
     stage1_score_in_draw: float
     stage2_score: float
     best_partner_member_id: str | None = None
+    ccs_profit_share_1d: float | None = None
+    ccs_profit_share_7d: float | None = None
+    ccs_total_profit_1d: float | None = None
+    ccs_total_profit_7d: float | None = None
+    ccs_member_count_1d: float | None = None
+    ccs_member_count_7d: float | None = None
+    ccs_high_concentration_1d: float | None = None
+    ccs_high_concentration_7d: float | None = None
+    ccs_solo_member_1d: float | None = None
+    ccs_solo_member_7d: float | None = None
     bet_amount: float | None = Field(default=None, alias="betAmount")
     win_amount: float | None = Field(default=None, alias="winAmount")
     high_amount_flag: bool = Field(default=False, alias="highAmountFlag")
@@ -173,6 +183,7 @@ class CcsScore(BaseModel):
     flagged_member_count: int
     flagged_members: list[str]
     evidence_draw_ids: list[int]
+    evidence: list[dict[str, str | int | float | bool | None]] = Field(default_factory=list)
 
 
 class CcsScoreResponse(BaseModel):
@@ -181,7 +192,16 @@ class CcsScoreResponse(BaseModel):
     ccs_scores: list[CcsScore]
 
 
-class AlertFlaggedMember(FlaggedMember):
+class AlertFlaggedMember(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    member_id: str
+    stage1_score_in_draw: float
+    best_partner_member_id: str | None = None
+    bet_amount: float | None = Field(default=None, alias="betAmount")
+    win_amount: float | None = Field(default=None, alias="winAmount")
+    high_amount_flag: bool = Field(default=False, alias="highAmountFlag")
+    high_amount_reason: str | None = Field(default=None, alias="highAmountReason")
     ccs_id: str = Field(alias="ccsId")
     partner_member_ids: list[str] = Field(default_factory=list)
 
@@ -201,7 +221,6 @@ class AlertDraw(BaseModel):
     max_bet_amount: float = Field(default=0.0, alias="maxBetAmount")
     max_win_amount: float = Field(default=0.0, alias="maxWinAmount")
     max_stage1_score: float
-    max_stage2_score: float
     response_details: list[str] = Field(default_factory=list)
 
 

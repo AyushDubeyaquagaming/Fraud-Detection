@@ -14,6 +14,7 @@ from fraud_detection.exception import FraudDetectionException
 from fraud_detection.logger import get_logger
 from fraud_detection.serving.live_scoring.draw_scorer import DrawScorer
 from fraud_detection.utils.common import load_joblib, read_json, read_yaml, write_json
+from fraud_detection.utils.mongodb import MONGO_PROJECTION, get_serving_mongo_collection
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,30 @@ def _resolve_window_bounds(window: dict[str, object], timestamp_min: pd.Timestam
     if start_ts > end_ts:
         raise ValueError(f"Invalid batch scoring window: start {start_ts} is after end {end_ts}")
     return start_ts, end_ts
+
+
+def _resolve_live_window_bounds(
+    window: dict[str, object],
+    *,
+    now: datetime | None = None,
+) -> tuple[str, pd.Timestamp, pd.Timestamp]:
+    timestamp_field = str(window.get("timestamp_field", "trans_date"))
+    anchor = pd.Timestamp(now or datetime.now(timezone.utc))
+    anchor = anchor.tz_localize("UTC") if anchor.tzinfo is None else anchor.tz_convert("UTC")
+    start_date = window.get("start_date")
+    end_date = window.get("end_date")
+    lookback_days = window.get("lookback_days")
+
+    end_ts = pd.Timestamp(end_date, tz="UTC") if end_date else anchor
+    if start_date:
+        start_ts = pd.Timestamp(start_date, tz="UTC")
+    elif lookback_days is not None:
+        start_ts = end_ts - pd.Timedelta(days=int(lookback_days))
+    else:
+        raise ValueError("Mongo-backed batch scoring requires start_date/end_date or lookback_days in batch_scoring.window")
+    if start_ts > end_ts:
+        raise ValueError(f"Invalid batch scoring window: start {start_ts} is after end {end_ts}")
+    return timestamp_field, start_ts, end_ts
 
 
 def _to_filter_bound(value: pd.Timestamp, arrow_type: pa.DataType) -> object:
@@ -94,6 +119,52 @@ def _iter_candidate_store_batches(store_path: Path, *, window: dict[str, object]
         yield frame
     if row_count == 0:
         raise ValueError(f"Candidate store window returned 0 rows from {store_path}")
+
+
+def _iter_mongo_draw_groups(
+    *,
+    mongo_config: dict[str, object],
+    window: dict[str, object],
+    now: datetime | None = None,
+):
+    timestamp_field, start_ts, end_ts = _resolve_live_window_bounds(window, now=now)
+    logger.info(
+        "Batch scoring mongo window: %s in [%s, %s)",
+        timestamp_field,
+        start_ts.isoformat(),
+        end_ts.isoformat(),
+    )
+    collection = get_serving_mongo_collection(
+        str(mongo_config.get("uri_env_var", "MONGODB_URI")),
+        str(mongo_config.get("database_env_var", "MONGODB_DATABASE")),
+        str(mongo_config.get("collection_env_var", "MONGODB_COLLECTION_ROULETTE_REPORT")),
+    )
+    query = {timestamp_field: {"$gte": start_ts.to_pydatetime(), "$lt": end_ts.to_pydatetime()}}
+    cursor = (
+        collection.find(query, MONGO_PROJECTION)
+        .sort([("draw_id", 1), (timestamp_field, 1)])
+        .batch_size(BATCH_SCORING_STREAM_BATCH_SIZE)
+    )
+    current_draw_id = None
+    pending_rows: list[dict] = []
+    row_count = 0
+    for row in cursor:
+        draw_id = pd.to_numeric(row.get("draw_id"), errors="coerce")
+        if pd.isna(draw_id):
+            continue
+        draw_id = int(draw_id)
+        if current_draw_id is None:
+            current_draw_id = draw_id
+        if draw_id != current_draw_id:
+            yield pd.DataFrame(pending_rows)
+            pending_rows = []
+            current_draw_id = draw_id
+        pending_rows.append(row)
+        row_count += 1
+    if pending_rows:
+        yield pd.DataFrame(pending_rows)
+    if row_count == 0:
+        raise ValueError("Mongo-backed batch scoring window returned 0 rows")
 
 
 def _iter_parquet_draw_groups(parquet_path: Path, *, window: dict[str, object], timestamp_field: str):
@@ -184,16 +255,25 @@ class BatchScoringPipeline:
             if not bundle_path.exists():
                 raise FileNotFoundError(f"Model bundle not found: {bundle_path}")
             bundle = load_joblib(bundle_path)
+            batch_cfg = config.get("batch_scoring", {}) or {}
             partnership_cfg = config.get("partnership", {})
             use_candidate_store = bool(partnership_cfg.get("use_candidate_store", bundle.get("use_candidate_store", False)))
-            window = partnership_cfg.get("candidate_window", {}) if use_candidate_store else (config.get("batch_scoring", {}).get("window", {}) or {})
-            if use_candidate_store:
+            source_cfg = config["data_ingestion"]
+            batch_source = str(batch_cfg.get("source", "mongodb" if use_candidate_store else source_cfg.get("source", "parquet"))).lower()
+            window = batch_cfg.get("window", {}) or {}
+            if batch_source == "candidate_store":
                 iterator = _iter_candidate_store_batches(
                     _resolve_repo_path(partnership_cfg.get("candidate_store_path", "data_store/candidate_draws")),
                     window=window,
                 )
+                score_mode = "candidate_store"
+            elif batch_source == "mongodb":
+                iterator = _iter_mongo_draw_groups(
+                    mongo_config=source_cfg.get("mongodb", {}) or {},
+                    window=window,
+                )
+                score_mode = "raw_rows"
             else:
-                source_cfg = config["data_ingestion"]
                 if source_cfg["source"] != "parquet":
                     raise ValueError("Partnership batch scoring currently expects a parquet source.")
                 timestamp_field = str(window.get("timestamp_field", "trans_date"))
@@ -202,15 +282,19 @@ class BatchScoringPipeline:
                     window=window,
                     timestamp_field=timestamp_field,
                 )
+                score_mode = "raw_rows"
 
             manifest_path = current_dir / str(config.get("serving", {}).get("manifest_file", "serving_manifest.json"))
             manifest = read_json(manifest_path) if manifest_path.exists() else {}
             partnership_table_path = current_dir / str(manifest.get("partnership_table_file", "partnership_table.parquet"))
             partnership_table = pd.read_parquet(partnership_table_path) if partnership_table_path.exists() else pd.DataFrame()
+            ccs_table_path = current_dir / str(manifest.get("ccs_concentration_table_file", "ccs_concentration_table.parquet"))
+            ccs_table = pd.read_parquet(ccs_table_path) if ccs_table_path.exists() else pd.DataFrame()
             scorer = DrawScorer(
                 bundle,
                 source_run_id=manifest.get("run_id") or bundle.get("source_run_id"),
                 partnership_table=partnership_table,
+                ccs_concentration_table=ccs_table,
             )
             output_path = current_dir / "live_predictions_backfill.parquet"
             writer = _ParquetDocWriter(output_path)
@@ -219,7 +303,7 @@ class BatchScoringPipeline:
             try:
                 for item in iterator:
                     try:
-                        results = scorer.score_candidate_batch(item) if use_candidate_store else [scorer.score_draw(item)]
+                        results = scorer.score_candidate_batch(item) if score_mode == "candidate_store" else [scorer.score_draw(item)]
                         pending_docs.extend(result.to_mongo_doc() for result in results)
                         draw_count += len(results)
                         if len(pending_docs) >= BATCH_SCORING_OUTPUT_BATCH_SIZE:
@@ -228,7 +312,7 @@ class BatchScoringPipeline:
                     except Exception as exc:
                         draw_id = (
                             item.get("draw_id", pd.Series(dtype=object)).iloc[0]
-                            if use_candidate_store
+                            if score_mode == "candidate_store"
                             else item.get("draw_id", pd.NA).iloc[0]
                         )
                         logger.warning("Skipping draw_id=%s during batch scoring: %s", draw_id, exc)
@@ -243,6 +327,8 @@ class BatchScoringPipeline:
                 "draws_scored": int(draw_count),
                 "output_path": str(output_path),
                 "model_version": bundle.get("model_version", "partnership_v1"),
+                "source": batch_source,
+                "window": window,
             }
             write_json(report, current_dir / "batch_scoring_report.json")
             return current_dir

@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from fraud_detection.components.ccs_features import (
+    CCS_FEATURE_COLUMNS,
+    attach_ccs_concentration_features,
+    load_relevant_profit_rows,
+)
 from fraud_detection.components.partnership_features import (
     PAIR_STAGE1_FEATURE_COLUMNS,
     SECTION_A_FEATURE_COLUMNS,
@@ -73,6 +78,11 @@ class ModelTraining:
                     pair_scored["is_strict_match"].eq(1),
                     pd.to_numeric(pair_scored["stage1_score"], errors="coerce").fillna(0.0),
                 )
+                nearmiss_values = pair_scored.get("is_nearmiss", pd.Series(0, index=pair_scored.index))
+                nearmiss_mask = pd.to_numeric(nearmiss_values, errors="coerce").fillna(0).astype(int).eq(1)
+                pair_scored.loc[nearmiss_mask, "pair_risk_score"] = pair_scored.loc[
+                    nearmiss_mask, "pair_risk_score"
+                ].clip(lower=float(self.config.partnership.get("stage1_flag_threshold", 0.70)))
                 stage1_for_stage2 = project_pair_scores_to_member_draw_rows(pair_scored, rolling_context=True)
                 gold_members = set()
                 if "label_gold" in pair_scored.columns:
@@ -104,6 +114,14 @@ class ModelTraining:
                 stage1_predictions_for_stage2["stage1_score"] = pd.to_numeric(
                     stage1_predictions_for_stage2["stage1_score"], errors="coerce"
                 ).fillna(0.0)
+                ccs_cfg = self.config.partnership.get("ccs_features", {}) or {}
+                if ccs_cfg.get("enabled", False):
+                    stage1_predictions_for_stage2 = attach_ccs_concentration_features(
+                        stage1_predictions_for_stage2,
+                        ccs_profit_path=ccs_cfg.get("profit_path", "data_store/ccs_daily_profit"),
+                        windows_days=list(ccs_cfg.get("windows_days", [1, 7])),
+                        concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
+                    )
             else:
                 gold_members = set(stage1_labeled.loc[stage1_labeled["label_gold"].eq(1), "member_id"].astype(str).str.upper())
                 stage1_predictions_for_stage2 = stage1_result.predictions
@@ -114,6 +132,18 @@ class ModelTraining:
             )
             stage2_features_path = self.config.output_dir / "stage2_features.parquet"
             stage2_features.to_parquet(stage2_features_path, index=False)
+            ccs_concentration_table_path = self.config.output_dir / "ccs_concentration_table.parquet"
+            ccs_cfg = self.config.partnership.get("ccs_features", {}) or {}
+            ccs_lookup = (
+                load_relevant_profit_rows(
+                    stage1_predictions_for_stage2,
+                    ccs_profit_path=ccs_cfg.get("profit_path", "data_store/ccs_daily_profit"),
+                    windows_days=list(ccs_cfg.get("windows_days", [1, 7])),
+                )
+                if ccs_cfg.get("enabled", False)
+                else pd.DataFrame()
+            )
+            ccs_lookup.to_parquet(ccs_concentration_table_path, index=False)
             stage2_result = train_stage2_model(
                 stage2_features,
                 feature_columns=STAGE2_FEATURE_COLUMNS,
@@ -136,6 +166,7 @@ class ModelTraining:
                 "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
                 "use_candidate_store": use_candidate_store,
                 "pair_rules": dict(self.config.partnership.get("pair_rules", {})),
+                "ccs_features": dict(self.config.partnership.get("ccs_features", {})),
                 "section_a_feature_columns": SECTION_A_FEATURE_COLUMNS,
                 "candidate_thresholds": thresholds.to_dict(),
                 "stage1_high_threshold": float(self.config.partnership.get("stage1_high_threshold", 0.5)),
@@ -158,6 +189,7 @@ class ModelTraining:
                 "fraud_members": int(stage2_features["label_gold_member"].sum()) if "label_gold_member" in stage2_features else 0,
                 "stage1_feature_columns": stage1_feature_columns,
                 "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+                "ccs_feature_columns": CCS_FEATURE_COLUMNS,
                 "stage2_alert_threshold": bundle["stage2_alert_threshold"],
                 "stage1_oof_predictions_path": str(stage1_oof_path),
                 "stage2_predictions_path": str(stage2_predictions_path),
@@ -174,6 +206,7 @@ class ModelTraining:
                 stage1_oof_predictions_path=stage1_oof_path,
                 stage2_features_path=stage2_features_path,
                 partnership_table_path=self.fe_artifact.partnership_table_path,
+                ccs_concentration_table_path=ccs_concentration_table_path,
                 stage1_feature_columns=stage1_feature_columns,
                 stage2_feature_columns=STAGE2_FEATURE_COLUMNS,
             )

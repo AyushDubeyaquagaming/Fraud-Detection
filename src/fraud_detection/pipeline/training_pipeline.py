@@ -44,8 +44,18 @@ def _resolve_repo_path(path_value: str | Path) -> Path:
 
 
 class TrainingPipeline:
-    def __init__(self, config_path: Path = CONFIG_FILE_PATH):
+    def __init__(
+        self,
+        config_path: Path = CONFIG_FILE_PATH,
+        *,
+        manage_mlflow: bool = True,
+        run_batch_scoring_on_promotion: bool = True,
+        mlflow_source: str = "training_pipeline",
+    ):
         self.config_path = config_path
+        self.manage_mlflow = manage_mlflow
+        self.run_batch_scoring_on_promotion = run_batch_scoring_on_promotion
+        self.mlflow_source = mlflow_source
 
     def run(self) -> Path:
         logger.info("TrainingPipeline: starting")
@@ -145,15 +155,27 @@ class TrainingPipeline:
         )
         import mlflow
 
-        tracking_uri = get_tracking_uri()
-        exp_id = setup_mlflow(tracking_uri, experiment_name)
-
         mlflow_active = False
+        started_mlflow_run = False
+        tracking_uri = get_tracking_uri()
         try:
-            mlflow.start_run(run_name=run_id, experiment_id=exp_id)
-            mlflow_active = True
-            mlflow.set_tag("run_id", run_id)
-            mlflow.set_tag("source", "training_pipeline")
+            if self.manage_mlflow:
+                exp_id = setup_mlflow(tracking_uri, experiment_name)
+                mlflow.start_run(run_name=run_id, experiment_id=exp_id)
+                started_mlflow_run = True
+            mlflow_active = mlflow.active_run() is not None
+            if mlflow_active:
+                if self.manage_mlflow:
+                    mlflow.set_tag("run_id", run_id)
+                else:
+                    mlflow.set_tag("training_run_id", run_id)
+                mlflow.set_tag("source", self.mlflow_source)
+                mlflow.set_tag("candidate_store_mode", str(use_candidate_store).lower())
+                window = partnership_cfg.get("candidate_window", {}) or {}
+                if window.get("start_date"):
+                    mlflow.set_tag("candidate_window_start", str(window.get("start_date")))
+                if window.get("end_date"):
+                    mlflow.set_tag("candidate_window_end", str(window.get("end_date")))
         except Exception as mle:
             logger.warning("MLflow run could not start: %s — continuing without MLflow", mle)
 
@@ -236,6 +258,10 @@ class TrainingPipeline:
             ).initiate_model_evaluation()
 
             if mlflow_active:
+                with open(eval_artifact.evaluation_report_path) as f:
+                    eval_report = json.load(f)
+                mlflow.set_tag("label_status", str(eval_report.get("label_status", "unknown")))
+                mlflow.set_tag("gate_reason", str(eval_report.get("gate_reason", "unknown")))
                 log_metrics_safe({
                     "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
                     "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,
@@ -272,11 +298,13 @@ class TrainingPipeline:
             ).initiate_model_pusher()
 
             # --- Step 8: Weekly Serving Snapshot ---
-            if pusher_artifact.promoted:
+            if pusher_artifact.promoted and self.run_batch_scoring_on_promotion:
                 logger.info("[8/8] WeeklyServingSnapshot")
                 from fraud_detection.pipeline.batch_scoring_pipeline import BatchScoringPipeline
 
                 BatchScoringPipeline(config_path=batch_scoring_config_path).run()
+            elif pusher_artifact.promoted:
+                logger.info("[8/8] WeeklyServingSnapshot skipped by caller configuration")
             else:
                 logger.info("[8/8] WeeklyServingSnapshot skipped because promotion gate did not pass")
 
@@ -284,12 +312,13 @@ class TrainingPipeline:
                 mlflow.set_tag("promoted", "true" if pusher_artifact.promoted else "false")
                 if pusher_artifact.promoted:
                     log_artifact_safe(str(pusher_artifact.model_bundle_path))
-                mlflow.end_run(status="FINISHED")
+                if started_mlflow_run:
+                    mlflow.end_run(status="FINISHED")
 
         except Exception as exc:
             tb_str = traceback.format_exc()
             logger.error("TrainingPipeline FAILED:\n%s", tb_str)
-            if mlflow_active:
+            if mlflow_active and started_mlflow_run:
                 try:
                     mlflow.end_run(status="FAILED")
                 except Exception:

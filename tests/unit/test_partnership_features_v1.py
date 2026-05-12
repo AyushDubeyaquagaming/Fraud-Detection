@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from fraud_detection.components.feature_engineering import FeatureEngineering
 from fraud_detection.components.partnership_features import (
@@ -44,6 +46,26 @@ def _raw_exact_draw() -> pd.DataFrame:
             },
         ]
     )
+
+
+def _candidate_row(draw_id: int) -> dict:
+    left = [1] * 19 + [0] * 19
+    right = [0] * 19 + [1] * 19
+    return {
+        "draw_id": draw_id,
+        "trans_date_min": pd.Timestamp("2026-04-27T00:00:00Z"),
+        "trans_date_max": pd.Timestamp("2026-04-27T00:00:01Z"),
+        "qualifying_player_count": 2,
+        "member_ids": [f"A{draw_id}", f"B{draw_id}"],
+        "ccs_ids": ["CA", "CB"],
+        "total_bet_amounts": [1900.0, 1900.0],
+        "win_points": [2500.0, 2500.0],
+        "coverage_bytes": [bytes(left), bytes(right)],
+        "amount_vector": [
+            [100.0 if value else 0.0 for value in left],
+            [100.0 if value else 0.0 for value in right],
+        ],
+    }
 
 
 def test_compute_partnership_features_detects_exact_complementary_draw():
@@ -175,3 +197,47 @@ def test_feature_engineering_streams_candidate_only_stage1_rows(tmp_path: Path):
     stage1_labeled = pd.read_parquet(artifact.stage1_labels_path)
 
     assert set(stage1_labeled["member_id"]) == {"A", "B"}
+
+
+def test_candidate_store_feature_engineering_disables_analyst_overlay_after_first_failure(tmp_path: Path, monkeypatch) -> None:
+    store = tmp_path / "candidate_draws" / "year=2026" / "month=04" / "week=18"
+    store.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist([_candidate_row(1), _candidate_row(2)]), store / "draws.parquet")
+
+    calls = {"count": 0}
+
+    def fail_read_analyst_labels_for_draws(draw_ids=None):
+        calls["count"] += 1
+        raise RuntimeError("analyst labels backend unavailable")
+
+    monkeypatch.setattr(
+        "fraud_detection.utils.mongo_predictions.read_analyst_labels_for_draws",
+        fail_read_analyst_labels_for_draws,
+    )
+
+    artifact = FeatureEngineering(
+        FeatureEngineeringConfig(
+            fraud_csv_path=tmp_path / "fraud.csv",
+            output_dir=tmp_path / "fe_candidate",
+            mode="training_eval",
+            partnership={
+                "use_candidate_store": True,
+                "candidate_store_path": str(tmp_path / "candidate_draws"),
+                "candidate_window": {"start_date": "2026-04-27", "end_date": "2026-04-28"},
+                "emit_negatives_sample": 0,
+                "stream_batch_size": 1,
+                "analyst_label_overlay": {"enabled": True},
+            },
+        ),
+        DataIngestionArtifact(
+            raw_data_path=tmp_path / "candidate_draws",
+            ingestion_report_path=tmp_path / "ingestion.json",
+            row_count=2,
+            member_count=4,
+            source_type="candidate_store",
+        ),
+    ).initiate_feature_engineering()
+
+    assert artifact.stage1_labels_path.exists()
+    assert pd.read_parquet(artifact.stage1_labels_path).shape[0] == 2
+    assert calls["count"] == 1

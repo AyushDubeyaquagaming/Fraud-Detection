@@ -72,6 +72,30 @@ def insert_analyst_label(
     notes: str | None = None,
     decided_at: datetime | None = None,
 ) -> Any:
+    inserted_id, _ = upsert_analyst_label(
+        draw_id=draw_id,
+        member_id=member_id,
+        label=label,
+        analyst_id=analyst_id,
+        model_version=model_version,
+        prediction_id=prediction_id,
+        notes=notes,
+        decided_at=decided_at,
+    )
+    return inserted_id
+
+
+def upsert_analyst_label(
+    *,
+    draw_id: int,
+    member_id: str,
+    label: str,
+    analyst_id: str,
+    model_version: str,
+    prediction_id: str | None = None,
+    notes: str | None = None,
+    decided_at: datetime | None = None,
+) -> tuple[Any, bool]:
     if label not in {"fraud", "not_fraud"}:
         raise ValueError("label must be 'fraud' or 'not_fraud'")
     doc = {
@@ -90,13 +114,14 @@ def insert_analyst_label(
         {"$set": doc},
         upsert=True,
     )
-    if result.upserted_id is not None:
-        return result.upserted_id
+    created = result.upserted_id is not None
+    if created:
+        return result.upserted_id, True
     existing = get_analyst_labels_collection().find_one(
         {"draw_id": doc["draw_id"], "member_id": doc["member_id"]},
         {"_id": 1},
     )
-    return existing["_id"] if existing else None
+    return (existing["_id"] if existing else None), False
 
 
 def read_analyst_labels_within_window(start: datetime, end: datetime) -> list[dict[str, Any]]:
@@ -105,6 +130,16 @@ def read_analyst_labels_within_window(start: datetime, end: datetime) -> list[di
         {"_id": 0},
     )
     return list(cursor)
+
+
+def read_analyst_labels_for_draws(draw_ids: list[int] | set[int] | None = None) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if draw_ids is not None:
+        scoped_draw_ids = [int(draw_id) for draw_id in draw_ids]
+        if not scoped_draw_ids:
+            return []
+        query["draw_id"] = {"$in": scoped_draw_ids}
+    return list(get_analyst_labels_collection().find(query, {"_id": 0}))
 
 
 def read_stage1_history(*, source_run_id: str | None, since: datetime, until: datetime | None = None) -> pd.DataFrame:

@@ -10,6 +10,8 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+from fraud_detection.components.ccs_features import attach_ccs_concentration_features
+from fraud_detection.components.analyst_label_overlay import apply_pair_label_overrides
 from fraud_detection.components.pair_scan import PairRuleConfig
 from fraud_detection.components.partnership_features import (
     STAGE1_FEATURE_COLUMNS,
@@ -132,6 +134,9 @@ class FeatureEngineering:
     def __init__(self, config: FeatureEngineeringConfig, ingestion_artifact: DataIngestionArtifact):
         self.config = config
         self.ingestion_artifact = ingestion_artifact
+        analyst_cfg = self.config.partnership.get("analyst_label_overlay", {}) or {}
+        self._analyst_label_overlay_enabled = bool(analyst_cfg.get("enabled", False))
+        self._analyst_label_overlay_unavailable = False
 
     def initiate_feature_engineering(self) -> FeatureEngineeringArtifact:
         logger.info("PartnershipFeatureEngineering: starting")
@@ -192,12 +197,12 @@ class FeatureEngineering:
             "stage1_labels": self.config.output_dir / "stage1_labels.parquet",
             "partnership_table": self.config.output_dir / "partnership_table.parquet",
             "pair_events": self.config.output_dir / "pair_events.parquet",
+            "ccs_concentration_table": self.config.output_dir / "ccs_concentration_table.parquet",
             "summary": self.config.output_dir / "feature_summary.json",
         }
         stage1_writer = _ParquetFrameWriter(paths["stage1_features"])
         stage1_labels_writer = _ParquetFrameWriter(paths["stage1_labels"])
         pair_events_writer = _ParquetFrameWriter(paths["pair_events"])
-        analyst_pairs = self._derived_analyst_pair_positive_keys()
         candidate_draw_rows = 0
         pair_rows = 0
         strict_pairs = 0
@@ -205,6 +210,8 @@ class FeatureEngineering:
         sampled_negative_pairs = 0
         stage1_rows = 0
         fraud_pairs = 0
+        analyst_positive_overrides = 0
+        analyst_negative_overrides = 0
         try:
             for candidate_chunk in self._iter_candidate_store_batches():
                 candidate_draw_rows += len(candidate_chunk)
@@ -216,7 +223,11 @@ class FeatureEngineering:
                     rolling_context=False,
                     random_seed=int(self.config.partnership.get("random_seed", 42)),
                 )
-                labeled_chunk = self._attach_pair_labels(pair_chunk, analyst_pairs=analyst_pairs)
+                stage1_chunk = self._attach_ccs_features(stage1_chunk)
+                analyst_labels = self._read_analyst_labels(
+                    draw_ids=pair_chunk.get("draw_id", pd.Series(dtype=object)).dropna().tolist()
+                )
+                labeled_chunk = self._attach_pair_labels(pair_chunk, analyst_labels=analyst_labels)
                 stage1_writer.write(stage1_chunk)
                 stage1_labels_writer.write(labeled_chunk)
                 pair_events_writer.write(pair_chunk)
@@ -226,6 +237,8 @@ class FeatureEngineering:
                 sampled_negative_pairs += int(pd.to_numeric(labeled_chunk.get("sampled_negative"), errors="coerce").fillna(0).sum())
                 stage1_rows += int(len(stage1_chunk))
                 fraud_pairs += int(pd.to_numeric(labeled_chunk.get("label_gold"), errors="coerce").fillna(0).sum())
+                analyst_positive_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("derived_pair_analyst").sum())
+                analyst_negative_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("analyst_not_fraud_pair").sum())
         finally:
             stage1_writer.close()
             stage1_labels_writer.close()
@@ -237,6 +250,8 @@ class FeatureEngineering:
             save_parquet(pd.DataFrame(), paths["stage1_labels"])
         if not paths["pair_events"].exists():
             save_parquet(pd.DataFrame(), paths["pair_events"])
+        if not paths["ccs_concentration_table"].exists():
+            save_parquet(pd.DataFrame(), paths["ccs_concentration_table"])
         save_parquet(pd.DataFrame(), paths["partnership_table"])
 
         summary = {
@@ -249,6 +264,8 @@ class FeatureEngineering:
             "sampled_negative_pairs": int(sampled_negative_pairs),
             "stage1_rows": int(stage1_rows),
             "fraud_pairs": int(fraud_pairs),
+            "analyst_positive_pair_overrides": int(analyst_positive_overrides),
+            "analyst_negative_pair_overrides": int(analyst_negative_overrides),
             "feature_columns": STAGE1_FEATURE_COLUMNS,
             "approach": "partnership_v1_candidate_store",
         }
@@ -265,6 +282,18 @@ class FeatureEngineering:
             stage1_labels_path=paths["stage1_labels"],
             partnership_table_path=paths["partnership_table"],
             pair_events_path=paths["pair_events"],
+            ccs_concentration_table_path=paths["ccs_concentration_table"],
+        )
+
+    def _attach_ccs_features(self, stage1_chunk: pd.DataFrame) -> pd.DataFrame:
+        ccs_cfg = self.config.partnership.get("ccs_features", {}) or {}
+        if not ccs_cfg.get("enabled", False):
+            return stage1_chunk
+        return attach_ccs_concentration_features(
+            stage1_chunk,
+            ccs_profit_path=ccs_cfg.get("profit_path", "data_store/ccs_daily_profit"),
+            windows_days=list(ccs_cfg.get("windows_days", [1, 7])),
+            concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
         )
 
     def _iter_candidate_store_batches(self):
@@ -308,7 +337,7 @@ class FeatureEngineering:
         self,
         pair_df: pd.DataFrame,
         *,
-        analyst_pairs: set[tuple[int, frozenset[str]]] | None = None,
+        analyst_labels: list[dict[str, Any]] | pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         labeled = pair_df.copy()
         labeled["label_stage1"] = pd.to_numeric(labeled.get("is_strict_match", 0), errors="coerce").fillna(0).astype(int)
@@ -317,46 +346,27 @@ class FeatureEngineering:
         labeled["sample_weight"] = 1.0
         labeled.loc[labeled["is_nearmiss"].eq(1), "label_source"] = "nearmiss_negative"
         labeled.loc[labeled["sampled_negative"].eq(1), "label_source"] = "sampled_negative"
-        analyst_pairs = self._derived_analyst_pair_positive_keys() if analyst_pairs is None else analyst_pairs
-        if analyst_pairs:
-            keys = list(
-                zip(
-                    pd.to_numeric(labeled["draw_id"], errors="coerce").astype("Int64"),
-                    labeled["member_a"].astype(str).str.upper(),
-                    labeled["member_b"].astype(str).str.upper(),
-                )
+        if analyst_labels is None:
+            analyst_labels = self._read_analyst_labels(
+                draw_ids=labeled.get("draw_id", pd.Series(dtype=object)).dropna().tolist()
             )
-            for idx, (draw_id, member_a, member_b) in zip(labeled.index, keys):
-                if (draw_id, frozenset([member_a, member_b])) in analyst_pairs:
-                    labeled.at[idx, "label_stage1"] = 1
-                    labeled.at[idx, "label_gold"] = 1
-                    labeled.at[idx, "label_source"] = "derived_pair_analyst"
+        labeled, _ = apply_pair_label_overrides(labeled, analyst_labels)
         return labeled
 
-    def _derived_analyst_pair_positive_keys(self) -> set[tuple[int, frozenset[str]]]:
+    def _read_analyst_labels(self, draw_ids: list[int] | None = None) -> list[dict[str, Any]]:
+        if not self._analyst_label_overlay_enabled or self._analyst_label_overlay_unavailable:
+            return []
         try:
-            from fraud_detection.utils.mongo_predictions import get_analyst_labels_collection
+            from fraud_detection.utils.mongo_predictions import read_analyst_labels_for_draws
 
-            docs = list(get_analyst_labels_collection().find({"label": "fraud"}, {"_id": 0, "draw_id": 1, "member_id": 1}))
+            return read_analyst_labels_for_draws(draw_ids=draw_ids)
         except Exception as exc:
-            logger.info("Analyst labels unavailable during candidate pair labeling: %s", exc)
-            return set()
-        if not docs:
-            return set()
-        frame = pd.DataFrame(docs)
-        if not {"draw_id", "member_id"}.issubset(frame.columns):
-            return set()
-        frame["draw_id"] = pd.to_numeric(frame["draw_id"], errors="coerce").astype("Int64")
-        frame["member_id"] = frame["member_id"].astype(str).str.strip().str.upper()
-        result: set[tuple[int, frozenset[str]]] = set()
-        for draw_id, group in frame.dropna(subset=["draw_id"]).groupby("draw_id"):
-            members = sorted(set(group["member_id"]))
-            if len(members) < 2:
-                continue
-            for left_idx, left in enumerate(members):
-                for right in members[left_idx + 1 :]:
-                    result.add((int(draw_id), frozenset([left, right])))
-        return result
+            self._analyst_label_overlay_unavailable = True
+            logger.warning(
+                "Analyst labels unavailable during candidate pair labeling; proceeding without analyst label overlay for the rest of this feature engineering run: %s",
+                exc,
+            )
+            return []
 
     def _build_stage1_base_from_parquet(
         self,

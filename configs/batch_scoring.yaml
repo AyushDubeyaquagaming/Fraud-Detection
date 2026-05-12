@@ -20,6 +20,7 @@ data_validation:
   fraud_csv_path: "ROULET CHEATING DATA.csv"
 
 batch_scoring:
+  source: "mongodb"
   mode: "operational"
   require_labels: false
   window:
@@ -38,11 +39,21 @@ partnership:
     strict_min_ratio_similarity: 0.80
     strict_min_pair_net_per_stake: -0.10
     nearmiss_min_union: 36
-    nearmiss_max_overlap: 2
+    nearmiss_max_overlap: 3
     nearmiss_min_ratio_similarity: 0.70
-    nearmiss_min_pair_net_per_stake: -0.10
+    nearmiss_min_pair_net_per_stake: -0.15
+    nearmiss_require_different_ccs: true
     min_total_bet_amount: 1000.0
     stage1_flag_threshold: 0.70
+  ccs_features:
+    enabled: true
+    profit_path: "data_store/ccs_daily_profit"
+    windows_days: [1, 7]
+    concentration_threshold: 0.70
+  analyst_label_overlay:
+    enabled: true
+    require_both_members_for_pair_override: true
+    conflict_policy: "no_override"
 
 partnership_scoring:
   stage2_alert_threshold: 0.65

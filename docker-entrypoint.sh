@@ -2,6 +2,10 @@
 set -e
 
 case "$1" in
+  full-cycle)
+    shift
+    exec python scripts/run_full_cycle.py "$@"
+    ;;
   train)
     shift
     exec python scripts/run_training.py "$@"
