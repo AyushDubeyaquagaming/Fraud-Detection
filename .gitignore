@@ -11,6 +11,8 @@ __pycache__/
 *$py.class
 fraud-data-no-cheat.csv
 bounded_ingestion_plan.md
+phase_b_plan.md
+PHASE_B_VALIDATION_RUNBOOK.txt
 fraud_no_cheat_modeling_plan.md
 profile_no_cheat_dataset.py
 fraud_no_cheat_eda_and_baseline.ipynb
@@ -18,16 +20,37 @@ analysis_readme.md
 hybrid_detection_plan.md
 hybrid_detection_plan_v2.md
 ARCHITECTURE_GUIDE.md
+CONTEXT_COPILOT.MD
+CANDIDATE_DRAWS_STORE.md
+PHASE_3_FINAL_REVIEW_SUMMARY.txt
+IMPLEMENTATION_EXECUTION_PLAN.md
 DEMO_RUNBOOK_2026_04_27.txt
+PHASE_3_PLAN.md
+Phase B Refactor — Partnership Collusion Engine + Live Inference + Feedback Loop.md
 artifacts/
 live_scoring_plan.md
+PARTNERSHIP_LOCAL_TEST_COMMANDS.txt
+DEPLOYMENT_REVIEW_FINDINGS_2026_05_12.md
 DEPLOYMENT.md
 live_scoring_handoff_notes.txt
 live_scoring_developer_checklist.txt
 LIVE_SCORING_FIXES_SUMMARY.txt
 fastapi_serving_plan.md
 developer_validation_guide.txt
+PARTNERSHIP_EXPLORATION_PLAN.md
+PHASE_A_PARTNERSHIP_MODELING_PLAN.md
 MLOPS_AUDIT_2026_04_27.txt
+GPT55_ALERT_SURFACE_FOLLOWUP_PLAN.md
+#scripts
+
+C:\Users\PC\Documents\Fraud Detection\scripts\bootstrap_rolling_store.py
+C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_feature_separation.py
+C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_fraud_label_matching.py
+C:\Users\PC\Documents\Fraud Detection\scripts\inspect_bet_schema.py
+C:\Users\PC\Documents\Fraud Detection\scripts\inspect_collusion_patterns.py
+C:\Users\PC\Documents\Fraud Detection\scripts\validate_fraud_ids.py
+
+
 # C extensions
 *.so
 
@@ -241,6 +264,7 @@ fraud_notebook_plan.md
 notebook/.ipynb_checkpoints/
 data_cache/
 notebook/data_cache/
+data_store/
 *.parquet
 
 # Generated audit / diagnostic outputs
@@ -266,3 +290,12 @@ artifacts/current/
 logs/
 mlruns/
 mlops_implementation_plan.md
+
+# Local planning / handoff files
+CANDIDATE_EXTRACTION_PLAN.md
+PHASE1_CANDIDATE_EXTRACTION_SUMMARY.txt
+PHASE2_DEVELOPER_VERIFICATION_COMMANDS.txt
+PHASE_2_INTEGRATION_PLAN.md
+configs/config.local_training.yaml
+configs/batch_scoring.local_smoke.yaml
+notebook/04_partnership_collusion_exploration.ipynb

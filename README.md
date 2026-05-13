@@ -1,226 +1,143 @@
-# BetBlitz Fraud Detection — MLOps Pipeline
+# BetBlitz Fraud Detection - MLOps Pipeline
 
-Roulette fraud detection system using a hybrid unsupervised + supervised approach.
-Source of truth: `notebook/03_hybrid_detection.ipynb`.
+Roulette partnership collusion detection system built around the candidate-draw store, Stage 1 pair scoring, Stage 2 member scoring, CCS profit context, and analyst feedback labels.
 
 ## Quick Start
 
-```bash
+```powershell
 # Install dependencies
 pip install -e .
 
 # Start local MLflow UI
-mlflow ui --backend-store-uri ./mlruns
+mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db
 
-# Run full training pipeline
-python scripts/run_training.py
+# Run the full candidate-store cycle
+python scripts/run_full_cycle.py --config configs/config.yaml
 
-# Run batch scoring (requires promoted model bundle)
-python scripts/run_batch_scoring.py
+# Run training only when upstream parquet stores already exist
+python scripts/run_training.py --config configs/config.yaml
 
-# Audit artifacts/current/
-python scripts/audit_artifacts.py
+# Run batch scoring from promoted artifacts
+python scripts/run_batch_scoring.py --config configs/batch_scoring.yaml
 
 # Run tests
 pytest tests/
 ```
 
+## Operational Path
+
+The supported production path is candidate-store based:
+
+1. Extract candidate roulette draws from MongoDB into `data_store/candidate_draws`.
+2. Refresh daily CCS-member profit into `data_store/ccs_daily_profit`.
+3. Train from those parquet stores.
+4. Promote the latest successfully trained model bundle.
+5. Run batch scoring after promotion.
+
+Analyst labels are optional feedback. Missing labels are logged as unavailable and do not block training or promotion.
+
 ## Project Structure
 
-```
-src/fraud_detection/          # installable package
-  components/                 # data ingestion, validation, feature engineering,
-                              # model training, evaluation, pusher, monitoring
-  pipeline/                   # training_pipeline.py, batch_scoring_pipeline.py
-  entity/                     # config_entity.py, artifact_entity.py
+```text
+src/fraud_detection/
+  components/                 # feature engineering, training, evaluation, pusher, monitoring
+  extraction/                 # candidate draw and CCS profit builders
+  pipeline/                   # training and batch scoring pipelines
+  serving/                    # FastAPI app, schemas, scoring routes
   utils/                      # common.py, mlflow_utils.py, mongodb.py
-  constants/                  # constants.py
-  logger.py / exception.py
 
 configs/
-  config.yaml                 # main pipeline config (edit source/paths here)
-  model_params.yaml           # model hyperparameters (locked — do not change)
+  config.yaml                 # main full-cycle/training config
+  candidate_extraction.yaml   # Mongo -> candidate draw parquet config
+  ccs_profit.yaml             # Mongo -> daily CCS profit parquet config
+  batch_scoring.yaml          # promoted-artifact batch scoring config
   schema.yaml                 # data schema
 
 scripts/
-  run_training.py             # full train → evaluate → monitor → promote
-  run_batch_scoring.py        # score fresh cohort from promoted bundle
-  audit_artifacts.py          # verify artifacts/current/ is consistent
-  cleanup_old_runs.py         # artifact retention utility
+  run_full_cycle.py           # candidate refresh -> CCS refresh -> train -> promote -> batch score
+  extract_candidate_draws.py  # component-level candidate parquet refresh
+  build_ccs_profit.py         # component-level CCS profit refresh
+  run_training.py             # training-only wrapper
+  run_batch_scoring.py        # batch scoring wrapper
 
 orchestration/
-  flows/training_flow.py      # Prefect-compatible training wrapper
+  flows/full_cycle_flow.py    # Prefect-compatible full-cycle wrapper
+  flows/training_flow.py      # Prefect-compatible training-only wrapper
   flows/batch_scoring_flow.py # Prefect-compatible scoring wrapper
-  notifications.py            # Optional Slack alerts
-  prefect.yaml                # Deployment spec for Prefect Cloud
-
-artifacts/
-  runs/run_YYYYMMDD_HHMMSS/   # per-run outputs (gitignored)
-    monitoring/               # Evidently drift reports + drift_summary.json
-  current/                    # promoted production bundle (gitignored)
-    model_bundle.joblib
-    hybrid_scored_players.parquet
-    alert_queue.csv
-    hybrid_evaluation.json
-    promotion_metadata.json
-
-tests/
-  unit/                       # fast unit tests (includes test_monitoring.py)
-  integration/                # end-to-end pipeline test (requires data_cache/)
+  prefect.yaml                # self-hosted Prefect deployment spec
 ```
 
 ## Configuration
 
-All tunable parameters live in `configs/`. Secrets go in `.env` (see `.env.example`).
-
-The default training source is live MongoDB. A standard training run pulls a bounded cohort from MongoDB,
-writes the raw pull into the run's ingestion artifact directory, validates it, and then continues through the
-rest of the pipeline. The parquet path remains available for controlled replays and local debugging.
+Secrets go in `.env`; tunable settings live in `configs/`.
 
 | File | Purpose |
 |---|---|
-| `configs/config.yaml` | Pipeline settings, live data source, MLflow |
-| `configs/model_params.yaml` | **Locked** model hyperparameters |
-| `.env` | MongoDB URI, MLflow tracking URI |
+| `configs/config.yaml` | Full-cycle/training settings, candidate window, MLflow |
+| `configs/candidate_extraction.yaml` | Candidate draw extraction from MongoDB |
+| `configs/ccs_profit.yaml` | Daily CCS profit extraction from MongoDB |
+| `configs/batch_scoring.yaml` | Batch scoring from `artifacts/current` |
+| `.env` | MongoDB URI, MLflow tracking URI, collection names |
 
-## Model Parameters (locked per spec)
-
-- IsolationForest: n_estimators=300, contamination=0.05, random_state=42
-- KMeans: n_clusters=4, n_init=10, random_state=42
-- LogisticRegression: C=0.1, class_weight="balanced", max_iter=2000
-- Anomaly weight=0.60, Supervised weight=0.40
+Candidate extraction resumes/skips existing partitions by default. CCS profit refresh skips existing days by default and rebuilds only when `--force-ccs` is used through the full-cycle command or `--force` is used on the component script.
 
 ## Outputs
 
-After a successful `run_training.py`:
+After a successful full-cycle run:
 
-- `artifacts/current/model_bundle.joblib` — all models + scalers + metadata
-- `artifacts/current/hybrid_scored_players.parquet` — scored cohort
-- `artifacts/current/alert_queue.csv` — top 50 players by risk score
-- `artifacts/current/hybrid_evaluation.json` — capture rates, tier distribution
-- `artifacts/runs/run_*/model_evaluation/plots/feature_importance.png` — supervised model importance
-- `artifacts/runs/run_*/model_evaluation/plots/confusion_matrix.png` — out-of-sample confusion matrix
-- `artifacts/runs/run_*/model_evaluation/plots/correlation_heatmap.png` — top-feature correlation map
+- `artifacts/full_cycle_runs/<full_cycle_id>/candidate_extraction_summary.json`
+- `artifacts/full_cycle_runs/<full_cycle_id>/ccs_profit_summary.json`
+- `artifacts/full_cycle_runs/<full_cycle_id>/full_cycle_summary.json`
+- `artifacts/runs/<run_id>/` training, evaluation, monitoring, and metadata outputs
+- `artifacts/current/` promoted serving bundle and batch scoring outputs
 
-These plots are also logged as MLflow artifacts for each run.
+Full-cycle runs log candidate extraction, CCS refresh, training, evaluation, monitoring, promotion, and batch scoring artifacts into one top-level MLflow run.
 
-## Streamlit Demo
+## Serving and Streamlit
 
-```bash
-streamlit run streamlit_hybrid_demo.py
+```powershell
+python scripts/run_api.py --config configs/config.yaml --host 127.0.0.1 --port 8000
+$env:FRAUD_API_BASE_URL='http://127.0.0.1:8000'
+streamlit run streamlit_partnership_demo.py
 ```
 
-The demo automatically reads from `artifacts/current/` if present,
-falling back to `data_cache/` for legacy compatibility.
-
-Use `Internal validation mode` when replay-eval artifacts are available. With purely operational artifacts,
-the demo still loads and shows behaviour space plus peer lookup, but label-only fields are hidden.
-
-## Cohort Scope
-
-> Scores are relative to the analysis cohort (~1,045 players), not the full BetBlitz platform.
+The API serves promoted artifacts from `artifacts/current`. Streamlit calls the API for draw, member, alert, and CCS review surfaces.
 
 ## Monitoring
 
-After each training run, Evidently drift reports are written to `artifacts/runs/<run_id>/monitoring/`:
+After each training run, Evidently drift reports are written under `artifacts/runs/<run_id>/monitoring/` when enabled. Monitoring is advisory and does not block promotion.
 
-| File | What it shows |
-|---|---|
-| `data_drift.html` | Raw data drift vs previous promoted run |
-| `feature_drift.html` | Feature drift for 8 key signal columns |
-| `prediction_drift.html` | Score distribution drift |
-| `drift_summary.json` | Machine-readable summary with threshold status |
+## Orchestration
 
-Reports are advisory only — they never block promotion. The first run after a fresh clone
-will log a skip (no reference run exists yet). After a successful promotion and a second run,
-full reports are generated.
-
-## Docker
-
-### Build
+The flows can run as plain Python scripts without a Prefect server:
 
 ```powershell
-docker build -t fraud-detection:local .
+python orchestration/flows/full_cycle_flow.py --config configs/config.yaml
+python orchestration/flows/training_flow.py --config configs/config.yaml
+python orchestration/flows/batch_scoring_flow.py --config configs/batch_scoring.yaml
 ```
 
-### Run training
-
-```powershell
-docker run --rm `
-  --env-file .env `
-  -v "${PWD}/artifacts:/app/artifacts" `
-  -v "${PWD}/logs:/app/logs" `
-  -v "${PWD}/mlruns:/app/mlruns" `
-  -v "${PWD}/data_cache:/app/data_cache" `
-  -v "${PWD}/configs:/app/configs:ro" `
-  fraud-detection:local train
-```
-
-### Run batch scoring
-
-```powershell
-docker run --rm `
-  --env-file .env `
-  -v "${PWD}/artifacts:/app/artifacts" `
-  -v "${PWD}/logs:/app/logs" `
-  -v "${PWD}/mlruns:/app/mlruns" `
-  -v "${PWD}/configs:/app/configs:ro" `
-  fraud-detection:local score
-```
-
-### Start MLflow UI (local tracking only)
-
-```powershell
-docker compose up -d mlflow-ui
-# Open http://localhost:5000
-```
-
-### Available container commands
-
-| Command | What it runs |
-|---|---|
-| `train` | `python scripts/run_training.py` |
-| `score` | `python scripts/run_batch_scoring.py` |
-| `audit` | `python scripts/audit_artifacts.py` |
-| `test` | `pytest tests/` |
-| `shell` | Interactive shell in the container |
-| `worker` | Prefect worker (Phase 3) |
-
-## Artifact Retention
-
-Remove old run directories while protecting `artifacts/current/`:
-
-```powershell
-# Dry run — see what would be deleted
-python scripts/cleanup_old_runs.py --keep 5
-
-# Actually delete
-python scripts/cleanup_old_runs.py --keep 5 --execute
-```
-
-## Orchestration (Optional — Phase 3)
-
-The training and scoring flows work as plain Python scripts with or without Prefect installed:
-
-```powershell
-python orchestration/flows/training_flow.py
-python orchestration/flows/batch_scoring_flow.py
-```
-
-To use Prefect Cloud:
+For scheduled runs, use the self-hosted Prefect deployment in `orchestration/prefect.yaml`:
 
 ```powershell
 pip install "prefect>=2.20.0,<3.0.0"
-prefect cloud login
 prefect work-pool create fraud-pool --type process
 prefect deploy --prefect-file orchestration/prefect.yaml
 prefect worker start --pool fraud-pool
 ```
 
-Set `SLACK_WEBHOOK_URL` in `.env` to receive failure notifications.
+`full-cycle-weekly` is the scheduled production path. `training-weekly` is retained as a disabled training-only component deployment.
 
-See `DEPLOYMENT.md` for the full handoff guide.
+## Artifact Retention
 
-## What's NOT in this version
+```powershell
+# Dry run
+python scripts/cleanup_old_runs.py --keep 5
 
-FastAPI service, Kubernetes, Prometheus/Grafana, CI/CD, DVC, self-hosted Prefect server.
+# Execute cleanup
+python scripts/cleanup_old_runs.py --keep 5 --execute
+```
+
+## Out of Scope
+
+Polars migration, DuckDB integration, model redesign, Kubernetes, Prometheus/Grafana, CI/CD, and DVC are not part of this implementation pass.

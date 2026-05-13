@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from fraud_detection.entity.artifact_entity import (
     DataIngestionArtifact,
     FeatureEngineeringArtifact,
     ModelEvaluationArtifact,
+    ModelTrainingArtifact,
     MonitoringArtifact,
 )
 from fraud_detection.entity.config_entity import MonitoringConfig
@@ -20,7 +22,7 @@ from fraud_detection.utils.common import ensure_dir, write_json
 
 logger = get_logger(__name__)
 
-_SCORE_COL = "hybrid_score"
+_SCORE_COL = "stage2_score"
 # Oversampling factor — read this many times sample_size rows from random row
 # groups, then sample down. 3x balances memory bound vs. label-stratification
 # headroom (positives are rare; need slack to find them).
@@ -91,6 +93,8 @@ def _sample_parquet_bounded(
     if not path.exists():
         return None
     try:
+        if path.is_dir():
+            return _sample_parquet_dataset_bounded(path, n, label_col, oversample)
         pf = pq.ParquetFile(str(path))
         total_rows = pf.metadata.num_rows
         num_rg = pf.num_row_groups
@@ -116,6 +120,30 @@ def _sample_parquet_bounded(
     except Exception as exc:
         logger.warning("Monitoring: bounded parquet sample failed for %s: %s", path, exc)
         return None
+
+
+def _sample_parquet_dataset_bounded(
+    path: Path,
+    n: int,
+    label_col: str | None = None,
+    oversample: float = _PARQUET_OVERSAMPLE_FACTOR,
+) -> pd.DataFrame | None:
+    dataset = ds.dataset(path, format="parquet", partitioning="hive")
+    target_rows = max(n, int(n * oversample))
+    chunks: list[pd.DataFrame] = []
+    rows_seen = 0
+    scanner = dataset.scanner(batch_size=min(max(target_rows, 1), 50_000))
+    for batch in scanner.to_batches():
+        chunk = batch.to_pandas()
+        if chunk.empty:
+            continue
+        chunks.append(chunk)
+        rows_seen += len(chunk)
+        if rows_seen >= target_rows:
+            break
+    if not chunks:
+        return None
+    return _sample(pd.concat(chunks, ignore_index=True), n, label_col)
 
 
 def _run_report(ref: pd.DataFrame, cur: pd.DataFrame, out_path: Path, label: str) -> dict[str, Any]:
@@ -155,6 +183,19 @@ def _run_report(ref: pd.DataFrame, cur: pd.DataFrame, out_path: Path, label: str
     }
 
 
+def _shared_nonempty_numeric_columns(ref: pd.DataFrame, cur: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for col in cur.columns:
+        if col not in ref.columns or col.startswith("_"):
+            continue
+        if cur[col].dtype.kind not in "iuf" or ref[col].dtype.kind not in "iuf":
+            continue
+        if cur[col].dropna().empty or ref[col].dropna().empty:
+            continue
+        columns.append(col)
+    return columns
+
+
 class Monitoring:
     def __init__(
         self,
@@ -162,6 +203,7 @@ class Monitoring:
         current_dir: Path,
         ingestion_artifact: DataIngestionArtifact,
         fe_artifact: FeatureEngineeringArtifact,
+        training_artifact: ModelTrainingArtifact,
         eval_artifact: ModelEvaluationArtifact,
         run_dir: Path,
     ):
@@ -169,8 +211,32 @@ class Monitoring:
         self.current_dir = current_dir
         self.ingestion_artifact = ingestion_artifact
         self.fe_artifact = fe_artifact
+        self.training_artifact = training_artifact
         self.eval_artifact = eval_artifact
         self.run_dir = run_dir
+
+    def _resolve_current_feature_path(self) -> Path | None:
+        candidates = [
+            self.training_artifact.stage2_features_path,
+            self.fe_artifact.stage2_features_path,
+            self.fe_artifact.player_features_path,
+        ]
+        for path in candidates:
+            if path is not None and Path(path).exists():
+                return Path(path)
+        return None
+
+    @staticmethod
+    def _resolve_reference_feature_path(ref_run_dir: Path) -> Path | None:
+        candidates = [
+            ref_run_dir / "model_training" / "stage2_features.parquet",
+            ref_run_dir / "feature_engineering" / "stage2_features.parquet",
+            ref_run_dir / "feature_engineering" / "player_features.parquet",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
 
     def initiate_monitoring(self) -> MonitoringArtifact:
         if not self.config.enabled:
@@ -224,7 +290,7 @@ class Monitoring:
         cur_raw = _sample_parquet_bounded(cur_raw_path, n)
         ref_raw = _sample_parquet_bounded(ref_raw_path, n)
         if cur_raw is not None and ref_raw is not None:
-            shared_cols = [c for c in cur_raw.columns if c in ref_raw.columns and cur_raw[c].dtype.kind in "iuf"]
+            shared_cols = _shared_nonempty_numeric_columns(ref_raw, cur_raw)
             if shared_cols:
                 summary = _run_report(ref_raw[shared_cols], cur_raw[shared_cols], data_report_path, "data_drift")
                 summaries.append(summary)
@@ -239,11 +305,11 @@ class Monitoring:
         del cur_raw, ref_raw  # release before next stage
 
         # --- Feature drift ---
-        cur_feat_path = self.fe_artifact.player_features_path
-        ref_feat_path = ref_run_dir / "feature_engineering" / "player_features.parquet"
+        cur_feat_path = self._resolve_current_feature_path()
+        ref_feat_path = self._resolve_reference_feature_path(ref_run_dir)
 
-        cur_feat = _sample_parquet_bounded(cur_feat_path, n, "event_fraud_flag")
-        ref_feat = _sample_parquet_bounded(ref_feat_path, n, "event_fraud_flag")
+        cur_feat = _sample_parquet_bounded(cur_feat_path, n, "event_fraud_flag") if cur_feat_path else None
+        ref_feat = _sample_parquet_bounded(ref_feat_path, n, "event_fraud_flag") if ref_feat_path else None
         if cur_feat is not None and ref_feat is not None:
             feat_cols = [c for c in monitored if c in cur_feat.columns and c in ref_feat.columns]
             if feat_cols:
@@ -253,12 +319,16 @@ class Monitoring:
             else:
                 logger.warning("Monitoring: no monitored feature columns found — skipping feature report")
         else:
-            logger.warning("Monitoring: feature sampling failed — skipping feature drift")
+            logger.warning(
+                "Monitoring: feature sampling failed (cur=%s ref=%s) — skipping feature drift",
+                cur_feat_path,
+                ref_feat_path,
+            )
         del cur_feat, ref_feat
 
         # --- Prediction drift ---
-        cur_pred_path = self.eval_artifact.scored_players_path
-        ref_pred_path = ref_run_dir / "model_evaluation" / "scored_players.parquet"
+        cur_pred_path = self.eval_artifact.stage2_holdout_predictions_path
+        ref_pred_path = ref_run_dir / "model_evaluation" / "stage2_holdout_predictions.parquet"
 
         cur_pred = _sample_parquet_bounded(cur_pred_path, n)
         ref_pred = _sample_parquet_bounded(ref_pred_path, n)
@@ -273,7 +343,7 @@ class Monitoring:
             else:
                 logger.warning("Monitoring: no score columns found — skipping prediction drift")
         else:
-            logger.warning("Monitoring: scored_players sampling failed — skipping prediction drift")
+            logger.warning("Monitoring: Stage 2 prediction sampling failed — skipping prediction drift")
         del cur_pred, ref_pred
 
         if not summaries:

@@ -8,22 +8,13 @@ from typing import Any
 
 import pandas as pd
 
-from fraud_detection.constants.constants import (
-    HYBRID_EVALUATION_FILE,
-    HYBRID_SCORED_PLAYERS_FILE,
-    PROMOTION_METADATA_FILE,
-    REPO_ROOT,
-    RUN_METADATA_FILE,
-    WEEKLY_SCORING_MANIFEST_FILE,
-)
-from fraud_detection.utils.common import load_joblib, load_parquet, read_json
-
-from .live_scoring.parquet_metadata import read_training_parquet_bounds
+from fraud_detection.constants.constants import MODEL_BUNDLE_FILE, PROMOTION_METADATA_FILE, REPO_ROOT, RUN_METADATA_FILE
+from fraud_detection.utils.common import load_joblib, read_json
 
 
 @dataclass(frozen=True)
 class ArtifactBundle:
-    scored_players_df: pd.DataFrame
+    stage2_holdout_predictions_df: pd.DataFrame
     serving_manifest: dict[str, Any]
     snapshot_metadata: dict[str, Any]
     promotion_metadata: dict[str, Any]
@@ -36,8 +27,9 @@ class ArtifactBundle:
     promoted_at: str | None
     evaluated_at: str | None
     model_version: str
-    # Live scoring extras — None when unavailable (API starts degraded for live endpoints)
     model_bundle: dict[str, Any] | None = None
+    partnership_table_df: pd.DataFrame | None = None
+    ccs_concentration_table_df: pd.DataFrame | None = None
     training_raw_parquet_path: Path | None = None
     training_parquet_start_date: datetime | None = None
     training_parquet_end_date: datetime | None = None
@@ -54,13 +46,7 @@ class ArtifactProvider(ABC):
 
 
 class LocalDiskArtifactProvider(ArtifactProvider):
-    def __init__(
-        self,
-        current_dir: Path,
-        manifest_file: str = "serving_manifest.json",
-        default_model_version: str = "hybrid_v1",
-        repo_root: Path = REPO_ROOT,
-    ):
+    def __init__(self, current_dir: Path, manifest_file: str = "serving_manifest.json", default_model_version: str = "partnership_v1", repo_root: Path = REPO_ROOT):
         self.current_dir = Path(current_dir)
         self.repo_root = Path(repo_root)
         self.default_model_version = default_model_version
@@ -72,93 +58,41 @@ class LocalDiskArtifactProvider(ArtifactProvider):
     def load(self) -> ArtifactBundle:
         if not self.is_available():
             raise FileNotFoundError(f"Serving manifest not found at {self.manifest_path}")
-
         manifest = read_json(self.manifest_path)
         run_dir = Path(manifest["run_dir"])
-        snapshot_manifest_path = self.current_dir / WEEKLY_SCORING_MANIFEST_FILE
-        snapshot_metadata = read_json(snapshot_manifest_path) if snapshot_manifest_path.exists() else {}
-        snapshot_scored_path = self.current_dir / snapshot_metadata.get("scored_players_file", HYBRID_SCORED_PLAYERS_FILE)
-        snapshot_eval_path = self.current_dir / snapshot_metadata.get("evaluation_file", HYBRID_EVALUATION_FILE)
-        snapshot_available = bool(snapshot_metadata) and snapshot_scored_path.exists() and snapshot_eval_path.exists()
-
-        if not snapshot_metadata:
-            snapshot_reason = "Weekly serving snapshot has not been generated yet."
-        elif not snapshot_available:
-            snapshot_reason = "Weekly serving snapshot artifacts are incomplete."
-        else:
-            snapshot_reason = None
-
-        run_meta_path = run_dir / RUN_METADATA_FILE
-        promotion_meta_path = self.current_dir / PROMOTION_METADATA_FILE
-
-        run_metadata = read_json(run_meta_path)
-        promotion_metadata = read_json(promotion_meta_path) if promotion_meta_path.exists() else {}
-
-        if snapshot_available:
-            df = load_parquet(snapshot_scored_path)
-            df["member_id"] = df["member_id"].astype(str).str.strip().str.upper()
-            df = df.set_index("member_id", drop=False)
-            evaluation_metadata = read_json(snapshot_eval_path)
-        else:
-            df = pd.DataFrame(columns=["member_id"]).set_index("member_id", drop=False)
-            evaluation_metadata = {
-                "scored_at": None,
-                "total_players": 0,
-                "risk_tier_distribution": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
-                "anomaly_weight": 0.6,
-                "supervised_weight": 0.4,
-                "snapshot_status": "insufficient_data",
-                "snapshot_reason": snapshot_reason,
-            }
-
-        snapshot_metadata = {
-            **snapshot_metadata,
-            "snapshot_available": snapshot_available,
-            "snapshot_status": "ready" if snapshot_available else "insufficient_data",
-            "snapshot_reason": snapshot_reason,
-        }
-
-        # Load model bundle for live scoring endpoints.
-        model_bundle: dict[str, Any] | None = None
-        bundle_path = self.current_dir / "model_bundle.joblib"
-        if bundle_path.exists():
-            try:
-                model_bundle = load_joblib(bundle_path)
-            except Exception:
-                model_bundle = None
-
-        # Resolve canonical raw parquet from the promoted run directory.
-        # Bounds are read from row-group metadata (no full-file load) to keep
-        # API startup memory-safe even when the training parquet is multi-GB.
-        training_raw_parquet_path: Path | None = None
-        training_parquet_start_date: datetime | None = None
-        training_parquet_end_date: datetime | None = None
-        _candidate = run_dir / "data_ingestion" / "raw_data.parquet"
-        if _candidate.exists():
-            training_raw_parquet_path = _candidate
-            training_parquet_start_date, training_parquet_end_date = (
-                read_training_parquet_bounds(_candidate)
-            )
-
+        promotion_metadata = read_json(self.current_dir / PROMOTION_METADATA_FILE) if (self.current_dir / PROMOTION_METADATA_FILE).exists() else {}
+        run_metadata = read_json(run_dir / RUN_METADATA_FILE) if (run_dir / RUN_METADATA_FILE).exists() else {}
+        evaluation_path = self.current_dir / "evaluation_report.json"
+        evaluation = read_json(evaluation_path) if evaluation_path.exists() else {}
+        bundle_path = self.current_dir / manifest.get("model_bundle_file", MODEL_BUNDLE_FILE)
+        model_bundle = load_joblib(bundle_path) if bundle_path.exists() else None
+        predictions_path = self.current_dir / "stage2_holdout_predictions.parquet"
+        predictions = pd.read_parquet(predictions_path) if predictions_path.exists() else pd.DataFrame(columns=["member_id"])
+        if "member_id" in predictions.columns:
+            predictions["member_id"] = predictions["member_id"].astype(str).str.strip().str.upper()
+            predictions = predictions.set_index("member_id", drop=False)
+        partnership_table_file = str(manifest.get("partnership_table_file", "partnership_table.parquet"))
+        partnership_table_path = self.current_dir / partnership_table_file
+        partnership_table = pd.read_parquet(partnership_table_path) if partnership_table_path.exists() else pd.DataFrame()
+        ccs_table_file = str(manifest.get("ccs_concentration_table_file", "ccs_concentration_table.parquet"))
+        ccs_table_path = self.current_dir / ccs_table_file
+        ccs_table = pd.read_parquet(ccs_table_path) if ccs_table_path.exists() else pd.DataFrame()
         return ArtifactBundle(
-            scored_players_df=df,
+            stage2_holdout_predictions_df=predictions,
             serving_manifest=manifest,
-            snapshot_metadata=snapshot_metadata,
+            snapshot_metadata={},
             promotion_metadata=promotion_metadata,
-            evaluation_metadata=evaluation_metadata,
+            evaluation_metadata=evaluation,
             run_metadata=run_metadata,
-            snapshot_available=snapshot_available,
-            snapshot_reason=snapshot_reason,
+            snapshot_available=bool(predictions_path.exists()),
+            snapshot_reason=None if predictions_path.exists() else "No partnership holdout predictions are available.",
             loaded_at=datetime.now(timezone.utc),
-            source_run_id=str(snapshot_metadata.get("source_run_id") or manifest["run_id"]),
+            source_run_id=str(manifest.get("run_id")),
             promoted_at=manifest.get("promoted_at"),
-            evaluated_at=evaluation_metadata.get("scored_at") or evaluation_metadata.get("evaluated_at"),
-            model_version=str(
-                snapshot_metadata.get("model_version")
-                or manifest.get("model_version", self.default_model_version)
-            ),
+            evaluated_at=evaluation.get("evaluated_at"),
+            model_version=str(manifest.get("model_version", self.default_model_version)),
             model_bundle=model_bundle,
-            training_raw_parquet_path=training_raw_parquet_path,
-            training_parquet_start_date=training_parquet_start_date,
-            training_parquet_end_date=training_parquet_end_date,
+            partnership_table_df=partnership_table,
+            ccs_concentration_table_df=ccs_table,
+            training_raw_parquet_path=run_dir / "data_ingestion" / "raw_data.parquet",
         )

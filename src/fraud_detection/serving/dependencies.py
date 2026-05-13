@@ -5,9 +5,9 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
 
+import pandas as pd
 from fastapi import Depends, HTTPException, status
 
-from fraud_detection.components.feature_engineering import TIMESTAMP_CANDIDATES
 from fraud_detection.logger import get_logger
 
 from .artifact_provider import ArtifactBundle, ArtifactProvider
@@ -70,9 +70,12 @@ def get_cache() -> ArtifactCache:
 @dataclass(frozen=True)
 class LiveScoringContext:
     model_bundle: dict[str, Any]
+    source_run_id: str | None
+    partnership_table: pd.DataFrame
+    ccs_concentration_table: pd.DataFrame
+    evaluation_metadata: dict[str, Any]
     training_raw_parquet_path: Path
     timestamp_field: str
-    timestamp_candidates: tuple[str, ...]
     parquet_start_date: Any  # datetime | None from bundle
     parquet_end_date: Any    # datetime | None from bundle
 
@@ -91,24 +94,26 @@ def get_live_scoring_context(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Promoted model bundle is not loaded.",
         )
-    if "ccs_stats_lookup" not in bundle.model_bundle:
+    required = {"stage1_model", "stage2_model", "stage1_feature_columns", "stage2_feature_columns"}
+    missing = sorted(required.difference(bundle.model_bundle))
+    if missing:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Promoted model bundle is not compatible with live scoring. Re-promote artifacts.",
-        )
-    if bundle.training_raw_parquet_path is None or not bundle.training_raw_parquet_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Promoted training raw parquet is not available.",
+            detail=f"Promoted partnership bundle is incomplete: {missing}. Re-promote artifacts.",
         )
 
     timestamp_field = str(bundle.snapshot_metadata.get("timestamp_field", "trans_date"))
 
     return LiveScoringContext(
         model_bundle=bundle.model_bundle,
-        training_raw_parquet_path=bundle.training_raw_parquet_path,
+        source_run_id=bundle.source_run_id,
+        partnership_table=bundle.partnership_table_df if bundle.partnership_table_df is not None else pd.DataFrame(),
+        ccs_concentration_table=(
+            bundle.ccs_concentration_table_df if bundle.ccs_concentration_table_df is not None else pd.DataFrame()
+        ),
+        evaluation_metadata=bundle.evaluation_metadata or {},
+        training_raw_parquet_path=bundle.training_raw_parquet_path or Path(),
         timestamp_field=timestamp_field,
-        timestamp_candidates=tuple(TIMESTAMP_CANDIDATES),
         parquet_start_date=bundle.training_parquet_start_date,
         parquet_end_date=bundle.training_parquet_end_date,
     )

@@ -2,13 +2,14 @@
 #
 # Services:
 #   - fraud-detection-api      FastAPI serving layer (v1 + live + historical scoring)
-#   - fraud-detection          One-shot training image (run with `docker compose run --rm fraud-detection`)
+#   - fraud-detection          One-shot full-cycle image (run with `docker compose run --rm fraud-detection`)
 #   - mlflow-server            MLflow tracking + Model Registry (SQLite-backed; survives restarts via volume)
 #   - prefect-postgres         Postgres for the Prefect orchestration DB (state, schedules, history)
 #   - prefect-server           Self-hosted Prefect server (NOT Prefect Cloud)
 #   - prefect-worker           Process worker that picks up flow runs from `fraud-pool`
 #
-# Bring it all up: `docker compose up -d`
+# Bring up the long-running services:
+#   docker compose up -d mlflow-server prefect-postgres prefect-server prefect-worker fraud-detection-api
 # Initial deploy of flows (one-time, host-side):
 #   PREFECT_API_URL=http://localhost:4200/api prefect deploy --prefect-file orchestration/prefect.yaml
 
@@ -40,6 +41,7 @@ services:
       - ./artifacts:/app/artifacts:ro
       - ./configs:/app/configs:ro
       - ./logs:/app/logs
+      - ./data_store:/app/data_store:ro
     depends_on:
       - mlflow-server
     restart: unless-stopped
@@ -71,10 +73,11 @@ services:
       - ./logs:/app/logs
       - ./mlruns:/app/mlruns
       - ./data_cache:/app/data_cache
+      - ./data_store:/app/data_store
       - ./configs:/app/configs:ro
     depends_on:
       - mlflow-server
-    command: train
+    command: full-cycle
 
   # ─────────────────────────────────────────────────────────────────────────
   # MLflow tracking + Model Registry (SQLite-backed for now; switch the
@@ -97,7 +100,7 @@ services:
       --default-artifact-root /mlflow/artifacts
       --serve-artifacts
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5).read()"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -166,6 +169,7 @@ services:
       - ./logs:/app/logs
       - ./mlruns:/app/mlruns
       - ./data_cache:/app/data_cache
+      - ./data_store:/app/data_store
       - ./configs:/app/configs:ro
       - ./orchestration:/app/orchestration:ro
       - ./src:/app/src:ro

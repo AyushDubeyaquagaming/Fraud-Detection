@@ -5,7 +5,7 @@ import time
 from fastapi import APIRouter, Depends
 
 from ..dependencies import ArtifactCache, get_cache
-from ..schemas import HealthResponse, ModelInfoResponse, TierDistribution
+from ..schemas import HealthResponse, ModelInfoResponse
 
 router = APIRouter(tags=["system"])
 
@@ -15,8 +15,6 @@ _start_time = time.time()
 def _build_model_info(cache: ArtifactCache) -> ModelInfoResponse:
     bundle = cache.get_bundle()
     evaluation = bundle.evaluation_metadata
-    tier_counts = evaluation.get("risk_tier_distribution", {})
-
     return ModelInfoResponse(
         model_version=bundle.model_version,
         source_run_id=bundle.source_run_id,
@@ -26,14 +24,12 @@ def _build_model_info(cache: ArtifactCache) -> ModelInfoResponse:
         snapshot_status=str(bundle.snapshot_metadata.get("snapshot_status", "ready" if bundle.snapshot_available else "insufficient_data")),
         snapshot_reason=bundle.snapshot_reason,
         snapshot_lookback_days=bundle.snapshot_metadata.get("lookback_days"),
-        total_scored_members=int(evaluation.get("total_players", len(bundle.scored_players_df))),
-        tier_distribution=TierDistribution(
-            LOW=int(tier_counts.get("LOW", 0)),
-            MEDIUM=int(tier_counts.get("MEDIUM", 0)),
-            HIGH=int(tier_counts.get("HIGH", 0)),
+        total_holdout_members=int(evaluation.get("total_members", len(bundle.stage2_holdout_predictions_df))),
+        stage2_alert_threshold=(
+            float(bundle.model_bundle["stage2_alert_threshold"])
+            if bundle.model_bundle and "stage2_alert_threshold" in bundle.model_bundle
+            else None
         ),
-        anomaly_weight=float(bundle.evaluation_metadata.get("anomaly_weight", 0.6)),
-        supervised_weight=float(bundle.evaluation_metadata.get("supervised_weight", 0.4)),
         artifacts_loaded_at=bundle.loaded_at.isoformat(),
     )
 

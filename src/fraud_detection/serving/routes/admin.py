@@ -31,5 +31,5 @@ def reload_artifacts(cache: ArtifactCache = Depends(get_cache)) -> ReloadRespons
         previous_run_id=previous_run_id,
         current_run_id=current_run_id,
         reloaded_at=datetime.now(timezone.utc).isoformat(),
-        total_scored_members=len(bundle.scored_players_df),
+        total_holdout_members=len(bundle.stage2_holdout_predictions_df),
     )

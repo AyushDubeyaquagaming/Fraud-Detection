@@ -21,16 +21,35 @@ pull:
       directory: /app
 
 deployments:
+  - name: full-cycle-weekly
+    flow_name: fraud-detection-full-cycle
+    entrypoint: orchestration/flows/full_cycle_flow.py:full_cycle_flow
+    description: "Weekly candidate refresh, CCS refresh, training, promotion, and batch scoring"
+    parameters:
+      config_path: "configs/config.yaml"
+      candidate_config_path: "configs/candidate_extraction.yaml"
+      ccs_config_path: "configs/ccs_profit.yaml"
+    schedules:
+      - cron: "0 1 * * 1"       # every Monday at 01:00 UTC
+        timezone: UTC
+        active: true
+    work_pool:
+      name: fraud-pool
+      work_queue_name: default
+    tags:
+      - fraud-detection
+      - full-cycle
+
   - name: training-weekly
     flow_name: fraud-detection-training
     entrypoint: orchestration/flows/training_flow.py:training_flow
-    description: "Weekly fraud model retraining with monitoring and promotion gate"
+    description: "Training-only wrapper retained for manual/component runs; full-cycle-weekly is the scheduled production path"
     parameters:
       config_path: "configs/config.yaml"
     schedules:
       - cron: "0 2 * * 1"       # every Monday at 02:00 UTC
         timezone: UTC
-        active: true
+        active: false
     work_pool:
       name: fraud-pool
       work_queue_name: default
@@ -43,7 +62,7 @@ deployments:
     entrypoint: orchestration/flows/batch_scoring_flow.py:batch_scoring_flow
     description: "Daily batch scoring against the promoted model bundle"
     parameters:
-      config_path: "configs/config.yaml"
+      config_path: "configs/batch_scoring.yaml"
     schedules:
       - cron: "0 4 * * *"       # every day at 04:00 UTC
         timezone: UTC
@@ -54,3 +73,19 @@ deployments:
     tags:
       - fraud-detection
       - scoring
+
+  - name: live-scoring-poll
+    flow_name: fraud-detection-live-scoring
+    entrypoint: orchestration/flows/live_scoring_flow.py:live_scoring_flow
+    description: "Poll Mongo for completed draws and upsert partnership live predictions"
+    parameters:
+      config_path: "configs/config.yaml"
+    schedules:
+      - interval: 60
+        active: false
+    work_pool:
+      name: fraud-pool
+      work_queue_name: default
+    tags:
+      - fraud-detection
+      - live-scoring

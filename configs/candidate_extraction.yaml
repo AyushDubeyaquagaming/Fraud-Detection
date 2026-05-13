@@ -1,0 +1,62 @@
+mongo:
+  uri_env_var: MONGODB_URI
+  database_env_var: MONGODB_DATABASE
+  collection_env_var: MONGODB_COLLECTION_ROULETTE_REPORT
+
+extraction:
+  game: roulette
+  min_total_bet_amount: 1000
+  min_qualifying_players: 2
+  board_size: 38
+  board_positions:
+    - "0"
+    - "00"
+    - "1"
+    - "2"
+    - "3"
+    - "4"
+    - "5"
+    - "6"
+    - "7"
+    - "8"
+    - "9"
+    - "10"
+    - "11"
+    - "12"
+    - "13"
+    - "14"
+    - "15"
+    - "16"
+    - "17"
+    - "18"
+    - "19"
+    - "20"
+    - "21"
+    - "22"
+    - "23"
+    - "24"
+    - "25"
+    - "26"
+    - "27"
+    - "28"
+    - "29"
+    - "30"
+    - "31"
+    - "32"
+    - "33"
+    - "34"
+    - "35"
+    - "36"
+  timestamp_field: trans_date
+
+output:
+  base_path: data_store/candidate_draws
+  partition_strategy: weekly_iso
+  parquet_compression: zstd
+  parquet_row_group_size: 50000
+
+runtime:
+  log_level: INFO
+  resume_existing_partitions: true
+  fail_fast_on_chunk_error: false
+

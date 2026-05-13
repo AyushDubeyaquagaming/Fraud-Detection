@@ -354,6 +354,9 @@ def build_query_batches_from_strategy(
     full_collection
         Escape hatch for one-time baseline pulls.
         Requires confirm_full_pull=true in strategy_params — raises otherwise.
+    rolling_store
+        Config-symmetry marker for DataIngestion. It is not a Mongo query
+        strategy and must be handled before calling this function.
     """
     if strategy == "date_window":
         return _build_date_window_queries(strategy_params)
@@ -369,11 +372,20 @@ def build_query_batches_from_strategy(
         )
         return [{}]
 
+    elif strategy == "rolling_store":
+        raise FraudDetectionException(
+            ValueError(
+                "rolling_store is read from local partitioned parquet, not Mongo. "
+                "Handle it in DataIngestion before building Mongo query batches."
+            ),
+            sys,
+        )
+
     else:
         raise FraudDetectionException(
             ValueError(
                 f"Unknown ingestion strategy '{strategy}'. "
-                "Must be one of: date_window, member_list, full_collection."
+                "Must be one of: date_window, member_list, full_collection, rolling_store."
             ),
             sys,
         )

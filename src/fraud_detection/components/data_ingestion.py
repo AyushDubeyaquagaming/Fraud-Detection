@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from fraud_detection.entity.artifact_entity import DataIngestionArtifact
@@ -17,6 +19,7 @@ from fraud_detection.utils.common import ensure_dir, write_json
 logger = get_logger(__name__)
 
 PARQUET_SUMMARY_BATCH_SIZE = 100_000
+PARQUET_WINDOW_BATCH_SIZE = 100_000
 
 
 class DataIngestion:
@@ -105,7 +108,7 @@ class DataIngestion:
 
             if self.config.source == "parquet":
                 ingestion_stats = self._ingest_from_parquet(raw_path)
-                strategy_used = None
+                strategy_used = self.config.parquet_strategy if self.config.parquet_strategy != "full_copy" else None
                 query_count = 1
             elif self.config.source == "mongodb":
                 ingestion_stats = self._ingest_from_mongodb(raw_path)
@@ -159,15 +162,140 @@ class DataIngestion:
         src = Path(self.config.parquet_path)
         if not src.exists():
             raise FileNotFoundError(f"Parquet source not found: {src}")
+        if self.config.parquet_strategy == "date_window":
+            logger.info("Staging bounded parquet window from %s → %s", src, output_path)
+            return self._stage_parquet_window(src, output_path, self.config.parquet_strategy_params)
+        if self.config.parquet_strategy not in {"", "full_copy", None}:
+            raise ValueError(f"Unknown parquet strategy: {self.config.parquet_strategy}")
         logger.info("Copying parquet from %s → %s", src, output_path)
         shutil.copy2(src, output_path)
         return self._summarize_parquet(output_path)
+
+    @staticmethod
+    def _to_filter_bound(value: pd.Timestamp, arrow_type: pa.DataType) -> object:
+        if pa.types.is_timestamp(arrow_type):
+            if arrow_type.tz:
+                return value.tz_convert(arrow_type.tz).to_pydatetime()
+            return value.tz_convert("UTC").tz_localize(None).to_pydatetime()
+        if pa.types.is_date32(arrow_type) or pa.types.is_date64(arrow_type):
+            return value.tz_convert("UTC").tz_localize(None).date()
+        raise TypeError(f"Unsupported parquet timestamp type for window filtering: {arrow_type}")
+
+    @staticmethod
+    def _timestamp_bounds(parquet_path: Path, timestamp_field: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        parquet_file = pq.ParquetFile(parquet_path)
+        schema_names = parquet_file.schema_arrow.names
+        if timestamp_field not in schema_names:
+            raise ValueError(f"Timestamp field '{timestamp_field}' is missing from parquet source {parquet_path}")
+
+        min_ts = None
+        max_ts = None
+        for batch in parquet_file.iter_batches(columns=[timestamp_field], batch_size=PARQUET_SUMMARY_BATCH_SIZE):
+            parsed = pd.to_datetime(batch.column(0).to_pandas(), errors="coerce", utc=True)
+            valid = parsed.dropna()
+            if valid.empty:
+                continue
+            batch_min = valid.min()
+            batch_max = valid.max()
+            min_ts = batch_min if min_ts is None or batch_min < min_ts else min_ts
+            max_ts = batch_max if max_ts is None or batch_max > max_ts else max_ts
+        return min_ts, max_ts
+
+    def _resolve_parquet_window(
+        self,
+        parquet_path: Path,
+        strategy_params: dict,
+    ) -> tuple[str, pd.Timestamp, pd.Timestamp]:
+        timestamp_field = str(strategy_params.get("timestamp_field", "trans_date"))
+        start_date = strategy_params.get("start_date")
+        end_date = strategy_params.get("end_date")
+        lookback_days = strategy_params.get("lookback_days")
+
+        min_ts, max_ts = self._timestamp_bounds(parquet_path, timestamp_field)
+        if max_ts is None:
+            raise ValueError(f"No parseable timestamps found in parquet column '{timestamp_field}'")
+
+        if end_date is not None:
+            end_ts = pd.Timestamp(end_date, tz="UTC")
+        else:
+            end_ts = max_ts
+
+        if start_date is not None:
+            start_ts = pd.Timestamp(start_date, tz="UTC")
+        elif lookback_days is not None:
+            start_ts = end_ts - pd.Timedelta(days=int(lookback_days))
+        elif min_ts is not None:
+            start_ts = min_ts
+        else:
+            start_ts = end_ts
+
+        if start_ts > end_ts:
+            raise ValueError(f"Invalid parquet date window: start {start_ts} is after end {end_ts}")
+        return timestamp_field, start_ts, end_ts
+
+    def _stage_parquet_window(self, parquet_path: Path, output_path: Path, strategy_params: dict) -> dict:
+        timestamp_field, start_ts, end_ts = self._resolve_parquet_window(parquet_path, strategy_params)
+        dataset = ds.dataset(parquet_path, format="parquet")
+        if timestamp_field not in dataset.schema.names:
+            raise ValueError(f"Timestamp field '{timestamp_field}' is missing from parquet schema")
+
+        arrow_type = dataset.schema.field(timestamp_field).type
+        filter_expr = (
+            (ds.field(timestamp_field) >= self._to_filter_bound(start_ts, arrow_type))
+            & (ds.field(timestamp_field) <= self._to_filter_bound(end_ts, arrow_type))
+        )
+
+        writer = None
+        row_count = 0
+        member_ids: set[str] = set()
+        min_seen = None
+        max_seen = None
+        try:
+            scanner = dataset.scanner(filter=filter_expr, batch_size=PARQUET_WINDOW_BATCH_SIZE)
+            for batch in scanner.to_batches():
+                if batch.num_rows == 0:
+                    continue
+                table = pa.Table.from_batches([batch])
+                if writer is None:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    writer = pq.ParquetWriter(str(output_path), table.schema)
+                writer.write_table(table)
+                row_count += batch.num_rows
+
+                if "member_id" in table.column_names:
+                    member_ids.update(str(value) for value in table["member_id"].to_pylist() if value is not None)
+                if timestamp_field in table.column_names:
+                    parsed = pd.to_datetime(table[timestamp_field].to_pandas(), errors="coerce", utc=True).dropna()
+                    if not parsed.empty:
+                        batch_min = parsed.min()
+                        batch_max = parsed.max()
+                        min_seen = batch_min if min_seen is None or batch_min < min_seen else min_seen
+                        max_seen = batch_max if max_seen is None or batch_max > max_seen else max_seen
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if row_count == 0:
+            output_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Configured parquet window returned 0 rows for {timestamp_field} in [{start_ts.isoformat()}, {end_ts.isoformat()}]"
+            )
+
+        return {
+            "row_count": row_count,
+            "member_count": len(member_ids),
+            "date_range": {
+                "from": str(min_seen) if min_seen is not None else str(start_ts),
+                "to": str(max_seen) if max_seen is not None else str(end_ts),
+            },
+        }
 
     def _ingest_from_mongodb(self, output_path: Path) -> dict:
         from fraud_detection.utils.mongodb import (
             build_query_batches_from_strategy,
             stream_query_batches_to_parquet,
         )
+        from fraud_detection.utils.rolling_parquet_store import materialize_rolling_window_to_parquet
 
         strategy = self.config.mongo_strategy
         strategy_params = self.config.mongo_strategy_params
@@ -177,6 +305,19 @@ class DataIngestion:
             strategy,
             strategy_params,
         )
+
+        if strategy == "rolling_store":
+            store_root = Path(strategy_params.get("store_root", "data_store/training_window"))
+            lookback_days = int(strategy_params.get("lookback_days", 90))
+            end_date = pd.Timestamp.now(tz="UTC")
+            start_date = end_date - pd.Timedelta(days=lookback_days)
+            stats = materialize_rolling_window_to_parquet(
+                output_root=store_root,
+                output_path=output_path,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return stats
 
         query_filters = build_query_batches_from_strategy(strategy, strategy_params)
 

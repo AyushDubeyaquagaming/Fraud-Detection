@@ -3,7 +3,7 @@
 Run locally (no Prefect server required):
     python orchestration/flows/training_flow.py
 
-Deploy to Prefect Cloud:
+Deploy to the configured Prefect server:
     prefect deploy --prefect-file orchestration/prefect.yaml
 """
 from __future__ import annotations

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from fraud_detection.entity.artifact_entity import DataIngestionArtifact, DataValidationArtifact
@@ -18,6 +19,17 @@ from fraud_detection.utils.common import ensure_dir, write_json
 logger = get_logger(__name__)
 
 VALIDATION_BATCH_SIZE = 100_000
+CANDIDATE_REQUIRED_COLUMNS = [
+    "draw_id",
+    "trans_date_min",
+    "trans_date_max",
+    "qualifying_player_count",
+    "member_ids",
+    "coverage_bytes",
+    "amount_vector",
+    "total_bet_amounts",
+    "win_points",
+]
 
 
 class DataValidation:
@@ -86,6 +98,8 @@ class DataValidation:
         logger.info("DataValidation: starting")
         try:
             ensure_dir(self.config.output_dir)
+            if self.ingestion_artifact.source_type == "candidate_store":
+                return self._validate_candidate_store()
             parquet_file = pq.ParquetFile(self.ingestion_artifact.raw_data_path)
             row_count = parquet_file.metadata.num_rows
             schema_names = parquet_file.schema_arrow.names
@@ -147,7 +161,18 @@ class DataValidation:
                     fraud_df = pd.read_csv(fraud_csv_path)
                     fraud_df.columns = [c.strip().lower() for c in fraud_df.columns]
                     has_cols = all(c in fraud_df.columns for c in ["member_id", "draw_id"])
-                    checks["fraud_csv"] = {"passed": has_cols, "rows": len(fraud_df)}
+                    has_date = "date" in fraud_df.columns
+                    fraud_check: dict = {"passed": has_cols, "rows": len(fraud_df), "has_date_column": has_date}
+                    if not has_date:
+                        # DATE is required for weekly window matching but the
+                        # downstream code falls back to legacy whole-window
+                        # behavior when missing — so treat as warning, not fail.
+                        fraud_check["warning"] = (
+                            "no DATE column — weekly fraud-label window matching "
+                            "will be disabled and labels will fall back to "
+                            "set-membership matching across the full ingestion window"
+                        )
+                    checks["fraud_csv"] = fraud_check
                 except Exception as ex:
                     checks["fraud_csv"] = {"passed": False, "error": str(ex)}
             else:
@@ -180,3 +205,45 @@ class DataValidation:
             raise
         except Exception as e:
             raise FraudDetectionException(e, sys) from e
+
+    def _validate_candidate_store(self) -> DataValidationArtifact:
+        dataset_path = self.ingestion_artifact.raw_data_path
+        dataset = ds.dataset(dataset_path, format="parquet", partitioning="hive")
+        schema_names = dataset.schema.names
+        missing_cols = [column for column in CANDIDATE_REQUIRED_COLUMNS if column not in schema_names]
+        row_count = int(dataset.count_rows()) if not missing_cols else 0
+        checks = {
+            "row_count": {
+                "passed": row_count >= self.config.min_row_count,
+                "actual": row_count,
+                "minimum": self.config.min_row_count,
+            },
+            "candidate_required_columns": {
+                "passed": len(missing_cols) == 0,
+                "missing": missing_cols,
+            },
+            "candidate_store_schema": {
+                "passed": len(missing_cols) == 0,
+                "path": str(dataset_path),
+            },
+        }
+        failed = [key for key, value in checks.items() if not value.get("passed", False)]
+        report = {
+            "validated_at": datetime.now(timezone.utc).isoformat(),
+            "validation_mode": "candidate_store",
+            "all_passed": not failed,
+            "failed_checks": failed,
+            "checks": checks,
+        }
+        report_path = self.config.output_dir / "validation_report.json"
+        write_json(report, report_path)
+        if failed:
+            msg = f"candidate store validation failed checks: {failed}; candidate store missing or invalid at {dataset_path}"
+            logger.error(msg)
+            raise FraudDetectionException(msg, sys)
+        logger.info("DataValidation: candidate store checks passed")
+        return DataValidationArtifact(
+            validation_report_path=report_path,
+            is_valid=True,
+            message="Candidate store validation checks passed.",
+        )

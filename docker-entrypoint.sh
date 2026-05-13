@@ -2,6 +2,10 @@
 set -e
 
 case "$1" in
+  full-cycle)
+    shift
+    exec python scripts/run_full_cycle.py "$@"
+    ;;
   train)
     shift
     exec python scripts/run_training.py "$@"
@@ -28,21 +32,17 @@ case "$1" in
   worker)
     shift
     POOL="${PREFECT_POOL_NAME:-fraud-pool}"
-    # Create the work pool if missing — idempotent. The worker itself does
-    # not auto-create pools in Prefect 2.x, so we run this first to keep
-    # `docker compose up` a one-shot experience.
+    # The Prefect worker does not create process pools automatically.
     if ! prefect work-pool inspect "$POOL" >/dev/null 2>&1; then
-        echo "Creating Prefect work pool '$POOL' (type=process)…"
+        echo "Creating Prefect work pool '$POOL' (type=process)..."
         prefect work-pool create "$POOL" --type process || true
     fi
     exec prefect worker start --pool "$POOL" --type process "$@"
     ;;
   deploy-flows)
-    # One-shot helper: register the flows in orchestration/prefect.yaml
-    # against the configured PREFECT_API_URL. Useful to run after the
-    # server is up: `docker compose run --rm prefect-worker deploy-flows`.
     shift
-    exec prefect deploy --prefect-file orchestration/prefect.yaml --all "$@"
+    yes n | prefect deploy --prefect-file orchestration/prefect.yaml --all "$@"
+    exit $?
     ;;
   *)
     exec "$@"
