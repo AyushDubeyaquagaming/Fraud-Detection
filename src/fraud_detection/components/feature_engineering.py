@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -213,7 +215,22 @@ class FeatureEngineering:
         analyst_positive_overrides = 0
         analyst_negative_overrides = 0
         try:
-            for candidate_chunk in self._iter_candidate_store_batches():
+            for batch_number, candidate_chunk in enumerate(self._iter_candidate_store_batches(), start=1):
+                batch_started = time.perf_counter()
+                candidate_players = int(
+                    pd.to_numeric(
+                        candidate_chunk.get("qualifying_player_count", pd.Series(dtype=float)),
+                        errors="coerce",
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+                logger.info(
+                    "FeatureEngineering candidate batch %d: candidate_draw_rows=%d qualifying_players=%d",
+                    batch_number,
+                    len(candidate_chunk),
+                    candidate_players,
+                )
                 candidate_draw_rows += len(candidate_chunk)
                 stage1_chunk, pair_chunk, _ = compute_partnership_features_from_candidates(
                     candidate_chunk,
@@ -239,6 +256,16 @@ class FeatureEngineering:
                 fraud_pairs += int(pd.to_numeric(labeled_chunk.get("label_gold"), errors="coerce").fillna(0).sum())
                 analyst_positive_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("derived_pair_analyst").sum())
                 analyst_negative_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("analyst_not_fraud_pair").sum())
+                logger.info(
+                    "FeatureEngineering candidate batch %d complete: pair_rows=%d stage1_rows=%d elapsed=%.2fs",
+                    batch_number,
+                    len(pair_chunk),
+                    len(stage1_chunk),
+                    time.perf_counter() - batch_started,
+                )
+                del candidate_chunk, stage1_chunk, pair_chunk, labeled_chunk
+                gc.collect()
+                pa.default_memory_pool().release_unused()
         finally:
             stage1_writer.close()
             stage1_labels_writer.close()

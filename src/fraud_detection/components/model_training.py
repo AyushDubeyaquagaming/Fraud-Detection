@@ -38,6 +38,21 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _direct_analyst_fraud_members(draw_ids: pd.Series | list[int]) -> set[str]:
+    scoped_draw_ids = pd.to_numeric(pd.Series(draw_ids), errors="coerce").dropna().astype(int).unique().tolist()
+    if not scoped_draw_ids:
+        return set()
+    try:
+        from fraud_detection.components.analyst_label_overlay import latest_analyst_decisions
+        from fraud_detection.utils.mongo_predictions import read_analyst_labels_for_draws
+
+        decisions = latest_analyst_decisions(read_analyst_labels_for_draws(scoped_draw_ids))
+    except Exception as exc:
+        logger.warning("Direct analyst fraud member labels unavailable during Stage 2 seeding: %s", exc)
+        return set()
+    return {member_id for (_draw_id, member_id), label in decisions.items() if label == "fraud"}
+
+
 class ModelTraining:
     def __init__(self, config: ModelTrainingConfig, fe_artifact: FeatureEngineeringArtifact):
         self.config = config
@@ -90,6 +105,10 @@ class ModelTraining:
                     gold_members = set(gold_pairs["member_a"].astype(str).str.upper()) | set(
                         gold_pairs["member_b"].astype(str).str.upper()
                     )
+                direct_analyst_members = _direct_analyst_fraud_members(
+                    pair_scored.get("draw_id", pd.Series(dtype=object))
+                )
+                gold_members |= direct_analyst_members
                 score_rows = []
                 for row in pair_scored.to_dict("records"):
                     score = float(row.get("pair_risk_score") or 0.0)
@@ -123,6 +142,7 @@ class ModelTraining:
                         concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
                     )
             else:
+                direct_analyst_members = set()
                 gold_members = set(stage1_labeled.loc[stage1_labeled["label_gold"].eq(1), "member_id"].astype(str).str.upper())
                 stage1_predictions_for_stage2 = stage1_result.predictions
             stage2_features = build_stage2_training_frame(
@@ -186,7 +206,12 @@ class ModelTraining:
                 "stage2": stage2_result.metrics,
                 "stage1_rows": int(len(stage1_labeled)),
                 "stage2_rows": int(len(stage2_features)),
-                "fraud_members": int(stage2_features["label_gold_member"].sum()) if "label_gold_member" in stage2_features else 0,
+                "fraud_members": (
+                    int(stage2_features["label_gold_member"].sum())
+                    if "label_gold_member" in stage2_features
+                    else 0
+                ),
+                "direct_analyst_fraud_members": int(len(direct_analyst_members)),
                 "stage1_feature_columns": stage1_feature_columns,
                 "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
                 "ccs_feature_columns": CCS_FEATURE_COLUMNS,

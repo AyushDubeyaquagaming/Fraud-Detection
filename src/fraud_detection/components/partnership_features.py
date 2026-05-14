@@ -160,14 +160,19 @@ def compute_pair_rows_from_candidates(
     rows: list[dict[str, Any]] = []
     if candidate_df.empty:
         return pair_rows_to_frame(rows)
-    for index, row in enumerate(candidate_df.to_dict("records")):
+    for index, row in enumerate(candidate_df.itertuples(index=False)):
+        row_dict = row._asdict()
+        try:
+            seed_offset = int(row_dict.get("draw_id"))
+        except (TypeError, ValueError):
+            seed_offset = index
         rows.extend(
             emit_pair_rows(
-                row,
+                row_dict,
                 cfg,
                 mode=mode,
                 ordinary_negative_sample=ordinary_negative_sample,
-                random_seed=random_seed + index,
+                random_seed=random_seed + (seed_offset % 2_147_483_647),
             )
         )
     return pair_rows_to_frame(rows)

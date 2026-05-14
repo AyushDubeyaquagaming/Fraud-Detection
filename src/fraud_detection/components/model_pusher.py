@@ -24,6 +24,18 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _copy_promoted_file(src: Path, dst: Path) -> None:
+    try:
+        shutil.copy2(src, dst)
+    except PermissionError:
+        logger.warning(
+            "Falling back to content-only copy for promoted artifact %s -> %s because metadata preservation is not permitted on the target filesystem.",
+            src,
+            dst,
+        )
+        shutil.copyfile(src, dst)
+
+
 class ModelPusher:
     def __init__(self, config: ModelPusherConfig, training_artifact: ModelTrainingArtifact, evaluation_artifact: ModelEvaluationArtifact):
         self.config = config
@@ -87,18 +99,18 @@ class ModelPusher:
             promoted_at = datetime.now(timezone.utc).isoformat()
             git_sha = _git_sha()
             current_bundle = self.config.current_dir / "model_bundle.joblib"
-            shutil.copy2(self.training_artifact.model_bundle_path, current_bundle)
+            _copy_promoted_file(self.training_artifact.model_bundle_path, current_bundle)
             if self.training_artifact.stage1_model_path:
-                shutil.copy2(self.training_artifact.stage1_model_path, self.config.current_dir / "stage1_model.joblib")
+                _copy_promoted_file(self.training_artifact.stage1_model_path, self.config.current_dir / "stage1_model.joblib")
             if self.training_artifact.stage2_model_path:
-                shutil.copy2(self.training_artifact.stage2_model_path, self.config.current_dir / "stage2_model.joblib")
+                _copy_promoted_file(self.training_artifact.stage2_model_path, self.config.current_dir / "stage2_model.joblib")
             if self.training_artifact.partnership_table_path and self.training_artifact.partnership_table_path.exists():
-                shutil.copy2(self.training_artifact.partnership_table_path, self.config.current_dir / "partnership_table.parquet")
+                _copy_promoted_file(self.training_artifact.partnership_table_path, self.config.current_dir / "partnership_table.parquet")
             if self.training_artifact.ccs_concentration_table_path and self.training_artifact.ccs_concentration_table_path.exists():
-                shutil.copy2(self.training_artifact.ccs_concentration_table_path, self.config.current_dir / "ccs_concentration_table.parquet")
-            shutil.copy2(self.training_artifact.training_report_path, self.config.current_dir / "training_report.json")
-            shutil.copy2(self.evaluation_artifact.evaluation_report_path, self.config.current_dir / "evaluation_report.json")
-            shutil.copy2(self.evaluation_artifact.stage2_holdout_predictions_path, self.config.current_dir / "stage2_holdout_predictions.parquet")
+                _copy_promoted_file(self.training_artifact.ccs_concentration_table_path, self.config.current_dir / "ccs_concentration_table.parquet")
+            _copy_promoted_file(self.training_artifact.training_report_path, self.config.current_dir / "training_report.json")
+            _copy_promoted_file(self.evaluation_artifact.evaluation_report_path, self.config.current_dir / "evaluation_report.json")
+            _copy_promoted_file(self.evaluation_artifact.stage2_holdout_predictions_path, self.config.current_dir / "stage2_holdout_predictions.parquet")
 
             registry_info = None
             registry_status = None

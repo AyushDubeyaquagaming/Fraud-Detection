@@ -64,6 +64,12 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
     return float(number)
 
 
+def _alert_window_bounds(lookback_days: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    end = pd.Timestamp.now(tz="UTC")
+    start = (end - pd.Timedelta(days=int(lookback_days))).normalize()
+    return start, end
+
+
 def _public_response_details(details: list[Any] | None, context: LiveScoringContext) -> list[str]:
     normalized: list[str] = []
     for item in details or []:
@@ -140,8 +146,21 @@ def _candidate_rows_for_draw(draw_id: int, *, context: LiveScoringContext) -> pd
     if not store_path.exists():
         return pd.DataFrame()
     dataset = ds.dataset(store_path, format="parquet", partitioning="hive")
-    table = dataset.to_table(filter=ds.field("draw_id") == int(draw_id))
-    return table.to_pandas() if table.num_rows else pd.DataFrame()
+    filter_expr = ds.field("draw_id") == int(draw_id)
+    try:
+        fragments = sorted(
+            list(dataset.get_fragments()),
+            key=lambda fragment: str(getattr(fragment, "path", "")),
+            reverse=True,
+        )
+        for fragment in fragments:
+            table = fragment.to_table(filter=filter_expr)
+            if table.num_rows:
+                return table.to_pandas()
+        return pd.DataFrame()
+    except Exception:
+        table = dataset.to_table(filter=filter_expr)
+        return table.to_pandas() if table.num_rows else pd.DataFrame()
 
 
 def _candidate_rows_for_window(
@@ -153,8 +172,7 @@ def _candidate_rows_for_window(
     store_path = _candidate_store_path(context)
     if not store_path.exists():
         return pd.DataFrame()
-    end = pd.Timestamp.now(tz="UTC")
-    start = end - pd.Timedelta(days=int(lookback_days))
+    start, end = _alert_window_bounds(lookback_days)
     dataset = ds.dataset(store_path, format="parquet", partitioning="hive")
     matches: list[pd.DataFrame] = []
 
@@ -353,18 +371,27 @@ def _build_alert_draws_from_backfill(
     ccs_ids: set[str] | None = None,
 ) -> tuple[list[AlertDraw], int]:
     docs = _prediction_backfill_docs(context)
-    end = pd.Timestamp.now(tz="UTC")
-    start = end - pd.Timedelta(days=int(lookback_days))
+    start, end = _alert_window_bounds(lookback_days)
     requested_ccs = {_member_key(value) for value in (ccs_ids or set()) if str(value).strip()}
-    candidates: list[tuple[pd.Timestamp, AlertDraw]] = []
+    docs_by_draw_id: dict[int, dict[str, Any]] = {}
     for result_doc in docs:
+        draw_id = pd.to_numeric(result_doc.get("draw_id"), errors="coerce")
+        if not pd.isna(draw_id):
+            docs_by_draw_id[int(draw_id)] = result_doc
+
+    candidates: list[tuple[pd.Timestamp, AlertDraw]] = []
+
+    def append_alert(result_doc: dict[str, Any], row: dict[str, Any] | None) -> bool:
+        draw_id = pd.to_numeric(result_doc.get("draw_id"), errors="coerce")
+        if pd.isna(draw_id):
+            return False
+        draw_id = int(draw_id)
         flagged_members = sorted(_flagged_members_from_doc(result_doc))
         if not result_doc.get("requires_review") or not flagged_members:
-            continue
-        row = _candidate_row_for_doc(int(result_doc["draw_id"]), context)
+            return False
         draw_ts = _doc_draw_timestamp(result_doc, row)
         if draw_ts is None or draw_ts < start or draw_ts > end:
-            continue
+            return False
         member_to_ccs = _candidate_member_to_ccs(row) if row is not None else {}
         partner_lookup = _partnership_partner_lookup(result_doc)
         flagged_by_member = {
@@ -395,12 +422,12 @@ def _build_alert_draws_from_backfill(
                 )
             )
         if requested_ccs and not alert_members:
-            continue
+            return False
         if min_bet_amount is not None and not any(float(item.bet_amount or 0.0) >= min_bet_amount for item in alert_members):
-            continue
+            return False
         high_amount_member_count = sum(1 for item in alert_members if item.high_amount_flag)
         alert = AlertDraw(
-            draw_id=int(result_doc["draw_id"]),
+            draw_id=draw_id,
             draw_date=_candidate_draw_date(row) if row is not None else draw_ts.isoformat(),
             risk_tier="HIGH",
             partnership_count=len(result_doc.get("partnerships", [])),
@@ -415,6 +442,35 @@ def _build_alert_draws_from_backfill(
             response_details=_public_response_details(result_doc.get("response_details", []), context),
         )
         candidates.append((draw_ts, alert))
+        return True
+
+    matched_candidate_docs = 0
+    try:
+        candidate_scan_limit = 50_000 if requested_ccs or min_bet_amount is not None else max_draws
+        candidate_rows = _candidate_rows_for_window(
+            context=context,
+            lookback_days=lookback_days,
+            max_draws=candidate_scan_limit,
+        )
+    except Exception:
+        candidate_rows = pd.DataFrame()
+    if not candidate_rows.empty:
+        for row in candidate_rows.to_dict("records"):
+            draw_id = pd.to_numeric(row.get("draw_id"), errors="coerce")
+            if pd.isna(draw_id):
+                continue
+            result_doc = docs_by_draw_id.get(int(draw_id))
+            if result_doc is None:
+                continue
+            matched_candidate_docs += 1
+            append_alert(result_doc, row)
+
+    if matched_candidate_docs == 0:
+        for result_doc in docs:
+            draw_id = pd.to_numeric(result_doc.get("draw_id"), errors="coerce")
+            row = None if pd.isna(draw_id) else _candidate_row_for_doc(int(draw_id), context)
+            append_alert(result_doc, row)
+
     candidates.sort(key=lambda item: (item[0], item[1].draw_id), reverse=True)
     alerts = [item[1] for item in candidates[: max(1, int(max_draws))]]
     alerts.sort(

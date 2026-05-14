@@ -59,6 +59,43 @@ def test_negative_sampling_emits_sampled_ordinary_negatives() -> None:
     assert int(pair_df["sampled_negative"].sum()) == 2
 
 
+def test_negative_sampling_is_stable_across_candidate_batches() -> None:
+    first = _candidate_row()
+    second = {**_candidate_row(), "draw_id": 9002}
+    combined = compute_pair_rows_from_candidates(
+        pd.DataFrame([first, second]),
+        rule_config=PairRuleConfig(),
+        mode="training",
+        ordinary_negative_sample=2,
+    )
+    split = pd.concat(
+        [
+            compute_pair_rows_from_candidates(
+                pd.DataFrame([first]),
+                rule_config=PairRuleConfig(),
+                mode="training",
+                ordinary_negative_sample=2,
+            ),
+            compute_pair_rows_from_candidates(
+                pd.DataFrame([second]),
+                rule_config=PairRuleConfig(),
+                mode="training",
+                ordinary_negative_sample=2,
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    sort_columns = ["draw_id", "member_a", "member_b"]
+    combined_view = combined.sort_values(sort_columns).reset_index(drop=True)
+    split_view = split.sort_values(sort_columns).reset_index(drop=True)
+    pd.testing.assert_series_equal(
+        combined_view["sampled_negative"],
+        split_view["sampled_negative"],
+        check_names=False,
+    )
+
+
 def test_pair_to_member_projection_preserves_stage1_schema() -> None:
     stage1_df, pair_df, _ = compute_partnership_features_from_candidates(
         pd.DataFrame([_candidate_row()]),

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+import yaml
 
 from fraud_detection.logger import get_logger
 
@@ -122,6 +129,17 @@ def log_artifacts_safe(path: str) -> None:
         logger.warning("mlflow.log_artifacts failed for %s: %s", path, e)
 
 
+class _LineageOnlyPyFunc:
+    def predict(self, model_input, params=None):
+        raise RuntimeError(
+            "This MLflow registry model is lineage-only. Use the promoted local artifacts for serving and scoring."
+        )
+
+
+def _load_pyfunc(data_path: str):
+    return _LineageOnlyPyFunc()
+
+
 def log_lineage_bundle_model(bundle_path: str | Path, artifact_path: str = "model_bundle") -> str:
     import mlflow
 
@@ -129,20 +147,36 @@ def log_lineage_bundle_model(bundle_path: str | Path, artifact_path: str = "mode
     if active_run is None:
         raise ValueError("An active MLflow run is required to log the lineage bundle model.")
 
-    class _LineageOnlyBundleModel(mlflow.pyfunc.PythonModel):
-        def load_context(self, context):
-            self.bundle_path = context.artifacts["bundle_path"]
+    bundle_path = Path(bundle_path)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Model bundle not found: {bundle_path}")
 
-        def predict(self, context, model_input, params=None):
-            raise RuntimeError(
-                "This MLflow registry model is lineage-only. Use the promoted local artifacts for serving and scoring."
-            )
-
-    mlflow.pyfunc.log_model(
-        artifact_path=artifact_path,
-        python_model=_LineageOnlyBundleModel(),
-        artifacts={"bundle_path": str(Path(bundle_path))},
-    )
+    # Use generic artifact logging instead of mlflow.pyfunc.log_model. Newer
+    # MLflow clients call the /logged-models endpoint during pyfunc logging,
+    # but the compose registry server is pinned to MLflow 2.10.2 and does not
+    # expose that endpoint. A hand-written MLmodel keeps registry compatibility
+    # without making serving depend on MLflow.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model_dir = Path(tmp_dir)
+        artifacts_dir = model_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundle_path, artifacts_dir / "model_bundle.joblib")
+        mlmodel = {
+            "artifact_path": artifact_path,
+            "flavors": {
+                "python_function": {
+                    "data": "artifacts",
+                    "loader_module": "fraud_detection.utils.mlflow_utils",
+                    "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                }
+            },
+            "mlflow_version": getattr(mlflow, "__version__", "unknown"),
+            "model_uuid": uuid.uuid4().hex,
+            "run_id": active_run.info.run_id,
+            "utc_time_created": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"),
+        }
+        (model_dir / "MLmodel").write_text(yaml.safe_dump(mlmodel, sort_keys=False), encoding="utf-8")
+        mlflow.log_artifacts(str(model_dir), artifact_path=artifact_path)
     return f"runs:/{active_run.info.run_id}/{artifact_path}"
 
 
@@ -187,11 +221,24 @@ def register_model_to_staging(
 
         # mlflow.register_model handles "create registered model if missing"
         # and "create new version" in a single call.
-        mv = mlflow.register_model(
-            model_uri=artifact_uri,
-            name=registered_name,
-            tags=tags or {},
-        )
+        try:
+            mv = mlflow.register_model(
+                model_uri=artifact_uri,
+                name=registered_name,
+                tags=tags or {},
+            )
+        except TypeError:
+            mv = mlflow.register_model(
+                model_uri=artifact_uri,
+                name=registered_name,
+            )
+            for key, value in (tags or {}).items():
+                client.set_model_version_tag(
+                    name=registered_name,
+                    version=mv.version,
+                    key=str(key),
+                    value=str(value),
+                )
 
         if description:
             try:

@@ -10,6 +10,7 @@ from fraud_detection.entity.config_entity import ModelEvaluationConfig
 from fraud_detection.exception import FraudDetectionException
 from fraud_detection.logger import get_logger
 from fraud_detection.utils.common import ensure_dir, read_json, write_json
+from fraud_detection.components.evaluation_plots import generate_evaluation_plots
 
 logger = get_logger(__name__)
 
@@ -98,6 +99,17 @@ class ModelEvaluation:
                 "evaluated_at": datetime.now(timezone.utc).isoformat(),
             }
             write_json(report, report_path)
+            try:
+                generate_evaluation_plots(
+                    scored=scored,
+                    output_dir=self.config.output_dir / "plots",
+                    training_report=training_report,
+                    stage2_model_path=self.training_artifact.stage2_model_path,
+                    stage1_oof_predictions_path=self.training_artifact.stage1_oof_predictions_path,
+                    capture_stats=capture_stats,
+                )
+            except Exception as plot_exc:
+                logger.warning("Evaluation plot generation failed; continuing without plots: %s", plot_exc)
             return ModelEvaluationArtifact(
                 stage2_holdout_predictions_path=scored_path,
                 capture_rate_table_path=capture_table_path,
