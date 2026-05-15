@@ -103,20 +103,75 @@ def train_stage2_model(
     feature_columns: list[str] | None = None,
     label_col: str = "label_gold_member",
     random_seed: int = 42,
+    n_splits: int = 5,
 ) -> PartnershipModelResult:
     features = [c for c in (feature_columns or STAGE2_FEATURE_COLUMNS) if c in stage2_features.columns]
     df = _prepare_labeled_frame(stage2_features, features, label_col, "sample_weight")
     predictions = df[["member_id"]].copy() if "member_id" in df.columns else pd.DataFrame(index=df.index)
     predictions["stage2_score"] = 0.0
+    predictions["is_oof"] = False
+    predictions["stage2_prediction_source"] = "not_evaluated"
     y = df[label_col].astype(int)
+    weights = df["sample_weight"].astype(float) if "sample_weight" in df.columns else None
     model = _new_classifier(random_seed)
-    if y.nunique() >= 2 and features:
-        model.fit(df[features], y)
-        predictions["stage2_score"] = _predict_proba(model, df[features])
-    else:
+    model_frame = df[features] if features else pd.DataFrame({"bias": np.zeros(len(df))}, index=df.index)
+
+    if y.nunique() < 2 or not features:
+        constant = int(y.iloc[0]) if len(y) else 0
         model = Pipeline([("model", DummyClassifier(strategy="constant", constant=int(y.iloc[0]) if len(y) else 0))])
-        model.fit(df[features] if features else pd.DataFrame({"bias": np.zeros(len(df))}), y)
-    return PartnershipModelResult(model, predictions, _classification_metrics(y, predictions["stage2_score"]), features)
+        model.fit(model_frame, y)
+        predictions["stage2_score"] = _predict_proba(model, model_frame)
+        validation_status = "not_evaluated_no_labels" if int(y.sum()) == 0 else "insufficient_labels_for_oof"
+        predictions["stage2_prediction_source"] = validation_status
+        metrics = _classification_metrics(pd.Series(dtype=int), pd.Series(dtype=float))
+        metrics.update(
+            {
+                "validation_status": validation_status,
+                "stage2_prediction_source": validation_status,
+                "oof_rows": 0,
+                "total_rows": int(len(predictions)),
+                "positive_rows": int(y.sum()),
+            }
+        )
+        return PartnershipModelResult(model, predictions, metrics, features)
+
+    split_count = min(int(n_splits), int(y.sum()), int((1 - y).sum()))
+    if split_count >= 2:
+        splitter = StratifiedKFold(n_splits=split_count, shuffle=True, random_state=random_seed)
+        for train_idx, val_idx in splitter.split(model_frame, y):
+            fold_model = _new_classifier(random_seed)
+            fit_kwargs = {}
+            if weights is not None:
+                fit_kwargs["model__sample_weight"] = weights.iloc[train_idx].to_numpy()
+            fold_model.fit(model_frame.iloc[train_idx], y.iloc[train_idx], **fit_kwargs)
+            predictions.loc[df.index[val_idx], "stage2_score"] = _predict_proba(
+                fold_model,
+                model_frame.iloc[val_idx],
+            )
+            predictions.loc[df.index[val_idx], "is_oof"] = True
+        validation_status = "evaluated_oof"
+        predictions["stage2_prediction_source"] = "oof"
+    else:
+        validation_status = "insufficient_labels_for_oof"
+        predictions["stage2_prediction_source"] = validation_status
+
+    final_fit_kwargs = {}
+    if weights is not None:
+        final_fit_kwargs["model__sample_weight"] = weights.to_numpy()
+    model.fit(model_frame, y, **final_fit_kwargs)
+
+    eval_mask = predictions["is_oof"].astype(bool)
+    metrics = _classification_metrics(y.loc[eval_mask], predictions.loc[eval_mask, "stage2_score"])
+    metrics.update(
+        {
+            "validation_status": validation_status,
+            "stage2_prediction_source": "oof" if validation_status == "evaluated_oof" else validation_status,
+            "oof_rows": int(eval_mask.sum()),
+            "total_rows": int(len(predictions)),
+            "positive_rows": int(y.sum()),
+        }
+    )
+    return PartnershipModelResult(model, predictions, metrics, features)
 
 
 def score_stage1(model: Any, stage1_features: pd.DataFrame, feature_columns: list[str] | None = None) -> pd.DataFrame:

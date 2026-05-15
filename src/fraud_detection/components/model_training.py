@@ -150,6 +150,18 @@ class ModelTraining:
                 partnership_features=partnership_features,
                 gold_members=gold_members,
             )
+            stage2_member_ids = (
+                set(stage2_features["member_id"].astype(str).str.strip().str.upper())
+                if "member_id" in stage2_features.columns
+                else set()
+            )
+            direct_analyst_members_in_stage2 = direct_analyst_members & stage2_member_ids
+            missing_direct_analyst_members = sorted(direct_analyst_members - stage2_member_ids)
+            if missing_direct_analyst_members:
+                logger.warning(
+                    "Stage 2 seeding: %d direct analyst fraud member(s) did not reach the Stage 2 frame because they were not in candidate pairs.",
+                    len(missing_direct_analyst_members),
+                )
             stage2_features_path = self.config.output_dir / "stage2_features.parquet"
             stage2_features.to_parquet(stage2_features_path, index=False)
             ccs_concentration_table_path = self.config.output_dir / "ccs_concentration_table.parquet"
@@ -183,7 +195,7 @@ class ModelTraining:
                 "stage1_model": stage1_result.model,
                 "stage2_model": stage2_result.model,
                 "stage1_feature_columns": stage1_feature_columns,
-                "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+                "stage2_feature_columns": stage2_result.feature_columns,
                 "use_candidate_store": use_candidate_store,
                 "pair_rules": dict(self.config.partnership.get("pair_rules", {})),
                 "ccs_features": dict(self.config.partnership.get("ccs_features", {})),
@@ -212,8 +224,11 @@ class ModelTraining:
                     else 0
                 ),
                 "direct_analyst_fraud_members": int(len(direct_analyst_members)),
+                "direct_analyst_fraud_members_in_stage2": int(len(direct_analyst_members_in_stage2)),
+                "direct_analyst_fraud_members_missing_stage2": int(len(missing_direct_analyst_members)),
+                "direct_analyst_fraud_members_missing_stage2_sample": missing_direct_analyst_members[:50],
                 "stage1_feature_columns": stage1_feature_columns,
-                "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+                "stage2_feature_columns": stage2_result.feature_columns,
                 "ccs_feature_columns": CCS_FEATURE_COLUMNS,
                 "stage2_alert_threshold": bundle["stage2_alert_threshold"],
                 "stage1_oof_predictions_path": str(stage1_oof_path),
@@ -224,7 +239,7 @@ class ModelTraining:
             write_json(report, training_report_path)
             return ModelTrainingArtifact(
                 training_report_path=training_report_path,
-                feature_columns=STAGE2_FEATURE_COLUMNS,
+                feature_columns=stage2_result.feature_columns,
                 stage1_model_path=stage1_model_path,
                 stage2_model_path=stage2_model_path,
                 model_bundle_path=bundle_path,
@@ -233,7 +248,7 @@ class ModelTraining:
                 partnership_table_path=self.fe_artifact.partnership_table_path,
                 ccs_concentration_table_path=ccs_concentration_table_path,
                 stage1_feature_columns=stage1_feature_columns,
-                stage2_feature_columns=STAGE2_FEATURE_COLUMNS,
+                stage2_feature_columns=stage2_result.feature_columns,
             )
         except Exception as exc:
             raise FraudDetectionException(exc, sys) from exc

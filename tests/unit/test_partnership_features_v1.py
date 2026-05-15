@@ -11,10 +11,11 @@ from fraud_detection.components.feature_engineering import FeatureEngineering
 from fraud_detection.components.partnership_features import (
     ROULETTE_POSITIONS,
     STAGE1_FEATURE_COLUMNS,
+    STAGE2_FEATURE_COLUMNS,
     build_stage2_training_frame,
     compute_partnership_features,
 )
-from fraud_detection.components.partnership_modeling import train_stage1_oof
+from fraud_detection.components.partnership_modeling import train_stage1_oof, train_stage2_model
 from fraud_detection.entity.artifact_entity import DataIngestionArtifact
 from fraud_detection.entity.config_entity import FeatureEngineeringConfig
 
@@ -151,6 +152,44 @@ def test_train_stage1_oof_marks_oof_rows():
     assert result.metrics["oof_rows"] == len(frame)
     assert result.predictions["is_oof"].all()
     assert result.predictions["stage1_score"].between(0, 1).all()
+
+
+def test_train_stage2_model_returns_oof_predictions_and_final_model():
+    rows = []
+    for idx in range(20):
+        rows.append(
+            {
+                "member_id": f"M{idx}",
+                "label_gold_member": int(idx % 5 == 0),
+                **{col: float(idx % 7) for col in STAGE2_FEATURE_COLUMNS},
+            }
+        )
+    frame = pd.DataFrame(rows)
+
+    result = train_stage2_model(frame, n_splits=2)
+
+    assert result.metrics["validation_status"] == "evaluated_oof"
+    assert result.metrics["oof_rows"] == len(frame)
+    assert result.predictions["is_oof"].all()
+    assert set(result.predictions["stage2_prediction_source"]) == {"oof"}
+    assert result.predictions["stage2_score"].between(0, 1).all()
+    assert result.model.predict_proba(frame[result.feature_columns]).shape[0] == len(frame)
+
+
+def test_train_stage2_model_marks_insufficient_oof_without_using_in_sample_scores():
+    frame = pd.DataFrame(
+        [
+            {"member_id": "A", "label_gold_member": 1, **{col: 1.0 for col in STAGE2_FEATURE_COLUMNS}},
+            {"member_id": "B", "label_gold_member": 0, **{col: 0.0 for col in STAGE2_FEATURE_COLUMNS}},
+        ]
+    )
+
+    result = train_stage2_model(frame, n_splits=5)
+
+    assert result.metrics["validation_status"] == "insufficient_labels_for_oof"
+    assert result.metrics["oof_rows"] == 0
+    assert not result.predictions["is_oof"].any()
+    assert set(result.predictions["stage2_prediction_source"]) == {"insufficient_labels_for_oof"}
 
 
 def test_feature_engineering_streams_candidate_only_stage1_rows(tmp_path: Path):

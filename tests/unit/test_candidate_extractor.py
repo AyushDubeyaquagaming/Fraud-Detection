@@ -207,6 +207,45 @@ def test_write_candidate_rows_stores_chunk_metadata_and_replaces_target(tmp_path
     assert not list(output_path.parent.glob("*.tmp"))
 
 
+def test_write_candidate_rows_preserves_existing_rows_outside_reextracted_chunk(tmp_path: Path) -> None:
+    output_path = tmp_path / "year=2026" / "month=05" / "week=19" / "draws.parquet"
+
+    def row(draw_id: int, day: int) -> dict:
+        return {
+            "draw_id": draw_id,
+            "trans_date_min": datetime(2026, 5, day, tzinfo=timezone.utc),
+            "trans_date_max": datetime(2026, 5, day, 0, 1, tzinfo=timezone.utc),
+            "qualifying_player_count": 2,
+            "member_ids": ["A", "B"],
+            "ccs_ids": ["C1", "C2"],
+            "total_bet_amounts": [1000.0, 1200.0],
+            "win_points": [0.0, 0.0],
+            "coverage_bytes": [b"\x01" * 38, b"\x00" * 38],
+            "amount_vector": [[1.0] * 38, [0.0] * 38],
+            "extraction_run_at": datetime(2026, 5, 14, tzinfo=timezone.utc),
+        }
+
+    write_candidate_rows(
+        [row(1, 4), row(2, 10)],
+        output_path,
+        chunk_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        chunk_end=datetime(2026, 5, 11, tzinfo=timezone.utc),
+    )
+    write_candidate_rows(
+        [row(3, 4)],
+        output_path,
+        chunk_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        chunk_end=datetime(2026, 5, 5, tzinfo=timezone.utc),
+    )
+
+    table = pq.read_table(output_path)
+    assert sorted(table.column("draw_id").to_pylist()) == [2, 3]
+    assert read_partition_chunk_bounds(output_path) == (
+        "2026-05-04T00:00:00+00:00",
+        "2026-05-05T00:00:00+00:00",
+    )
+
+
 def test_existing_partition_without_metadata_is_reextracted(tmp_path: Path) -> None:
     output_path = tmp_path / "data_store" / "candidate_draws" / "year=2026" / "month=04" / "week=18" / "draws.parquet"
     output_path.parent.mkdir(parents=True, exist_ok=True)

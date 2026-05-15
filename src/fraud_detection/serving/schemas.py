@@ -46,6 +46,9 @@ class ModelInfoResponse(BaseModel):
     snapshot_reason: str | None = None
     snapshot_lookback_days: int | None = None
     total_holdout_members: int = 0
+    total_evaluation_members: int = 0
+    validation_status: str | None = None
+    promotion_decision: str | None = None
     stage2_alert_threshold: float | None = None
     artifacts_loaded_at: str
 
@@ -68,6 +71,7 @@ class ReloadResponse(BaseModel):
     current_run_id: str
     reloaded_at: str
     total_holdout_members: int
+    total_evaluation_members: int = 0
 
 
 class ErrorResponse(BaseModel):

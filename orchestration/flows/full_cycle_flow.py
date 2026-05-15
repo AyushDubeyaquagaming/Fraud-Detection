@@ -10,7 +10,7 @@ import copy
 import json
 import sys
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,13 +64,40 @@ def _candidate_summary_dict(summary) -> dict[str, Any]:
     return _json_safe_dataclass(summary)
 
 
-def _resolve_window(config: dict[str, Any], start_date: str | None, end_date: str | None) -> tuple[datetime, datetime]:
+def _resolve_window(
+    config: dict[str, Any],
+    start_date: str | None,
+    end_date: str | None,
+    *,
+    window_mode: str = "fixed",
+    now: datetime | None = None,
+) -> tuple[datetime, datetime]:
+    if bool(start_date) != bool(end_date):
+        raise ValueError("Full cycle requires both start_date and end_date when either is provided.")
+    if start_date and end_date:
+        return parse_utc_date(str(start_date)), parse_utc_date(str(end_date))
+
     window = (config.get("partnership", {}) or {}).get("candidate_window", {}) or {}
-    start_value = start_date or window.get("start_date")
-    end_value = end_date or window.get("end_date")
+    if str(window_mode or "fixed").strip().lower() == "rolling":
+        lookback_days = int(window.get("rolling_lookback_days", 90))
+        if lookback_days <= 0:
+            raise ValueError("partnership.candidate_window.rolling_lookback_days must be positive.")
+        anchor = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+        end_dt = datetime.combine(anchor.date(), datetime_time.min, tzinfo=timezone.utc)
+        start_dt = end_dt - timedelta(days=lookback_days)
+        return start_dt, end_dt
+
+    start_value = window.get("start_date")
+    end_value = window.get("end_date")
     if not start_value or not end_value:
         raise ValueError("Full cycle requires start_date and end_date, either as args or partnership.candidate_window.")
     return parse_utc_date(str(start_value)), parse_utc_date(str(end_value))
+
+
+def _coerce_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _ccs_end_date_for_candidate_window(end_dt: datetime):
@@ -157,6 +184,7 @@ def run_full_cycle(
     batch_config_path: str | Path | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    window_mode: str = "fixed",
     force_candidates: bool = False,
     force_ccs: bool = False,
 ) -> dict[str, Any]:
@@ -164,7 +192,7 @@ def run_full_cycle(
     candidate_config_path = _resolve_repo_path(candidate_config_path)
     ccs_config_path = _resolve_repo_path(ccs_config_path)
     config = read_yaml(config_path)
-    start_dt, end_dt = _resolve_window(config, start_date, end_date)
+    start_dt, end_dt = _resolve_window(config, start_date, end_date, window_mode=window_mode)
     full_cycle_id = f"full_cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     full_cycle_dir = _resolve_repo_path(config["pipeline"]["artifact_root"]) / "full_cycle_runs" / full_cycle_id
     full_cycle_dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +205,7 @@ def run_full_cycle(
         "config_path": str(config_path),
         "start_date": start_dt.isoformat(),
         "end_date": end_dt.isoformat(),
+        "window_mode": window_mode,
         "full_cycle_dir": str(full_cycle_dir),
     }
     try:
@@ -196,6 +225,7 @@ def run_full_cycle(
                     "ccs_config_path": str(ccs_config_path),
                     "start_date": start_dt.isoformat(),
                     "end_date": end_dt.isoformat(),
+                    "window_mode": window_mode,
                     "force_candidates": force_candidates,
                     "force_ccs": force_ccs,
                 }
@@ -324,6 +354,7 @@ if _PREFECT_AVAILABLE:
         batch_config_path: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        window_mode: str = "fixed",
         force_candidates: bool = False,
         force_ccs: bool = False,
     ) -> dict[str, Any]:
@@ -336,6 +367,7 @@ if _PREFECT_AVAILABLE:
                 batch_config_path=batch_config_path,
                 start_date=start_date,
                 end_date=end_date,
+                window_mode=window_mode,
                 force_candidates=force_candidates,
                 force_ccs=force_ccs,
             )
@@ -361,6 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-config", default=None)
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
+    parser.add_argument("--window-mode", choices=["fixed", "rolling"], default="fixed")
     parser.add_argument("--force-candidates", action="store_true")
     parser.add_argument("--force-ccs", action="store_true")
     args = parser.parse_args()
@@ -373,6 +406,7 @@ if __name__ == "__main__":
                 batch_config_path=args.batch_config,
                 start_date=args.start_date,
                 end_date=args.end_date,
+                window_mode=args.window_mode,
                 force_candidates=args.force_candidates,
                 force_ccs=args.force_ccs,
             ),

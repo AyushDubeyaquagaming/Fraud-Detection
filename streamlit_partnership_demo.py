@@ -221,34 +221,50 @@ with tab_alerts:
                 "/score/alerts",
                 params=params,
             )
-            st.write(f"Draws scanned: {result['draws_scanned']}")
-            st.write(f"Alert draws found: {result['alert_draw_count']}")
-            alerts = pd.DataFrame(result["alerts"])
-            if alerts.empty:
-                st.info("No alert draws found in the selected window.")
-            else:
-                st.caption("Alert draws are sourced from the latest promoted weekly scoring output.")
-                columns = [
-                    "draw_date",
-                    "draw_id",
-                    "risk_tier",
-                    "partnership_count",
-                    "flagged_member_count",
-                    "highAmountMemberCount",
-                    "maxWinAmount",
-                    "maxBetAmount",
-                    "ccs_ids",
-                    "flagged_member_ids",
-                    "response_details",
-                ]
-                st.dataframe(alerts[[column for column in columns if column in alerts.columns]], use_container_width=True)
-                selected_draw = st.selectbox("Alert member details", alerts["draw_id"].astype(str).tolist())
-                selected = alerts.loc[alerts["draw_id"].astype(str).eq(selected_draw)].iloc[0].to_dict()
-                members = pd.DataFrame(selected.get("flaggedMembers") or selected.get("flagged_members") or [])
-                if not members.empty:
-                    st.dataframe(members, use_container_width=True)
+            st.session_state["alerts_result"] = result
+            st.session_state["alerts_params"] = params
+            st.session_state.pop("alerts_selected_draw", None)
         except Exception as exc:
             st.error(str(exc))
+
+    result = st.session_state.get("alerts_result")
+    if result:
+        st.write(f"Draws scanned: {result['draws_scanned']}")
+        st.write(f"Alert draws found: {result['alert_draw_count']}")
+        alerts = pd.DataFrame(result["alerts"])
+        if alerts.empty:
+            st.info("No alert draws found in the selected window.")
+        else:
+            st.caption("Alert draws are sourced from the latest promoted weekly scoring output.")
+            columns = [
+                "draw_date",
+                "draw_id",
+                "risk_tier",
+                "partnership_count",
+                "flagged_member_count",
+                "highAmountMemberCount",
+                "maxWinAmount",
+                "maxBetAmount",
+                "ccs_ids",
+                "flagged_member_ids",
+                "response_details",
+            ]
+            st.dataframe(alerts[[column for column in columns if column in alerts.columns]], use_container_width=True)
+            draw_options = alerts["draw_id"].astype(str).tolist()
+            selected_draw = st.session_state.get("alerts_selected_draw")
+            if selected_draw not in draw_options:
+                st.session_state["alerts_selected_draw"] = draw_options[0]
+            selected_draw = st.selectbox(
+                "Alert member details",
+                draw_options,
+                key="alerts_selected_draw",
+            )
+            selected = alerts.loc[alerts["draw_id"].astype(str).eq(selected_draw)].iloc[0].to_dict()
+            members = pd.DataFrame(selected.get("flaggedMembers") or selected.get("flagged_members") or [])
+            if members.empty:
+                st.info("No flagged member rows available for the selected draw.")
+            else:
+                st.dataframe(members, use_container_width=True)
 
 with tab_retrain:
     st.subheader("Add confirmed fraud feedback")

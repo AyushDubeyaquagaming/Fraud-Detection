@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 
@@ -69,6 +70,20 @@ def write_candidate_rows(
         metadata[CHUNK_END_METADATA_KEY] = chunk_end.isoformat().encode("utf-8")
         schema = schema.with_metadata(metadata)
     table = pa.Table.from_pylist(rows, schema=schema)
+    if output_path.exists() and chunk_start is not None and chunk_end is not None:
+        existing = pq.ParquetFile(output_path).read()
+        if existing.num_rows:
+            existing = existing.select([field.name for field in CANDIDATE_DRAW_SCHEMA]).cast(CANDIDATE_DRAW_SCHEMA)
+            timestamp_type = existing.schema.field("trans_date_min").type
+            start_scalar = pa.scalar(chunk_start, type=timestamp_type)
+            end_scalar = pa.scalar(chunk_end, type=timestamp_type)
+            outside_chunk = pc.or_(
+                pc.less(existing["trans_date_min"], start_scalar),
+                pc.greater_equal(existing["trans_date_min"], end_scalar),
+            )
+            retained = existing.filter(outside_chunk)
+            table = pa.concat_tables([retained, table], promote_options="default")
+            table = table.cast(schema)
     temp_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
     pq.write_table(
         table,

@@ -25,6 +25,11 @@ def _build_model_info(cache: ArtifactCache) -> ModelInfoResponse:
         snapshot_reason=bundle.snapshot_reason,
         snapshot_lookback_days=bundle.snapshot_metadata.get("lookback_days"),
         total_holdout_members=int(evaluation.get("total_members", len(bundle.stage2_holdout_predictions_df))),
+        total_evaluation_members=int(
+            evaluation.get("total_evaluation_members", evaluation.get("total_members", len(bundle.stage2_holdout_predictions_df)))
+        ),
+        validation_status=evaluation.get("validation_status"),
+        promotion_decision=evaluation.get("promotion_decision"),
         stage2_alert_threshold=(
             float(bundle.model_bundle["stage2_alert_threshold"])
             if bundle.model_bundle and "stage2_alert_threshold" in bundle.model_bundle

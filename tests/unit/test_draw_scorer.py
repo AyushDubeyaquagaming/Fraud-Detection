@@ -135,6 +135,43 @@ def test_candidate_nearmiss_gets_rule_floor_when_model_score_is_low() -> None:
     assert result.partnerships[0]["is_section_a"] is True
 
 
+def test_candidate_exact_partnership_high_amount_regression() -> None:
+    stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage1_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in PAIR_FEATURE_COLUMNS}), [0, 0])
+    stage2_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in STAGE2_FEATURE_COLUMNS}), [0, 0])
+    bundle = {
+        "model_version": "partnership_v1",
+        "stage1_model": stage1_model,
+        "stage2_model": stage2_model,
+        "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+        "use_candidate_store": True,
+        "stage1_flag_threshold": 0.7,
+    }
+
+    result = DrawScorer(bundle, source_run_id="run_test").score_candidate_draw(
+        {
+            "draw_id": 7300000,
+            "qualifying_player_count": 2,
+            "member_ids": ["SYNTH_EXACT_A", "SYNTH_EXACT_B"],
+            "ccs_ids": ["SYNTH_CCS", "SYNTH_CCS"],
+            "trans_date_min": pd.Timestamp("2026-05-10T18:27:57Z"),
+            "trans_date_max": pd.Timestamp("2026-05-10T18:28:00Z"),
+            "coverage_bytes": [bytes([1] * 19 + [0] * 19), bytes([0] * 19 + [1] * 19)],
+            "amount_vector": [[5000.0] * 19 + [0.0] * 19, [0.0] * 19 + [5000.0] * 19],
+            "total_bet_amounts": [95000.0, 95000.0],
+            "win_points": [90000.0, 90000.0],
+        }
+    )
+
+    assert result.requires_review is True
+    assert result.max_stage1_score == 1.0
+    assert {member["member_id"] for member in result.flagged_members} == {"SYNTH_EXACT_A", "SYNTH_EXACT_B"}
+    assert {member["bet_amount"] for member in result.flagged_members} == {95000.0}
+    assert all(member["high_amount_flag"] for member in result.flagged_members)
+    assert result.partnerships[0]["is_section_b"] is True
+
+
 def test_candidate_batch_scoring_matches_single_draw_path() -> None:
     stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=1))])
     stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=1))])

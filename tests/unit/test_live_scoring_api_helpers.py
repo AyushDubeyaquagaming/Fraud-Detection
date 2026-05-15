@@ -87,11 +87,12 @@ def test_candidate_rows_for_member_reads_partitioned_store(tmp_path):
 
 
 def test_score_alerts_includes_ccs_context_for_flagged_members(monkeypatch):
+    now = pd.Timestamp.now(tz="UTC")
     candidate_row = {
         "draw_id": 1,
         "member_ids": ["A", "B"],
         "ccs_ids": ["CA", "CB"],
-        "trans_date_min": pd.Timestamp("2026-05-07T00:00:00Z"),
+        "trans_date_min": now - pd.Timedelta(days=1),
     }
     result_doc = {
         "draw_id": 1,

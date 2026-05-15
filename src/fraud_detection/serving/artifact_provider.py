@@ -66,7 +66,10 @@ class LocalDiskArtifactProvider(ArtifactProvider):
         evaluation = read_json(evaluation_path) if evaluation_path.exists() else {}
         bundle_path = self.current_dir / manifest.get("model_bundle_file", MODEL_BUNDLE_FILE)
         model_bundle = load_joblib(bundle_path) if bundle_path.exists() else None
-        predictions_path = self.current_dir / "stage2_holdout_predictions.parquet"
+        predictions_file = str(manifest.get("stage2_evaluation_predictions_file", "stage2_evaluation_predictions.parquet"))
+        predictions_path = self.current_dir / predictions_file
+        if not predictions_path.exists():
+            predictions_path = self.current_dir / "stage2_holdout_predictions.parquet"
         predictions = pd.read_parquet(predictions_path) if predictions_path.exists() else pd.DataFrame(columns=["member_id"])
         if "member_id" in predictions.columns:
             predictions["member_id"] = predictions["member_id"].astype(str).str.strip().str.upper()

@@ -67,6 +67,9 @@ class ModelEvaluationArtifact:
     stage2_capture_rate_top_5pct: float
     stage2_lift_top_5pct: float
     stage2_top_50_captured: int
+    stage2_evaluation_predictions_path: Path | None = None
+    validation_status: str | None = None
+    promotion_decision: str | None = None
 
 
 @dataclass

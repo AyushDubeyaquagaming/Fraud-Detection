@@ -81,6 +81,8 @@ class ModelPusher:
                 metadata = {
                     "gate_passed": False,
                     "label_status": evaluation_report.get("label_status"),
+                    "validation_status": evaluation_report.get("validation_status"),
+                    "promotion_decision": evaluation_report.get("promotion_decision"),
                     "gate_reason": evaluation_report.get("gate_reason"),
                     "stage2_capture_top_5pct": self.evaluation_artifact.stage2_capture_rate_top_5pct,
                     "stage2_lift_top_5pct": self.evaluation_artifact.stage2_lift_top_5pct,
@@ -111,6 +113,11 @@ class ModelPusher:
             _copy_promoted_file(self.training_artifact.training_report_path, self.config.current_dir / "training_report.json")
             _copy_promoted_file(self.evaluation_artifact.evaluation_report_path, self.config.current_dir / "evaluation_report.json")
             _copy_promoted_file(self.evaluation_artifact.stage2_holdout_predictions_path, self.config.current_dir / "stage2_holdout_predictions.parquet")
+            if self.evaluation_artifact.stage2_evaluation_predictions_path and self.evaluation_artifact.stage2_evaluation_predictions_path.exists():
+                _copy_promoted_file(
+                    self.evaluation_artifact.stage2_evaluation_predictions_path,
+                    self.config.current_dir / "stage2_evaluation_predictions.parquet",
+                )
 
             registry_info = None
             registry_status = None
@@ -134,6 +141,8 @@ class ModelPusher:
                 "git_sha": git_sha,
                 "stage2_capture_top_5pct": self.evaluation_artifact.stage2_capture_rate_top_5pct,
                 "stage2_lift_top_5pct": self.evaluation_artifact.stage2_lift_top_5pct,
+                "validation_status": self.evaluation_artifact.validation_status,
+                "promotion_decision": self.evaluation_artifact.promotion_decision,
                 "registry_status": registry_status,
                 "mlflow_registry": registry_info,
             }
@@ -149,6 +158,7 @@ class ModelPusher:
                 "stage2_model_file": "stage2_model.joblib",
                 "partnership_table_file": "partnership_table.parquet",
                 "ccs_concentration_table_file": "ccs_concentration_table.parquet",
+                "stage2_evaluation_predictions_file": "stage2_evaluation_predictions.parquet",
                 "stage2_alert_threshold": read_json(self.training_artifact.training_report_path).get("stage2_alert_threshold", 0.65),
             }
             if registry_info:

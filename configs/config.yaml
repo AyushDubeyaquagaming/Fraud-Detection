@@ -64,6 +64,7 @@ partnership:
   candidate_window:
     start_date: 2026-02-25
     end_date: 2026-05-05
+    rolling_lookback_days: 90
   emit_negatives_sample: 5
   pair_rules:
     strict_min_ratio_similarity: 0.80

@@ -262,6 +262,8 @@ class TrainingPipeline:
                     eval_report = json.load(f)
                 mlflow.set_tag("label_status", str(eval_report.get("label_status", "unknown")))
                 mlflow.set_tag("gate_reason", str(eval_report.get("gate_reason", "unknown")))
+                mlflow.set_tag("validation_status", str(eval_report.get("validation_status", "unknown")))
+                mlflow.set_tag("promotion_decision", str(eval_report.get("promotion_decision", "unknown")))
                 log_metrics_safe({
                     "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
                     "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,

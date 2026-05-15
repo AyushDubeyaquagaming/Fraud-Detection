@@ -29,6 +29,7 @@ deployments:
       config_path: "configs/config.yaml"
       candidate_config_path: "configs/candidate_extraction.yaml"
       ccs_config_path: "configs/ccs_profit.yaml"
+      window_mode: "rolling"
     schedules:
       - cron: "0 1 * * 1"       # every Monday at 01:00 UTC
         timezone: UTC
