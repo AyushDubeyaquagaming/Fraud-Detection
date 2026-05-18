@@ -28,6 +28,7 @@ API_BASE_URL = os.getenv("FRAUD_API_BASE_URL", "http://127.0.0.1:8000")
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE")
 LIVE_PREDICTIONS_COLLECTION = os.getenv("LIVE_PREDICTIONS_COLLECTION", "live_predictions")
+MLFLOW_UI_URL = os.getenv("MLFLOW_UI_URL") or os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 ACTIVE_PREFECT_STATES = {"SCHEDULED", "PENDING", "RUNNING"}
 
 
@@ -402,7 +403,7 @@ with tab_retrain:
                 "Run is no longer active. Reloading API artifacts is safe, "
                 "but serving changes only if the run promoted a model."
             )
-            st.link_button("Open MLflow", os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+            st.link_button("Open MLflow", MLFLOW_UI_URL)
             if st.button("Reload API Artifacts"):
                 try:
                     result = post_json("/admin/reload", {})

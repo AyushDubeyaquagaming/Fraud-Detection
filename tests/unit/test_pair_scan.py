@@ -35,6 +35,8 @@ def test_strict_rule_fires_on_full_coverage_zero_overlap_positive_net() -> None:
 
     assert len(rows) == 1
     assert rows[0]["is_strict_match"] == 1
+    assert rows[0]["is_strict_collusion_pattern"] == 1
+    assert rows[0]["bet_amount_ratio_within_10pct"] == 1
     assert rows[0]["union_count"] == 38
     assert rows[0]["overlap_count"] == 0
 
@@ -119,7 +121,7 @@ def test_nearmiss_different_ccs_still_fires() -> None:
     assert rows[0]["pair_different_ccs"] == 1
 
 
-def test_high_stake_cross_ccs_nearmiss_can_allow_three_overlaps_and_larger_pair_loss() -> None:
+def test_high_stake_cross_ccs_nearmiss_requires_similar_total_stake() -> None:
     left_positions = {1, 2, 4, 6, 8, 9, 10, 13, 15, 17, 19, 20, 22, 24, 26, 27, 28, 31, 33, 35, 36, 37}
     right_positions = {0, 3, 5, 7, 9, 11, 12, 14, 16, 18, 21, 23, 25, 27, 29, 30, 32, 34, 36}
     left = [int(idx in left_positions) for idx in range(38)]
@@ -138,18 +140,54 @@ def test_high_stake_cross_ccs_nearmiss_can_allow_three_overlaps_and_larger_pair_
         mode="inference",
     )
 
+    assert rows == []
+
+
+def test_high_stake_cross_ccs_nearmiss_fires_when_total_stake_is_similar() -> None:
+    left_positions = {1, 2, 4, 6, 8, 9, 10, 13, 15, 17, 19, 20, 22, 24, 26, 27, 28, 31, 33, 35, 36, 37}
+    right_positions = {0, 3, 5, 7, 9, 11, 12, 14, 16, 18, 21, 23, 25, 27, 29, 30, 32, 34, 36}
+    left = [int(idx in left_positions) for idx in range(38)]
+    right = [int(idx in right_positions) for idx in range(38)]
+    row = _row(
+        [left, right],
+        [[2000.0 if value else 0.0 for value in left], [2000.0 if value else 0.0 for value in right]],
+        stakes=[45000.0, 41000.0],
+        wins=[72000.0, 0.0],
+        ccs_ids=["CCS016058", "CCS023061"],
+    )
+
+    rows = emit_pair_rows(
+        row,
+        PairRuleConfig(nearmiss_max_overlap=3, nearmiss_min_pair_net_per_stake=-0.20),
+        mode="inference",
+    )
+
     assert len(rows) == 1
     assert rows[0]["is_nearmiss"] == 1
-    assert rows[0]["pair_different_ccs"] == 1
+    assert rows[0]["stake_ratio"] >= 0.90
 
 
-def test_strict_does_not_fire_on_overlap() -> None:
+def test_strict_allows_small_overlap_by_config() -> None:
+    left = [1] * 20 + [0] * 18
+    right = [1] + [0] * 19 + [1] * 18
+    row = _row([left, right], [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]], wins=[1200.0, 1000.0])
+
+    rows = emit_pair_rows(row, PairRuleConfig(), mode="inference")
+
+    assert len(rows) == 1
+    assert rows[0]["is_strict_match"] == 1
+    assert rows[0]["is_min_overlap_pair"] == 1
+
+
+def test_strict_does_not_fire_when_overlap_exceeds_config() -> None:
     left = [1] * 20 + [0] * 18
     right = [1] + [0] * 19 + [1] * 18
     row = _row([left, right], [[10.0 if v else 0.0 for v in left], [10.0 if v else 0.0 for v in right]], wins=[1200.0, 1000.0])
 
     rows = emit_pair_rows(row, PairRuleConfig(nearmiss_max_overlap=0), mode="inference")
 
+    assert rows
+    rows = emit_pair_rows(row, PairRuleConfig(strict_max_overlap_count=0, nearmiss_max_overlap=0), mode="inference")
     assert rows == []
 
 

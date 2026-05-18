@@ -105,7 +105,7 @@ def test_pair_to_member_projection_preserves_stage1_schema() -> None:
         rolling_context=False,
     )
 
-    expected = ["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS]
+    expected = ["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS, "stage1_score"]
     assert list(stage1_df.columns) == expected
     assert not stage1_df.empty
     assert not pair_df.empty

@@ -114,6 +114,7 @@ class PartnershipMatch(BaseModel):
     union_coverage: float
     jaccard: float
     per_position_ratio: float
+    total_stake_ratio: float | None = None
     combined_bet_cv: float
     pair_net: float
     is_section_a: bool = False

@@ -7,9 +7,10 @@
 #   - prefect-postgres         Postgres for the Prefect orchestration DB (state, schedules, history)
 #   - prefect-server           Self-hosted Prefect server (NOT Prefect Cloud)
 #   - prefect-worker           Process worker that picks up flow runs from `fraud-pool`
+#   - streamlit-ui             Streamlit analyst/demo UI
 #
 # Bring up the long-running services:
-#   docker compose up -d mlflow-server prefect-postgres prefect-server prefect-worker fraud-detection-api
+#   docker compose up -d mlflow-server prefect-postgres prefect-server prefect-worker fraud-detection-api streamlit-ui
 # Initial deploy of flows (one-time, host-side):
 #   PREFECT_API_URL=http://localhost:4200/api prefect deploy --prefect-file orchestration/prefect.yaml
 
@@ -67,6 +68,9 @@ services:
       - .env
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - PREFECT_POOL_NAME=fraud-pool
+      - PYTHONPATH=/app/src:/app
     networks: [fraud-net]
     volumes:
       - ./artifacts:/app/artifacts
@@ -76,8 +80,57 @@ services:
       - ./data_store:/app/data_store
       - ./configs:/app/configs:ro
     depends_on:
-      - mlflow-server
+      mlflow-server:
+        condition: service_started
+      prefect-server:
+        condition: service_healthy
     command: full-cycle
+
+  streamlit-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fraud-detection:local
+    command: ["streamlit"]
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src:/app
+      - STREAMLIT_PORT=8501
+      - FRAUD_API_BASE_URL=http://fraud-detection-api:8000
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - PREFECT_UI_URL=${PREFECT_UI_URL:-http://localhost:4200}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_UI_URL=${MLFLOW_UI_URL:-http://localhost:5000}
+    networks: [fraud-net]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./configs:/app/configs:ro
+      - ./logs:/app/logs
+      - ./data_store:/app/data_store:ro
+    depends_on:
+      fraud-detection-api:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+      mlflow-server:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────────────
   # MLflow tracking + Model Registry (SQLite-backed for now; switch the

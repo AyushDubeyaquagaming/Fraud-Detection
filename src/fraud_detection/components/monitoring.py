@@ -287,8 +287,13 @@ class Monitoring:
         feature_report_path = reports_dir / "feature_drift.html"
         prediction_report_path = reports_dir / "prediction_drift.html"
 
-        cur_raw = _sample_parquet_bounded(cur_raw_path, n)
-        ref_raw = _sample_parquet_bounded(ref_raw_path, n)
+        if self.ingestion_artifact.source_type == "candidate_store":
+            logger.info("Monitoring: skipping raw data drift for candidate-store source; feature and prediction drift still run")
+            cur_raw = None
+            ref_raw = None
+        else:
+            cur_raw = _sample_parquet_bounded(cur_raw_path, n)
+            ref_raw = _sample_parquet_bounded(ref_raw_path, n)
         if cur_raw is not None and ref_raw is not None:
             shared_cols = _shared_nonempty_numeric_columns(ref_raw, cur_raw)
             if shared_cols:

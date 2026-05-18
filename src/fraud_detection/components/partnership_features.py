@@ -8,6 +8,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from fraud_detection.components.clique_scan import (
+    CliqueRuleConfig,
+    clique_rows_to_frame,
+    coerce_clique_rule_config,
+    emit_clique_rows,
+)
 from fraud_detection.components.pair_scan import (
     PAIR_FEATURE_COLUMNS,
     PairRuleConfig,
@@ -51,6 +57,15 @@ STAGE1_FEATURE_COLUMNS = [
     "is_exact_complementary_pair_in_draw",
     "is_near_complementary_pair_in_draw",
     "n_low_overlap_partners_in_draw",
+    "n_strict_pairs_in_draw",
+    "clique_size_estimate",
+    "clique_total_stake_share",
+    "clique_max_pair_rule_confidence",
+    "max_strict_pair_score_today",
+    "recurrence_1d",
+    "recurrence_3d",
+    "distinct_partners_1d",
+    "distinct_partners_3d",
     "rolling_partnership_recurrence_7d",
     "rolling_distinct_partners_7d",
     "rolling_min_jaccard_7d",
@@ -75,6 +90,15 @@ STAGE2_FEATURE_COLUMNS = [
     "n_draws_stage1_above_0p9",
     "longest_consecutive_high_stage1_streak",
     "n_distinct_high_score_partners",
+    "max_strict_pair_score_today",
+    "n_strict_pairs_in_draw",
+    "clique_size_estimate",
+    "clique_total_stake_share",
+    "clique_max_pair_rule_confidence",
+    "recurrence_1d",
+    "recurrence_3d",
+    "distinct_partners_1d",
+    "distinct_partners_3d",
     *SECTION_A_FEATURE_COLUMNS,
     "ccs_profit_share_1d",
     "ccs_profit_share_7d",
@@ -178,6 +202,20 @@ def compute_pair_rows_from_candidates(
     return pair_rows_to_frame(rows)
 
 
+def compute_clique_rows_from_candidates(
+    candidate_df: pd.DataFrame,
+    *,
+    rule_config: CliqueRuleConfig | dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    cfg = coerce_clique_rule_config(rule_config)
+    rows: list[dict[str, Any]] = []
+    if candidate_df.empty:
+        return clique_rows_to_frame(rows)
+    for row in candidate_df.itertuples(index=False):
+        rows.extend(emit_clique_rows(row._asdict(), cfg))
+    return clique_rows_to_frame(rows)
+
+
 def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_context: bool = True) -> pd.DataFrame:
     if pair_df.empty:
         return ensure_stage1_schema(pd.DataFrame())
@@ -187,6 +225,7 @@ def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_co
         pair_frame["pair_risk_score"] = pair_frame["is_strict_match"].astype(float)
     pair_frame["pair_risk_score"] = pd.to_numeric(pair_frame["pair_risk_score"], errors="coerce").fillna(0.0)
     pair_frame["draw_date"] = pd.to_datetime(pair_frame.get("draw_date"), errors="coerce", utc=True)
+    clique_lookup = _strict_clique_lookup(pair_frame)
 
     projected: list[dict[str, Any]] = []
     for row in pair_frame.to_dict("records"):
@@ -194,12 +233,14 @@ def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_co
             ("member_a", "member_b", "stake_a", "win_points_a", "coverage_count_a"),
             ("member_b", "member_a", "stake_b", "win_points_b", "coverage_count_b"),
         ]:
+            member_id = str(row.get(member_col, "")).strip().upper()
+            clique = clique_lookup.get((int(row.get("draw_id")), member_id), {})
             position_count = int(row.get(coverage_col) or 0)
             stake = float(row.get(stake_col) or 0.0)
             win_points = float(row.get(win_col) or 0.0)
             projected.append(
                 {
-                    "member_id": str(row.get(member_col, "")).strip().upper(),
+                    "member_id": member_id,
                     "ccs_id": row.get("ccs_a") if member_col == "member_a" else row.get("ccs_b"),
                     "draw_id": int(row.get("draw_id")),
                     "draw_date": row.get("draw_date"),
@@ -219,6 +260,11 @@ def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_co
                     "is_exact_complementary_pair_in_draw": int(row.get("is_strict_match") or 0),
                     "is_near_complementary_pair_in_draw": int(row.get("is_nearmiss") or 0),
                     "n_low_overlap_partners_in_draw": 1,
+                    "n_strict_pairs_in_draw": int(row.get("is_strict_collusion_pattern", row.get("is_strict_match")) or 0),
+                    "clique_size_estimate": int(clique.get("clique_size_estimate", 1)),
+                    "clique_total_stake_share": float(clique.get("clique_total_stake_share", 0.0)),
+                    "clique_max_pair_rule_confidence": float(clique.get("clique_max_pair_rule_confidence", 0.0)),
+                    "max_strict_pair_score_today": float(clique.get("max_strict_pair_score_today", 0.0)),
                     "_pair_risk_score": float(row.get("pair_risk_score") or 0.0),
                 }
             )
@@ -241,8 +287,104 @@ def project_pair_scores_to_member_draw_rows(pair_df: pd.DataFrame, *, rolling_co
         how="left",
     )
     best["n_low_overlap_partners_in_draw"] = pd.to_numeric(best["_partner_count"], errors="coerce").fillna(1).astype(int)
-    best = best.drop(columns=["_pair_risk_score", "_partner_count"], errors="ignore")
+    strict_counts = (
+        member_rows.groupby(["member_id", "draw_id"], as_index=False)["n_strict_pairs_in_draw"]
+        .sum()
+        .rename(columns={"n_strict_pairs_in_draw": "_strict_pair_count"})
+    )
+    best = best.merge(strict_counts, on=["member_id", "draw_id"], how="left")
+    best["n_strict_pairs_in_draw"] = pd.to_numeric(best["_strict_pair_count"], errors="coerce").fillna(0).astype(int)
+    best = best.drop(columns=["_pair_risk_score", "_partner_count", "_strict_pair_count"], errors="ignore")
     out = ensure_stage1_schema(best)
+    return add_rolling_context(out, pd.DataFrame()) if rolling_context else out
+
+
+def project_clique_scores_to_member_draw_rows(
+    clique_df: pd.DataFrame,
+    candidate_df: pd.DataFrame | None = None,
+    *,
+    rolling_context: bool = True,
+) -> pd.DataFrame:
+    if clique_df.empty:
+        return ensure_stage1_schema(pd.DataFrame())
+
+    candidate_lookup = _candidate_member_lookup(candidate_df)
+    projected: list[dict[str, Any]] = []
+    for row in clique_df.to_dict("records"):
+        members = [str(member).strip().upper() for member in row.get("member_ids", []) if str(member).strip()]
+        if not members:
+            continue
+        draw_id = int(row.get("draw_id"))
+        clique_size = int(row.get("clique_size") or len(members))
+        group_stake = float(row.get("group_total_stake") or 0.0)
+        score = float(row.get("clique_risk_score") or row.get("rule_confidence") or 0.0)
+        for member_id in members:
+            context = candidate_lookup.get((draw_id, member_id), {})
+            partners = sorted(member for member in members if member != member_id)
+            stake = float(context.get("stake", 0.0))
+            win_points = float(context.get("win_points", 0.0))
+            position_count = int(context.get("position_count", 0))
+            projected.append(
+                {
+                    "member_id": member_id,
+                    "ccs_id": context.get("ccs_id", row.get("ccs_id")),
+                    "draw_id": draw_id,
+                    "draw_date": row.get("draw_date"),
+                    "best_partner_member_id": partners[0] if partners else None,
+                    "position_count": position_count,
+                    "stake": stake,
+                    "win_points": win_points,
+                    "net_result": win_points - stake,
+                    "partition_score": min(position_count, 38 - position_count),
+                    "best_partner_union_coverage": float(row.get("union_coverage_pct") or 0.0),
+                    "best_partner_jaccard": float(
+                        (row.get("duplicate_position_count") or 0) / max(row.get("union_count") or 0, 1)
+                    ),
+                    "best_partner_per_position_ratio": float(row.get("avg_amount_ratio") or 0.0),
+                    "best_partner_combined_bet_cv": float(row.get("combined_bet_cv") or 0.0),
+                    "best_partner_pair_net": float(row.get("group_net") or 0.0),
+                    "best_partner_overlap_positions": int(row.get("duplicate_position_count") or 0),
+                    "best_partner_union_positions": int(row.get("union_count") or 0),
+                    "is_exact_complementary_pair_in_draw": int((row.get("union_count") or 0) >= 38),
+                    "is_near_complementary_pair_in_draw": int((row.get("union_count") or 0) >= 36),
+                    "n_low_overlap_partners_in_draw": max(clique_size - 1, 0),
+                    "n_strict_pairs_in_draw": max(clique_size - 1, 0)
+                    if int(row.get("is_strict_clique") or 0)
+                    else 0,
+                    "clique_size_estimate": clique_size,
+                    "clique_total_stake_share": float(stake / group_stake) if group_stake > 0 else 0.0,
+                    "clique_max_pair_rule_confidence": float(row.get("rule_confidence") or 0.0),
+                    "max_strict_pair_score_today": score,
+                    "stage1_score": score,
+                    "_partner_count": max(clique_size - 1, 0),
+                }
+            )
+
+    if not projected:
+        return ensure_stage1_schema(pd.DataFrame())
+    frame = pd.DataFrame(projected)
+    frame["stage1_score"] = pd.to_numeric(frame["stage1_score"], errors="coerce").fillna(0.0)
+    frame = frame.sort_values(
+        ["member_id", "draw_id", "stage1_score", "best_partner_union_coverage"],
+        ascending=[True, True, False, False],
+    )
+    partner_counts = (
+        frame.groupby(["member_id", "draw_id"], as_index=False)["_partner_count"]
+        .sum()
+        .rename(columns={"_partner_count": "_clique_partner_count"})
+    )
+    best = frame.drop_duplicates(["member_id", "draw_id"], keep="first").merge(
+        partner_counts,
+        on=["member_id", "draw_id"],
+        how="left",
+    )
+    best["n_low_overlap_partners_in_draw"] = pd.to_numeric(
+        best["_clique_partner_count"], errors="coerce"
+    ).fillna(best["n_low_overlap_partners_in_draw"]).astype(int)
+    scores = best[["member_id", "draw_id", "stage1_score"]].copy()
+    out = ensure_stage1_schema(best.drop(columns=["_partner_count", "_clique_partner_count"], errors="ignore"))
+    out = out.merge(scores, on=["member_id", "draw_id"], how="left")
+    out["stage1_score"] = pd.to_numeric(out["stage1_score"], errors="coerce").fillna(0.0)
     return add_rolling_context(out, pd.DataFrame()) if rolling_context else out
 
 
@@ -250,6 +392,7 @@ def compute_partnership_features_from_candidates(
     candidate_df: pd.DataFrame,
     *,
     rule_config: PairRuleConfig | dict[str, Any] | None = None,
+    clique_rule_config: CliqueRuleConfig | dict[str, Any] | None = None,
     mode: str = "inference",
     ordinary_negative_sample: int = 0,
     rolling_context: bool = True,
@@ -262,7 +405,16 @@ def compute_partnership_features_from_candidates(
         ordinary_negative_sample=ordinary_negative_sample,
         random_seed=random_seed,
     )
-    stage1_member_df = project_pair_scores_to_member_draw_rows(pair_df, rolling_context=rolling_context)
+    clique_df = compute_clique_rows_from_candidates(candidate_df, rule_config=clique_rule_config)
+    pair_stage1 = project_pair_scores_to_member_draw_rows(pair_df, rolling_context=False)
+    clique_stage1 = project_clique_scores_to_member_draw_rows(
+        clique_df,
+        candidate_df,
+        rolling_context=False,
+    )
+    stage1_member_df = _combine_stage1_signal_rows(pair_stage1, clique_stage1)
+    if rolling_context:
+        stage1_member_df = add_rolling_context(stage1_member_df, pd.DataFrame())
     return stage1_member_df, pair_df, pd.DataFrame()
 
 
@@ -400,10 +552,20 @@ def add_rolling_context(features: pd.DataFrame, partnership_df: pd.DataFrame) ->
     if features.empty:
         return features
     out = features.sort_values(["member_id", "draw_date", "draw_id"]).copy()
+    if "n_strict_pairs_in_draw" not in out.columns:
+        out["n_strict_pairs_in_draw"] = 0
+    if "n_low_overlap_partners_in_draw" not in out.columns:
+        out["n_low_overlap_partners_in_draw"] = 0
+    if "best_partner_member_id" not in out.columns:
+        out["best_partner_member_id"] = None
     results = []
     for _, group in out.groupby("member_id", sort=False):
         group = group.copy()
         dates = pd.to_datetime(group["draw_date"], errors="coerce", utc=True)
+        recurrence_1d = []
+        recurrence_3d = []
+        distinct_partners_1d = []
+        distinct_partners_3d = []
         recurrences = []
         distinct_partners = []
         min_jaccards = []
@@ -411,14 +573,26 @@ def add_rolling_context(features: pd.DataFrame, partnership_df: pd.DataFrame) ->
         for idx, current_date in enumerate(dates):
             if pd.isna(current_date):
                 hist = group.iloc[0:0]
+                hist_1d = hist
+                hist_3d = hist
             else:
                 hist = group.loc[(dates < current_date) & (dates >= current_date - pd.Timedelta(days=7))]
+                hist_1d = group.loc[(dates < current_date) & (dates >= current_date - pd.Timedelta(days=1))]
+                hist_3d = group.loc[(dates < current_date) & (dates >= current_date - pd.Timedelta(days=3))]
+            recurrence_1d.append(int((pd.to_numeric(hist_1d.get("n_strict_pairs_in_draw", 0), errors="coerce").fillna(0) > 0).sum()))
+            recurrence_3d.append(int((pd.to_numeric(hist_3d.get("n_strict_pairs_in_draw", 0), errors="coerce").fillna(0) > 0).sum()))
+            distinct_partners_1d.append(int(hist_1d.get("best_partner_member_id", pd.Series(dtype=object)).dropna().astype(str).nunique()))
+            distinct_partners_3d.append(int(hist_3d.get("best_partner_member_id", pd.Series(dtype=object)).dropna().astype(str).nunique()))
             recurrences.append(int((pd.to_numeric(hist.get("n_low_overlap_partners_in_draw", 0), errors="coerce").fillna(0) > 0).sum()))
             distinct_partners.append(int(hist.get("best_partner_member_id", pd.Series(dtype=object)).dropna().astype(str).nunique()))
             jacc = pd.to_numeric(hist.get("best_partner_jaccard", pd.Series(dtype=float)), errors="coerce")
             min_jaccards.append(float(jacc.min()) if jacc.notna().any() else 1.0)
             comp = pd.to_numeric(hist.get("is_exact_complementary_pair_in_draw", pd.Series(dtype=float)), errors="coerce").fillna(0)
             comp_pct.append(float(comp.mean()) if len(comp) else 0.0)
+        group["recurrence_1d"] = recurrence_1d
+        group["recurrence_3d"] = recurrence_3d
+        group["distinct_partners_1d"] = distinct_partners_1d
+        group["distinct_partners_3d"] = distinct_partners_3d
         group["rolling_partnership_recurrence_7d"] = recurrences
         group["rolling_distinct_partners_7d"] = distinct_partners
         group["rolling_min_jaccard_7d"] = min_jaccards
@@ -454,6 +628,15 @@ def build_stage2_training_frame(
         "longest_consecutive_high_stage1_streak": ("stage1_score", lambda s: _longest_streak(s >= 0.5)),
     }
     for col in [
+        "max_strict_pair_score_today",
+        "n_strict_pairs_in_draw",
+        "clique_size_estimate",
+        "clique_total_stake_share",
+        "clique_max_pair_rule_confidence",
+        "recurrence_1d",
+        "recurrence_3d",
+        "distinct_partners_1d",
+        "distinct_partners_3d",
         "ccs_profit_share_1d",
         "ccs_profit_share_7d",
         "ccs_total_profit_1d",
@@ -536,6 +719,90 @@ def ensure_stage1_schema(frame: pd.DataFrame) -> pd.DataFrame:
     return out[["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id", *STAGE1_FEATURE_COLUMNS]]
 
 
+def _candidate_member_lookup(candidate_df: pd.DataFrame | None) -> dict[tuple[int, str], dict[str, Any]]:
+    if candidate_df is None or candidate_df.empty:
+        return {}
+    lookup: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in candidate_df.to_dict("records"):
+        draw_id_value = pd.to_numeric(row.get("draw_id"), errors="coerce")
+        if pd.isna(draw_id_value):
+            continue
+        draw_id = int(draw_id_value)
+        members = [str(value).strip().upper() for value in row.get("member_ids", [])]
+        ccs_ids = list(row.get("ccs_ids", []))
+        stakes = list(row.get("total_bet_amounts", []))
+        wins = list(row.get("win_points", []))
+        coverage_bytes = list(row.get("coverage_bytes", []))
+        for idx, member_id in enumerate(members):
+            if not member_id:
+                continue
+            raw_coverage = coverage_bytes[idx] if idx < len(coverage_bytes) else b""
+            coverage = np.frombuffer(bytes(raw_coverage), dtype=np.uint8) if raw_coverage is not None else np.array([])
+            lookup[(draw_id, member_id)] = {
+                "ccs_id": None if idx >= len(ccs_ids) else ccs_ids[idx],
+                "stake": float(stakes[idx] or 0.0) if idx < len(stakes) else 0.0,
+                "win_points": float(wins[idx] or 0.0) if idx < len(wins) else 0.0,
+                "position_count": int((coverage > 0).sum()) if coverage.size else 0,
+            }
+    return lookup
+
+
+def _combine_stage1_signal_rows(*frames: pd.DataFrame) -> pd.DataFrame:
+    usable = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not usable:
+        return ensure_stage1_schema(pd.DataFrame())
+    for frame in usable:
+        if "stage1_score" not in frame.columns:
+            frame["stage1_score"] = 0.0
+        frame["stage1_score"] = pd.to_numeric(frame["stage1_score"], errors="coerce").fillna(0.0)
+    combined = pd.concat(usable, ignore_index=True)
+    combined["member_id"] = combined["member_id"].astype(str).str.strip().str.upper()
+    combined["draw_id"] = pd.to_numeric(combined["draw_id"], errors="coerce").astype("Int64")
+    combined = combined.dropna(subset=["draw_id"]).copy()
+    if combined.empty:
+        return ensure_stage1_schema(pd.DataFrame())
+    combined["draw_id"] = combined["draw_id"].astype(int)
+    for column in ["n_low_overlap_partners_in_draw", "n_strict_pairs_in_draw"]:
+        if column not in combined.columns:
+            combined[column] = 0
+        combined[column] = pd.to_numeric(combined[column], errors="coerce").fillna(0).astype(int)
+    aggregate_counts = combined.groupby(["member_id", "draw_id"], as_index=False).agg(
+        _n_low_overlap_partners_in_draw=("n_low_overlap_partners_in_draw", "sum"),
+        _n_strict_pairs_in_draw=("n_strict_pairs_in_draw", "sum"),
+        _clique_size_estimate=("clique_size_estimate", "max"),
+        _clique_total_stake_share=("clique_total_stake_share", "max"),
+        _clique_max_pair_rule_confidence=("clique_max_pair_rule_confidence", "max"),
+        _max_strict_pair_score_today=("max_strict_pair_score_today", "max"),
+        _stage1_score=("stage1_score", "max"),
+    )
+    combined = combined.sort_values(
+        ["member_id", "draw_id", "stage1_score", "best_partner_union_coverage"],
+        ascending=[True, True, False, False],
+    )
+    best = combined.drop_duplicates(["member_id", "draw_id"], keep="first").merge(
+        aggregate_counts,
+        on=["member_id", "draw_id"],
+        how="left",
+    )
+    best["n_low_overlap_partners_in_draw"] = best["_n_low_overlap_partners_in_draw"]
+    best["n_strict_pairs_in_draw"] = best["_n_strict_pairs_in_draw"]
+    best["clique_size_estimate"] = best["_clique_size_estimate"].fillna(best.get("clique_size_estimate", 1))
+    best["clique_total_stake_share"] = best["_clique_total_stake_share"].fillna(
+        best.get("clique_total_stake_share", 0.0)
+    )
+    best["clique_max_pair_rule_confidence"] = best["_clique_max_pair_rule_confidence"].fillna(
+        best.get("clique_max_pair_rule_confidence", 0.0)
+    )
+    best["max_strict_pair_score_today"] = best["_max_strict_pair_score_today"].fillna(
+        best.get("max_strict_pair_score_today", 0.0)
+    )
+    scores = best[["member_id", "draw_id", "_stage1_score"]].rename(columns={"_stage1_score": "stage1_score"})
+    out = ensure_stage1_schema(best.drop(columns=[column for column in best.columns if column.startswith("_")], errors="ignore"))
+    out = out.merge(scores, on=["member_id", "draw_id"], how="left")
+    out["stage1_score"] = pd.to_numeric(out["stage1_score"], errors="coerce").fillna(0.0)
+    return out
+
+
 def save_partnership_feature_artifacts(
     output_dir: Path,
     *,
@@ -615,7 +882,72 @@ def _neutral_partner_metrics() -> dict[str, Any]:
         "is_exact_complementary_pair_in_draw": 0,
         "is_near_complementary_pair_in_draw": 0,
         "n_low_overlap_partners_in_draw": 0,
+        "n_strict_pairs_in_draw": 0,
+        "clique_size_estimate": 1,
+        "clique_total_stake_share": 0.0,
+        "clique_max_pair_rule_confidence": 0.0,
+        "max_strict_pair_score_today": 0.0,
+        "recurrence_1d": 0,
+        "recurrence_3d": 0,
+        "distinct_partners_1d": 0,
+        "distinct_partners_3d": 0,
     }
+
+
+def _strict_clique_lookup(pair_frame: pd.DataFrame) -> dict[tuple[int, str], dict[str, float | int]]:
+    if pair_frame.empty:
+        return {}
+    strict_col = "is_strict_collusion_pattern" if "is_strict_collusion_pattern" in pair_frame.columns else "is_strict_match"
+    strict = pair_frame.loc[pd.to_numeric(pair_frame.get(strict_col), errors="coerce").fillna(0).astype(int) == 1].copy()
+    if strict.empty:
+        return {}
+    strict["draw_id"] = pd.to_numeric(strict["draw_id"], errors="coerce").astype("Int64")
+    strict = strict.dropna(subset=["draw_id"])
+    for col in ["stake_a", "stake_b", "rule_confidence", "pair_risk_score"]:
+        if col not in strict.columns:
+            strict[col] = 0.0
+        strict[col] = pd.to_numeric(strict[col], errors="coerce").fillna(0.0)
+
+    lookup: dict[tuple[int, str], dict[str, float | int]] = {}
+    for draw_id, draw_pairs in strict.groupby("draw_id", sort=False):
+        members = pd.unique(
+            pd.concat(
+                [
+                    draw_pairs["member_a"].astype(str).str.strip().str.upper(),
+                    draw_pairs["member_b"].astype(str).str.strip().str.upper(),
+                ],
+                ignore_index=True,
+            )
+        )
+        member_stake = {member: 0.0 for member in members}
+        partner_counts = {member: 0 for member in members}
+        max_conf = {member: 0.0 for member in members}
+        max_score = {member: 0.0 for member in members}
+        for row in draw_pairs.to_dict("records"):
+            a = str(row.get("member_a", "")).strip().upper()
+            b = str(row.get("member_b", "")).strip().upper()
+            stake_a = float(row.get("stake_a") or 0.0)
+            stake_b = float(row.get("stake_b") or 0.0)
+            conf = float(row.get("rule_confidence") or 0.0)
+            score = float(row.get("pair_risk_score") or conf)
+            member_stake[a] = max(member_stake.get(a, 0.0), stake_a)
+            member_stake[b] = max(member_stake.get(b, 0.0), stake_b)
+            partner_counts[a] = partner_counts.get(a, 0) + 1
+            partner_counts[b] = partner_counts.get(b, 0) + 1
+            max_conf[a] = max(max_conf.get(a, 0.0), conf)
+            max_conf[b] = max(max_conf.get(b, 0.0), conf)
+            max_score[a] = max(max_score.get(a, 0.0), score)
+            max_score[b] = max(max_score.get(b, 0.0), score)
+        total_stake = sum(member_stake.values())
+        clique_size = int(len([member for member, count in partner_counts.items() if count > 0]))
+        for member, stake in member_stake.items():
+            lookup[(int(draw_id), member)] = {
+                "clique_size_estimate": clique_size,
+                "clique_total_stake_share": float(stake / total_stake) if total_stake > 0 else 0.0,
+                "clique_max_pair_rule_confidence": float(max_conf.get(member, 0.0)),
+                "max_strict_pair_score_today": float(max_score.get(member, 0.0)),
+            }
+    return lookup
 
 
 def _pair_metric(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:

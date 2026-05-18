@@ -50,3 +50,4 @@ audit_*.py
 rebuild_*.py
 hybrid_inference.py
 streamlit_*.py
+!streamlit_partnership_demo.py

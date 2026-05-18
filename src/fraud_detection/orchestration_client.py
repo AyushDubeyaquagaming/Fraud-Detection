@@ -29,6 +29,9 @@ def prefect_api_url() -> str:
 
 
 def prefect_ui_url() -> str:
+    configured_ui_url = os.getenv("PREFECT_UI_URL", "").strip()
+    if configured_ui_url:
+        return configured_ui_url.rstrip("/")
     api_url = prefect_api_url()
     return api_url[:-4] if api_url.endswith("/api") else api_url
 

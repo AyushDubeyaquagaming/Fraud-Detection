@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from fraud_detection.components.clique_scan import coerce_clique_rule_config
 from fraud_detection.components.pair_scan import PAIR_FEATURE_COLUMNS, coerce_pair_rule_config
 from fraud_detection.components.ccs_features import CCS_FEATURE_COLUMNS, attach_ccs_concentration_features_from_frame, prepare_profit_frame
 from fraud_detection.components.partnership_features import (
@@ -14,7 +15,10 @@ from fraud_detection.components.partnership_features import (
     PartnershipThresholds,
     build_live_stage2_frame,
     compute_partnership_features,
+    compute_clique_rows_from_candidates,
     compute_pair_rows_from_candidates,
+    ensure_stage1_schema,
+    project_clique_scores_to_member_draw_rows,
     project_pair_scores_to_member_draw_rows,
 )
 from fraud_detection.components.partnership_modeling import score_stage1, score_stage2
@@ -65,6 +69,7 @@ class DrawScorer:
             if k in PartnershipThresholds.__dataclass_fields__
         })
         self.pair_rules = coerce_pair_rule_config(bundle.get("pair_rules") or {})
+        self.clique_rules = coerce_clique_rule_config(bundle.get("clique_rules") or {})
         self.stage1_flag_threshold = float(
             bundle.get("stage1_flag_threshold", self.pair_rules.stage1_flag_threshold)
         )
@@ -101,7 +106,13 @@ class DrawScorer:
             rolling_context=False,
             candidate_thresholds=self.thresholds,
         )
-        stage1_scores = score_stage1(self.stage1_model, stage1_features, self.stage1_feature_columns)
+        stage1_score_values = score_stage1(self.stage1_model, stage1_features, self.stage1_feature_columns)
+        stage1_scores = stage1_features.merge(
+            stage1_score_values[[column for column in ["member_id", "draw_id", "stage1_score"] if column in stage1_score_values.columns]],
+            on=[column for column in ["member_id", "draw_id"] if column in stage1_features.columns],
+            how="left",
+        )
+        stage1_scores["stage1_score"] = pd.to_numeric(stage1_scores.get("stage1_score"), errors="coerce").fillna(0.0)
         stage1_scores_with_ccs = self._attach_serving_ccs_context(stage1_scores)
         live_stage2 = build_live_stage2_frame(
             stage1_scores_with_ccs,
@@ -167,9 +178,17 @@ class DrawScorer:
         partnership_features: pd.DataFrame | None = None,
     ) -> DrawScoreResult:
         row = candidate_row.to_dict() if isinstance(candidate_row, pd.Series) else dict(candidate_row)
-        pair_events = compute_pair_rows_from_candidates(pd.DataFrame([row]), rule_config=self.pair_rules, mode="inference")
+        candidate_frame = pd.DataFrame([row])
+        pair_events = compute_pair_rows_from_candidates(candidate_frame, rule_config=self.pair_rules, mode="inference")
         pair_events = self._score_candidate_pairs(pair_events)
-        return self._candidate_result_from_pairs(row, pair_events, stage1_history=stage1_history, partnership_features=partnership_features)
+        clique_events = compute_clique_rows_from_candidates(candidate_frame, rule_config=self.clique_rules)
+        return self._candidate_result_from_signals(
+            row,
+            pair_events,
+            clique_events,
+            stage1_history=stage1_history,
+            partnership_features=partnership_features,
+        )
 
     def score_candidate_batch(
         self,
@@ -183,6 +202,7 @@ class DrawScorer:
         rows = candidate_rows.to_dict("records")
         pair_events = compute_pair_rows_from_candidates(candidate_rows, rule_config=self.pair_rules, mode="inference")
         pair_events = self._score_candidate_pairs(pair_events)
+        clique_events = compute_clique_rows_from_candidates(candidate_rows, rule_config=self.clique_rules)
         if pair_events.empty:
             grouped_pairs: dict[int, pd.DataFrame] = {}
         else:
@@ -190,10 +210,18 @@ class DrawScorer:
                 int(draw_id): group.copy()
                 for draw_id, group in pair_events.groupby("draw_id", sort=False)
             }
+        if clique_events.empty:
+            grouped_cliques: dict[int, pd.DataFrame] = {}
+        else:
+            grouped_cliques = {
+                int(draw_id): group.copy()
+                for draw_id, group in clique_events.groupby("draw_id", sort=False)
+            }
         return [
-            self._candidate_result_from_pairs(
+            self._candidate_result_from_signals(
                 row,
                 grouped_pairs.get(int(row["draw_id"]), pd.DataFrame()),
+                grouped_cliques.get(int(row["draw_id"]), pd.DataFrame()),
                 stage1_history=stage1_history,
                 partnership_features=partnership_features,
             )
@@ -202,7 +230,11 @@ class DrawScorer:
 
     def _score_candidate_pairs(self, pair_events: pd.DataFrame) -> pd.DataFrame:
         if not pair_events.empty:
-            near_mask = pair_events["is_strict_match"].astype(int).eq(0)
+            strict_signal = pd.to_numeric(
+                pair_events.get("is_strict_collusion_pattern", pair_events.get("is_strict_match", 0)),
+                errors="coerce",
+            ).fillna(0).astype(int)
+            near_mask = strict_signal.eq(0)
             pair_events["stage1_model_score"] = 0.0
             if near_mask.any():
                 try:
@@ -213,7 +245,7 @@ class DrawScorer:
             pair_events["pair_risk_score"] = pd.to_numeric(
                 pair_events["stage1_model_score"], errors="coerce"
             ).fillna(0.0)
-            pair_events.loc[pair_events["is_strict_match"].astype(int).eq(1), "pair_risk_score"] = 1.0
+            pair_events.loc[strict_signal.eq(1), "pair_risk_score"] = 1.0
             nearmiss_mask = pair_events["is_nearmiss"].astype(int).eq(1)
             pair_events.loc[nearmiss_mask, "pair_risk_score"] = pair_events.loc[nearmiss_mask, "pair_risk_score"].clip(
                 lower=self.stage1_flag_threshold
@@ -228,8 +260,25 @@ class DrawScorer:
         stage1_history: pd.DataFrame | None = None,
         partnership_features: pd.DataFrame | None = None,
     ) -> DrawScoreResult:
+        return self._candidate_result_from_signals(
+            row,
+            pair_events,
+            pd.DataFrame(),
+            stage1_history=stage1_history,
+            partnership_features=partnership_features,
+        )
+
+    def _candidate_result_from_signals(
+        self,
+        row: dict[str, Any],
+        pair_events: pd.DataFrame,
+        clique_events: pd.DataFrame,
+        *,
+        stage1_history: pd.DataFrame | None = None,
+        partnership_features: pd.DataFrame | None = None,
+    ) -> DrawScoreResult:
         draw_id = int(row["draw_id"])
-        if pair_events.empty:
+        if pair_events.empty and clique_events.empty:
             response_details = self._response_details(stage1_history, partnership_features)
             return DrawScoreResult(
                 draw_id=draw_id,
@@ -246,12 +295,8 @@ class DrawScorer:
                 requires_review=False,
                 response_details=response_details,
             )
-        stage1_features = project_pair_scores_to_member_draw_rows(pair_events, rolling_context=False)
-        stage1_scores = (
-            stage1_features[["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id"]].copy()
-            if not stage1_features.empty
-            else pd.DataFrame(columns=["member_id", "ccs_id", "draw_id", "draw_date", "best_partner_member_id"])
-        )
+        candidate_frame = pd.DataFrame([row])
+        pair_stage1 = project_pair_scores_to_member_draw_rows(pair_events, rolling_context=False)
         if not pair_events.empty:
             score_rows = []
             for item in pair_events.to_dict("records"):
@@ -265,9 +310,13 @@ class DrawScorer:
                         }
                     )
             member_scores = pd.DataFrame(score_rows).groupby(["member_id", "draw_id"], as_index=False)["stage1_score"].max()
-            stage1_scores = stage1_scores.merge(member_scores, on=["member_id", "draw_id"], how="left")
-        else:
-            stage1_scores["stage1_score"] = []
+            pair_stage1 = pair_stage1.merge(member_scores, on=["member_id", "draw_id"], how="left")
+        clique_stage1 = project_clique_scores_to_member_draw_rows(
+            clique_events,
+            candidate_frame,
+            rolling_context=False,
+        )
+        stage1_scores = self._combine_candidate_stage1_scores(pair_stage1, clique_stage1)
         stage1_scores["stage1_score"] = pd.to_numeric(stage1_scores.get("stage1_score"), errors="coerce").fillna(0.0)
         stage1_scores_with_ccs = self._attach_serving_ccs_context(stage1_scores)
         live_stage2 = build_live_stage2_frame(
@@ -291,7 +340,7 @@ class DrawScorer:
             }
             for item in scored_members.itertuples(index=False)
         ]
-        partnerships = self._candidate_partnership_docs(pair_events)
+        partnerships = self._candidate_partnership_docs(pair_events) + self._candidate_clique_docs(clique_events)
         flagged = scored_members.loc[
             (scored_members["stage1_score"] >= self.stage1_flag_threshold)
             | (scored_members["stage2_score"] >= self.stage2_alert_threshold)
@@ -324,6 +373,64 @@ class DrawScorer:
             requires_review=bool(flagged_members or partnerships),
             response_details=response_details,
         )
+
+    @staticmethod
+    def _combine_candidate_stage1_scores(*frames: pd.DataFrame) -> pd.DataFrame:
+        usable = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+        if not usable:
+            return ensure_stage1_schema(pd.DataFrame()).assign(stage1_score=pd.Series(dtype=float))
+        for frame in usable:
+            if "stage1_score" not in frame.columns:
+                frame["stage1_score"] = 0.0
+            frame["stage1_score"] = pd.to_numeric(frame["stage1_score"], errors="coerce").fillna(0.0)
+        combined = pd.concat(usable, ignore_index=True)
+        combined["member_id"] = combined["member_id"].astype(str).str.strip().str.upper()
+        combined["draw_id"] = pd.to_numeric(combined["draw_id"], errors="coerce").astype("Int64")
+        combined = combined.dropna(subset=["draw_id"]).copy()
+        if combined.empty:
+            return ensure_stage1_schema(pd.DataFrame()).assign(stage1_score=pd.Series(dtype=float))
+        combined["draw_id"] = combined["draw_id"].astype(int)
+        for column in [
+            "n_low_overlap_partners_in_draw",
+            "n_strict_pairs_in_draw",
+            "clique_size_estimate",
+            "clique_total_stake_share",
+            "clique_max_pair_rule_confidence",
+            "max_strict_pair_score_today",
+            "best_partner_union_coverage",
+        ]:
+            if column not in combined.columns:
+                combined[column] = 0.0
+            combined[column] = pd.to_numeric(combined[column], errors="coerce").fillna(0.0)
+        aggregate = combined.groupby(["member_id", "draw_id"], as_index=False).agg(
+            _n_low_overlap_partners_in_draw=("n_low_overlap_partners_in_draw", "sum"),
+            _n_strict_pairs_in_draw=("n_strict_pairs_in_draw", "sum"),
+            _clique_size_estimate=("clique_size_estimate", "max"),
+            _clique_total_stake_share=("clique_total_stake_share", "max"),
+            _clique_max_pair_rule_confidence=("clique_max_pair_rule_confidence", "max"),
+            _max_strict_pair_score_today=("max_strict_pair_score_today", "max"),
+            _stage1_score=("stage1_score", "max"),
+        )
+        combined = combined.sort_values(
+            ["member_id", "draw_id", "stage1_score", "best_partner_union_coverage"],
+            ascending=[True, True, False, False],
+        )
+        best = combined.drop_duplicates(["member_id", "draw_id"], keep="first").merge(
+            aggregate,
+            on=["member_id", "draw_id"],
+            how="left",
+        )
+        best["n_low_overlap_partners_in_draw"] = best["_n_low_overlap_partners_in_draw"].astype(int)
+        best["n_strict_pairs_in_draw"] = best["_n_strict_pairs_in_draw"].astype(int)
+        best["clique_size_estimate"] = best["_clique_size_estimate"]
+        best["clique_total_stake_share"] = best["_clique_total_stake_share"]
+        best["clique_max_pair_rule_confidence"] = best["_clique_max_pair_rule_confidence"]
+        best["max_strict_pair_score_today"] = best["_max_strict_pair_score_today"]
+        scores = best[["member_id", "draw_id", "_stage1_score"]].rename(columns={"_stage1_score": "stage1_score"})
+        out = ensure_stage1_schema(best.drop(columns=[column for column in best.columns if column.startswith("_")], errors="ignore"))
+        out = out.merge(scores, on=["member_id", "draw_id"], how="left")
+        out["stage1_score"] = pd.to_numeric(out["stage1_score"], errors="coerce").fillna(0.0)
+        return out
 
     @staticmethod
     def _response_details(
@@ -464,7 +571,10 @@ class DrawScorer:
             return []
         docs = []
         flagged = pair_events.loc[
-            pair_events["is_strict_match"].astype(int).eq(1)
+            pd.to_numeric(
+                pair_events.get("is_strict_collusion_pattern", pair_events.get("is_strict_match", 0)),
+                errors="coerce",
+            ).fillna(0).astype(int).eq(1)
             | (pd.to_numeric(pair_events.get("pair_risk_score"), errors="coerce").fillna(0.0) >= self.stage1_flag_threshold)
         ]
         for row in flagged.itertuples(index=False):
@@ -477,10 +587,42 @@ class DrawScorer:
                     "union_coverage": float(row.union_coverage_pct),
                     "jaccard": float(row.overlap_count / max(row.union_count, 1)),
                     "per_position_ratio": float(row.ratio_similarity),
+                    "total_stake_ratio": float(row.stake_ratio),
                     "combined_bet_cv": 0.0,
                     "pair_net": float(row.pair_net),
+                    "rule_confidence": float(getattr(row, "rule_confidence", 0.0)),
                     "is_section_a": bool(getattr(row, "is_nearmiss", 0)),
-                    "is_section_b": bool(getattr(row, "is_strict_match", 0)),
+                    "is_section_b": bool(getattr(row, "is_strict_collusion_pattern", getattr(row, "is_strict_match", 0))),
+                }
+            )
+        return docs
+
+    def _candidate_clique_docs(self, clique_events: pd.DataFrame) -> list[dict[str, Any]]:
+        if clique_events.empty:
+            return []
+        docs = []
+        risk = pd.to_numeric(clique_events.get("clique_risk_score"), errors="coerce").fillna(0.0)
+        strict = pd.to_numeric(clique_events.get("is_strict_clique"), errors="coerce").fillna(0).astype(int)
+        nearmiss = pd.to_numeric(clique_events.get("is_nearmiss_clique"), errors="coerce").fillna(0).astype(int)
+        flagged = clique_events.loc[strict.eq(1) | nearmiss.eq(1) | risk.ge(self.stage1_flag_threshold)]
+        for row in flagged.itertuples(index=False):
+            score = float(getattr(row, "clique_risk_score", 0.0) or 0.0)
+            union_count = int(getattr(row, "union_count", 0) or 0)
+            duplicate_count = int(getattr(row, "duplicate_position_count", 0) or 0)
+            docs.append(
+                {
+                    "member_ids": [str(member) for member in getattr(row, "member_ids", [])],
+                    "stage1_score_max": score,
+                    "stage1_score_mean": score,
+                    "union_coverage": float(getattr(row, "union_coverage_pct", 0.0) or 0.0),
+                    "jaccard": float(duplicate_count / max(union_count, 1)),
+                    "per_position_ratio": float(getattr(row, "avg_amount_ratio", 0.0) or 0.0),
+                    "total_stake_ratio": float(getattr(row, "total_stake_ratio", 0.0) or 0.0),
+                    "combined_bet_cv": float(getattr(row, "combined_bet_cv", 0.0) or 0.0),
+                    "pair_net": float(getattr(row, "group_net", 0.0) or 0.0),
+                    "rule_confidence": float(getattr(row, "rule_confidence", 0.0) or 0.0),
+                    "is_section_a": bool(getattr(row, "is_nearmiss_clique", 0)),
+                    "is_section_b": bool(getattr(row, "is_strict_clique", 0)),
                 }
             )
         return docs
@@ -509,6 +651,7 @@ class DrawScorer:
                     "union_coverage": float(row.union_coverage),
                     "jaccard": float(row.jaccard),
                     "per_position_ratio": float(row.per_position_ratio),
+                    "total_stake_ratio": float(getattr(row, "stake_ratio", 0.0) or 0.0),
                     "combined_bet_cv": float(row.combined_bet_cv),
                     "pair_net": float(row.pair_net),
                     "is_section_a": False,

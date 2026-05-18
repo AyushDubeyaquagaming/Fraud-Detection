@@ -14,10 +14,6 @@ case "$1" in
     shift
     exec python scripts/run_batch_scoring.py "$@"
     ;;
-  audit)
-    shift
-    exec python scripts/audit_artifacts.py "$@"
-    ;;
   test)
     shift
     exec python -m pytest tests/ "$@"
@@ -28,6 +24,14 @@ case "$1" in
   serve)
     shift
     exec python scripts/run_api.py --host 0.0.0.0 --port "${API_PORT:-8000}" "$@"
+    ;;
+  streamlit)
+    shift
+    exec streamlit run streamlit_partnership_demo.py \
+      --server.address 0.0.0.0 \
+      --server.port "${STREAMLIT_PORT:-8501}" \
+      --server.headless true \
+      "$@"
     ;;
   worker)
     shift
