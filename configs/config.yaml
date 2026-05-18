@@ -61,12 +61,18 @@ live_scoring:
 partnership:
   use_candidate_store: true
   candidate_store_path: "data_store/candidate_draws"
+  short_rolling_windows: [1, 3]
+  synthetic_positives_from_strict_pattern: false
+  strict_inference_filter: false
   candidate_window:
     start_date: 2026-02-25
     end_date: 2026-05-05
+    rolling_lookback_days: 90
   emit_negatives_sample: 5
   pair_rules:
     strict_min_ratio_similarity: 0.80
+    strict_min_stake_ratio: 0.90
+    strict_max_overlap_count: 2
     strict_min_pair_net_per_stake: -0.10
     nearmiss_min_union: 36
     nearmiss_max_overlap: 3
@@ -74,7 +80,30 @@ partnership:
     nearmiss_min_pair_net_per_stake: -0.15
     nearmiss_require_different_ccs: true
     min_total_bet_amount: 1000.0
+    min_pair_total_bet_amount: 0.0
     stage1_flag_threshold: 0.70
+    strict_inference_filter: false
+  clique_rules:
+    min_group_size: 3
+    max_group_size: 4
+    min_union_count: 34
+    strict_union_count: 36
+    max_duplicate_position_count: 2
+    min_member_coverage_count: 2
+    max_member_coverage_count: 24
+    min_member_stake: 1000.0
+    min_group_total_stake: 30000.0
+    min_avg_amount_ratio: 0.80
+    min_total_stake_ratio: 0.90
+    require_same_ccs: true
+    max_candidates_per_ccs: 16
+    stage1_flag_threshold: 0.70
+    section_team_enabled: true
+    min_section_team_clusters: 3
+    min_section_team_distinct_ccs: 3
+    min_section_team_union_count: 36
+    min_duplicate_cluster_members: 3
+    max_section_team_clusters: 8
   ccs_features:
     enabled: true
     profit_path: "data_store/ccs_daily_profit"
@@ -83,9 +112,10 @@ partnership:
   analyst_label_overlay:
     enabled: true
     require_both_members_for_pair_override: true
+    any_member_clique_override: false
     conflict_policy: "no_override"
   stage1_flag_threshold: 0.70
-  stream_batch_size: 20000
+  stream_batch_size: 500
   candidate_thresholds:
     min_position_count: 4
     max_position_count: 34

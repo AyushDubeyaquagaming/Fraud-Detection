@@ -48,6 +48,8 @@ def ensure_prediction_indexes() -> None:
     predictions.create_index("flagged_members.member_id")
     labels.create_index([("draw_id", 1), ("member_id", 1)], unique=True)
     labels.create_index("decided_at")
+    labels.create_index("draw_date")
+    labels.create_index("ccs_id")
     state.create_index("_id", unique=True)
 
 
@@ -66,11 +68,13 @@ def insert_analyst_label(
     draw_id: int,
     member_id: str,
     label: str,
-    analyst_id: str,
-    model_version: str,
+    analyst_id: str | None = None,
+    model_version: str = "partnership_v1",
     prediction_id: str | None = None,
     notes: str | None = None,
     decided_at: datetime | None = None,
+    draw_date: datetime | str | None = None,
+    ccs_id: str | None = None,
 ) -> Any:
     inserted_id, _ = upsert_analyst_label(
         draw_id=draw_id,
@@ -81,6 +85,8 @@ def insert_analyst_label(
         prediction_id=prediction_id,
         notes=notes,
         decided_at=decided_at,
+        draw_date=draw_date,
+        ccs_id=ccs_id,
     )
     return inserted_id
 
@@ -90,11 +96,13 @@ def upsert_analyst_label(
     draw_id: int,
     member_id: str,
     label: str,
-    analyst_id: str,
-    model_version: str,
+    analyst_id: str | None = None,
+    model_version: str = "partnership_v1",
     prediction_id: str | None = None,
     notes: str | None = None,
     decided_at: datetime | None = None,
+    draw_date: datetime | str | None = None,
+    ccs_id: str | None = None,
 ) -> tuple[Any, bool]:
     if label not in {"fraud", "not_fraud"}:
         raise ValueError("label must be 'fraud' or 'not_fraud'")
@@ -104,14 +112,21 @@ def upsert_analyst_label(
         "member_id": str(member_id).strip().upper(),
         "label": label,
         "tier": "gold_analyst",
-        "analyst_id": analyst_id,
         "decided_at": decided_at or datetime.now(timezone.utc),
         "model_version": model_version,
         "notes": notes,
     }
+    unset_fields: dict[str, str] = {"analyst_id": ""}
+    if draw_date is not None:
+        doc["draw_date"] = _normalize_datetime(draw_date)
+    if ccs_id is not None and str(ccs_id).strip():
+        doc["ccs_id"] = str(ccs_id).strip().upper()
+    update_doc: dict[str, Any] = {"$set": doc}
+    if unset_fields:
+        update_doc["$unset"] = unset_fields
     result = get_analyst_labels_collection().update_one(
         {"draw_id": doc["draw_id"], "member_id": doc["member_id"]},
-        {"$set": doc},
+        update_doc,
         upsert=True,
     )
     created = result.upserted_id is not None
@@ -122,6 +137,28 @@ def upsert_analyst_label(
         {"_id": 1},
     )
     return (existing["_id"] if existing else None), False
+
+
+def _normalize_datetime(value: datetime | str) -> datetime | str:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    except Exception:
+        return str(value)
+    if pd.isna(parsed):
+        return str(value)
+    return parsed.to_pydatetime()
+
+
+def read_recent_analyst_labels(limit: int = 50) -> list[dict[str, Any]]:
+    cursor = (
+        get_analyst_labels_collection()
+        .find({}, {"_id": 0})
+        .sort("decided_at", -1)
+        .limit(max(1, int(limit)))
+    )
+    return list(cursor)
 
 
 def read_analyst_labels_within_window(start: datetime, end: datetime) -> list[dict[str, Any]]:

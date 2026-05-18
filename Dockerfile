@@ -29,8 +29,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY orchestration/ ./orchestration/
-COPY tests/ ./tests/
 COPY configs/ ./configs/
+COPY streamlit_partnership_demo.py ./
 COPY pyproject.toml ./
 COPY README.md ./
 COPY ["ROULET CHEATING DATA.csv", "./"]
@@ -44,9 +44,11 @@ RUN adduser --disabled-password --gecos "" --uid 1000 fraud && \
     chown -R fraud:fraud /app
 
 COPY docker-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 USER fraud
+
+EXPOSE 8000 8501
 
 VOLUME ["/app/artifacts", "/app/logs", "/app/mlruns", "/app/data_cache", "/app/data_store"]
 

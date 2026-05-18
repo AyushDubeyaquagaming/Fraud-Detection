@@ -38,6 +38,21 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _direct_analyst_fraud_members(draw_ids: pd.Series | list[int]) -> set[str]:
+    scoped_draw_ids = pd.to_numeric(pd.Series(draw_ids), errors="coerce").dropna().astype(int).unique().tolist()
+    if not scoped_draw_ids:
+        return set()
+    try:
+        from fraud_detection.components.analyst_label_overlay import latest_analyst_decisions
+        from fraud_detection.utils.mongo_predictions import read_analyst_labels_for_draws
+
+        decisions = latest_analyst_decisions(read_analyst_labels_for_draws(scoped_draw_ids))
+    except Exception as exc:
+        logger.warning("Direct analyst fraud member labels unavailable during Stage 2 seeding: %s", exc)
+        return set()
+    return {member_id for (_draw_id, member_id), label in decisions.items() if label == "fraud"}
+
+
 class ModelTraining:
     def __init__(self, config: ModelTrainingConfig, fe_artifact: FeatureEngineeringArtifact):
         self.config = config
@@ -74,8 +89,12 @@ class ModelTraining:
                     on=["draw_id", "member_a", "member_b"],
                     how="left",
                 )
-                pair_scored["pair_risk_score"] = pair_scored["is_strict_match"].where(
-                    pair_scored["is_strict_match"].eq(1),
+                strict_signal = pd.to_numeric(
+                    pair_scored.get("is_strict_collusion_pattern", pair_scored.get("is_strict_match", 0)),
+                    errors="coerce",
+                ).fillna(0).astype(int)
+                pair_scored["pair_risk_score"] = strict_signal.where(
+                    strict_signal.eq(1),
                     pd.to_numeric(pair_scored["stage1_score"], errors="coerce").fillna(0.0),
                 )
                 nearmiss_values = pair_scored.get("is_nearmiss", pd.Series(0, index=pair_scored.index))
@@ -90,6 +109,10 @@ class ModelTraining:
                     gold_members = set(gold_pairs["member_a"].astype(str).str.upper()) | set(
                         gold_pairs["member_b"].astype(str).str.upper()
                     )
+                direct_analyst_members = _direct_analyst_fraud_members(
+                    pair_scored.get("draw_id", pd.Series(dtype=object))
+                )
+                gold_members |= direct_analyst_members
                 score_rows = []
                 for row in pair_scored.to_dict("records"):
                     score = float(row.get("pair_risk_score") or 0.0)
@@ -114,6 +137,24 @@ class ModelTraining:
                 stage1_predictions_for_stage2["stage1_score"] = pd.to_numeric(
                     stage1_predictions_for_stage2["stage1_score"], errors="coerce"
                 ).fillna(0.0)
+                stage1_signal_features = (
+                    pd.read_parquet(self.fe_artifact.stage1_features_path)
+                    if self.fe_artifact.stage1_features_path and self.fe_artifact.stage1_features_path.exists()
+                    else pd.DataFrame()
+                )
+                if not stage1_signal_features.empty and "stage1_score" in stage1_signal_features.columns:
+                    clique_signal_rows = stage1_signal_features.loc[
+                        pd.to_numeric(stage1_signal_features["stage1_score"], errors="coerce").fillna(0.0) > 0.0
+                    ].copy()
+                    if not clique_signal_rows.empty:
+                        stage1_predictions_for_stage2 = pd.concat(
+                            [stage1_predictions_for_stage2, clique_signal_rows],
+                            ignore_index=True,
+                        )
+                        stage1_predictions_for_stage2 = stage1_predictions_for_stage2.sort_values(
+                            ["member_id", "draw_id", "stage1_score", "best_partner_union_coverage"],
+                            ascending=[True, True, False, False],
+                        ).drop_duplicates(["member_id", "draw_id"], keep="first")
                 ccs_cfg = self.config.partnership.get("ccs_features", {}) or {}
                 if ccs_cfg.get("enabled", False):
                     stage1_predictions_for_stage2 = attach_ccs_concentration_features(
@@ -123,6 +164,7 @@ class ModelTraining:
                         concentration_threshold=float(ccs_cfg.get("concentration_threshold", 0.70)),
                     )
             else:
+                direct_analyst_members = set()
                 gold_members = set(stage1_labeled.loc[stage1_labeled["label_gold"].eq(1), "member_id"].astype(str).str.upper())
                 stage1_predictions_for_stage2 = stage1_result.predictions
             stage2_features = build_stage2_training_frame(
@@ -130,6 +172,18 @@ class ModelTraining:
                 partnership_features=partnership_features,
                 gold_members=gold_members,
             )
+            stage2_member_ids = (
+                set(stage2_features["member_id"].astype(str).str.strip().str.upper())
+                if "member_id" in stage2_features.columns
+                else set()
+            )
+            direct_analyst_members_in_stage2 = direct_analyst_members & stage2_member_ids
+            missing_direct_analyst_members = sorted(direct_analyst_members - stage2_member_ids)
+            if missing_direct_analyst_members:
+                logger.warning(
+                    "Stage 2 seeding: %d direct analyst fraud member(s) did not reach the Stage 2 frame because they were not in candidate pairs.",
+                    len(missing_direct_analyst_members),
+                )
             stage2_features_path = self.config.output_dir / "stage2_features.parquet"
             stage2_features.to_parquet(stage2_features_path, index=False)
             ccs_concentration_table_path = self.config.output_dir / "ccs_concentration_table.parquet"
@@ -158,20 +212,28 @@ class ModelTraining:
             save_joblib(stage2_result.model, stage2_model_path)
 
             thresholds = PartnershipThresholds(**dict(self.config.partnership.get("candidate_thresholds", {})))
+            pair_rules = dict(self.config.partnership.get("pair_rules", {}))
+            if "strict_inference_filter" in self.config.partnership:
+                pair_rules["strict_inference_filter"] = self.config.partnership["strict_inference_filter"]
             bundle = {
                 "model_version": "partnership_v1",
                 "stage1_model": stage1_result.model,
                 "stage2_model": stage2_result.model,
                 "stage1_feature_columns": stage1_feature_columns,
-                "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+                "stage2_feature_columns": stage2_result.feature_columns,
                 "use_candidate_store": use_candidate_store,
-                "pair_rules": dict(self.config.partnership.get("pair_rules", {})),
+                "pair_rules": pair_rules,
+                "clique_rules": dict(self.config.partnership.get("clique_rules", {})),
                 "ccs_features": dict(self.config.partnership.get("ccs_features", {})),
                 "section_a_feature_columns": SECTION_A_FEATURE_COLUMNS,
                 "candidate_thresholds": thresholds.to_dict(),
                 "stage1_high_threshold": float(self.config.partnership.get("stage1_high_threshold", 0.5)),
                 "stage2_alert_threshold": float(self.config.partnership.get("stage2_alert_threshold", 0.65)),
                 "rolling_window_days": int(self.config.partnership.get("rolling_window_days", 7)),
+                "short_rolling_windows": list(self.config.partnership.get("short_rolling_windows", [1, 3])),
+                "synthetic_positives_from_strict_pattern": bool(
+                    self.config.partnership.get("synthetic_positives_from_strict_pattern", False)
+                ),
                 "label_tier_weights": self.config.partnership.get("label_tier_weights", {"gold": 1.0, "silver": 1.0, "bronze": 0.5, "gold_analyst": 1.0}),
                 "trained_at": datetime.now(timezone.utc).isoformat(),
                 "git_sha": _git_sha(),
@@ -186,9 +248,17 @@ class ModelTraining:
                 "stage2": stage2_result.metrics,
                 "stage1_rows": int(len(stage1_labeled)),
                 "stage2_rows": int(len(stage2_features)),
-                "fraud_members": int(stage2_features["label_gold_member"].sum()) if "label_gold_member" in stage2_features else 0,
+                "fraud_members": (
+                    int(stage2_features["label_gold_member"].sum())
+                    if "label_gold_member" in stage2_features
+                    else 0
+                ),
+                "direct_analyst_fraud_members": int(len(direct_analyst_members)),
+                "direct_analyst_fraud_members_in_stage2": int(len(direct_analyst_members_in_stage2)),
+                "direct_analyst_fraud_members_missing_stage2": int(len(missing_direct_analyst_members)),
+                "direct_analyst_fraud_members_missing_stage2_sample": missing_direct_analyst_members[:50],
                 "stage1_feature_columns": stage1_feature_columns,
-                "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+                "stage2_feature_columns": stage2_result.feature_columns,
                 "ccs_feature_columns": CCS_FEATURE_COLUMNS,
                 "stage2_alert_threshold": bundle["stage2_alert_threshold"],
                 "stage1_oof_predictions_path": str(stage1_oof_path),
@@ -199,7 +269,7 @@ class ModelTraining:
             write_json(report, training_report_path)
             return ModelTrainingArtifact(
                 training_report_path=training_report_path,
-                feature_columns=STAGE2_FEATURE_COLUMNS,
+                feature_columns=stage2_result.feature_columns,
                 stage1_model_path=stage1_model_path,
                 stage2_model_path=stage2_model_path,
                 model_bundle_path=bundle_path,
@@ -208,7 +278,7 @@ class ModelTraining:
                 partnership_table_path=self.fe_artifact.partnership_table_path,
                 ccs_concentration_table_path=ccs_concentration_table_path,
                 stage1_feature_columns=stage1_feature_columns,
-                stage2_feature_columns=STAGE2_FEATURE_COLUMNS,
+                stage2_feature_columns=stage2_result.feature_columns,
             )
         except Exception as exc:
             raise FraudDetectionException(exc, sys) from exc

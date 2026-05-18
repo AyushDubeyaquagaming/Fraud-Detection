@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -163,3 +164,38 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
     assert fake_mlflow.ended_status == "FINISHED"
     summary = read_json(Path(result["full_cycle_dir"]) / "full_cycle_summary.json")
     assert summary["status"] == "FINISHED"
+
+
+def test_resolve_window_uses_rolling_only_when_requested():
+    config = {
+        "partnership": {
+            "candidate_window": {
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-08",
+                "rolling_lookback_days": 14,
+            }
+        }
+    }
+
+    fixed_start, fixed_end = full_cycle_flow._resolve_window(config, None, None)
+    rolling_start, rolling_end = full_cycle_flow._resolve_window(
+        config,
+        None,
+        None,
+        window_mode="rolling",
+        now=datetime(2026, 5, 14, 10, 30, tzinfo=timezone.utc),
+    )
+    explicit_start, explicit_end = full_cycle_flow._resolve_window(
+        config,
+        "2026-05-01",
+        "2026-05-03",
+        window_mode="rolling",
+        now=datetime(2026, 5, 14, 10, 30, tzinfo=timezone.utc),
+    )
+
+    assert fixed_start.date().isoformat() == "2026-01-01"
+    assert fixed_end.date().isoformat() == "2026-01-08"
+    assert rolling_start.isoformat() == "2026-04-30T00:00:00+00:00"
+    assert rolling_end.isoformat() == "2026-05-14T00:00:00+00:00"
+    assert explicit_start.date().isoformat() == "2026-05-01"
+    assert explicit_end.date().isoformat() == "2026-05-03"

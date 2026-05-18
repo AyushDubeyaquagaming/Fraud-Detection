@@ -135,6 +135,152 @@ def test_candidate_nearmiss_gets_rule_floor_when_model_score_is_low() -> None:
     assert result.partnerships[0]["is_section_a"] is True
 
 
+def test_candidate_exact_partnership_high_amount_regression() -> None:
+    stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage1_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in PAIR_FEATURE_COLUMNS}), [0, 0])
+    stage2_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in STAGE2_FEATURE_COLUMNS}), [0, 0])
+    bundle = {
+        "model_version": "partnership_v1",
+        "stage1_model": stage1_model,
+        "stage2_model": stage2_model,
+        "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+        "use_candidate_store": True,
+        "stage1_flag_threshold": 0.7,
+    }
+
+    result = DrawScorer(bundle, source_run_id="run_test").score_candidate_draw(
+        {
+            "draw_id": 7300000,
+            "qualifying_player_count": 2,
+            "member_ids": ["SYNTH_EXACT_A", "SYNTH_EXACT_B"],
+            "ccs_ids": ["SYNTH_CCS", "SYNTH_CCS"],
+            "trans_date_min": pd.Timestamp("2026-05-10T18:27:57Z"),
+            "trans_date_max": pd.Timestamp("2026-05-10T18:28:00Z"),
+            "coverage_bytes": [bytes([1] * 19 + [0] * 19), bytes([0] * 19 + [1] * 19)],
+            "amount_vector": [[5000.0] * 19 + [0.0] * 19, [0.0] * 19 + [5000.0] * 19],
+            "total_bet_amounts": [95000.0, 95000.0],
+            "win_points": [90000.0, 90000.0],
+        }
+    )
+
+    assert result.requires_review is True
+    assert result.max_stage1_score == 1.0
+    assert {member["member_id"] for member in result.flagged_members} == {"SYNTH_EXACT_A", "SYNTH_EXACT_B"}
+    assert {member["bet_amount"] for member in result.flagged_members} == {95000.0}
+    assert all(member["high_amount_flag"] for member in result.flagged_members)
+    assert result.partnerships[0]["is_section_b"] is True
+
+
+def test_candidate_three_member_same_ccs_clique_flags_draw_7305365_pattern() -> None:
+    stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage1_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in PAIR_FEATURE_COLUMNS}), [0, 0])
+    stage2_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in STAGE2_FEATURE_COLUMNS}), [0, 0])
+    bundle = {
+        "model_version": "partnership_v1",
+        "stage1_model": stage1_model,
+        "stage2_model": stage2_model,
+        "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+        "use_candidate_store": True,
+        "stage1_flag_threshold": 0.7,
+    }
+    coverage = [
+        [1] * 12 + [0] * 26,
+        [0] * 12 + [1] * 12 + [0] * 14,
+        [0] * 24 + [1] * 12 + [0] * 2,
+    ]
+
+    result = DrawScorer(bundle, source_run_id="run_test").score_candidate_draw(
+        {
+            "draw_id": 7305365,
+            "qualifying_player_count": 3,
+            "member_ids": ["GK00527181", "GK00140513", "GK00527185"],
+            "ccs_ids": ["CCS040502", "CCS040502", "CCS040502"],
+            "trans_date_min": pd.Timestamp("2026-05-08T11:56:36Z"),
+            "trans_date_max": pd.Timestamp("2026-05-08T11:57:25Z"),
+            "coverage_bytes": [bytes(row) for row in coverage],
+            "amount_vector": [[5000.0 if value else 0.0 for value in row] for row in coverage],
+            "total_bet_amounts": [60000.0, 60000.0, 60000.0],
+            "win_points": [0.0, 0.0, 0.0],
+        }
+    )
+
+    assert result.requires_review is True
+    assert result.max_stage1_score == 1.0
+    assert {member["member_id"] for member in result.flagged_members} == {
+        "GK00527181",
+        "GK00140513",
+        "GK00527185",
+    }
+    assert len(result.partnerships) == 1
+    assert set(result.partnerships[0]["member_ids"]) == {"GK00527181", "GK00140513", "GK00527185"}
+    assert result.partnerships[0]["union_coverage"] == 36 / 38
+    assert result.partnerships[0]["is_section_b"] is True
+
+
+def test_candidate_section_team_pattern_flags_all_roulette_cheating_members() -> None:
+    stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=0))])
+    stage1_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in PAIR_FEATURE_COLUMNS}), [0, 0])
+    stage2_model.fit(pd.DataFrame({col: [0.0, 1.0] for col in STAGE2_FEATURE_COLUMNS}), [0, 0])
+    sections = [
+        (["GK00527181", "GK00140513", "GK00527185"], "CCS040502", list(range(14, 26)), 60000.0, 0.0),
+        (["GK00537590", "GK00141731", "GK00537586"], "CCS041720", list(range(2, 14)), 60000.0, 180000.0),
+        (["GK00301706", "GK00139170", "GK00301710"], "CCS039159", list(range(26, 38)), 60000.0, 0.0),
+        (["GK00527633", "GK00527634", "GK00140526"], "CCS040515", [0, 1], 10000.0, 0.0),
+    ]
+    member_ids: list[str] = []
+    ccs_ids: list[str] = []
+    coverage: list[list[int]] = []
+    amounts: list[list[float]] = []
+    stakes: list[float] = []
+    wins: list[float] = []
+    for members, ccs_id, positions, stake, win_points in sections:
+        mask = [1 if idx in positions else 0 for idx in range(38)]
+        amount = stake / len(positions)
+        for member in members:
+            member_ids.append(member)
+            ccs_ids.append(ccs_id)
+            coverage.append(mask)
+            amounts.append([amount if value else 0.0 for value in mask])
+            stakes.append(stake)
+            wins.append(win_points)
+
+    result = DrawScorer(
+        {
+            "model_version": "partnership_v1",
+            "stage1_model": stage1_model,
+            "stage2_model": stage2_model,
+            "stage2_feature_columns": STAGE2_FEATURE_COLUMNS,
+            "use_candidate_store": True,
+            "stage1_flag_threshold": 0.7,
+        },
+        source_run_id="run_test",
+    ).score_candidate_draw(
+        {
+            "draw_id": 7305365,
+            "qualifying_player_count": len(member_ids),
+            "member_ids": member_ids,
+            "ccs_ids": ccs_ids,
+            "trans_date_min": pd.Timestamp("2026-05-08T11:56:36Z"),
+            "trans_date_max": pd.Timestamp("2026-05-08T11:57:25Z"),
+            "coverage_bytes": [bytes(row) for row in coverage],
+            "amount_vector": amounts,
+            "total_bet_amounts": stakes,
+            "win_points": wins,
+        }
+    )
+
+    assert result.requires_review is True
+    assert result.max_stage1_score == 1.0
+    assert {member["member_id"] for member in result.flagged_members} == set(member_ids)
+    assert len(result.partnerships) == 1
+    assert set(result.partnerships[0]["member_ids"]) == set(member_ids)
+    assert result.partnerships[0]["union_coverage"] == 1.0
+    assert result.partnerships[0]["is_section_b"] is True
+
+
 def test_candidate_batch_scoring_matches_single_draw_path() -> None:
     stage1_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=1))])
     stage2_model = Pipeline([("model", DummyClassifier(strategy="constant", constant=1))])

@@ -40,9 +40,18 @@ developer_validation_guide.txt
 PARTNERSHIP_EXPLORATION_PLAN.md
 PHASE_A_PARTNERSHIP_MODELING_PLAN.md
 MLOPS_AUDIT_2026_04_27.txt
+Deployment-request-forms.csv
+AGENTS.md 
+CLAUDE.md
+RUN_AND_VERIFY_COMMANDS.txt
 GPT55_ALERT_SURFACE_FOLLOWUP_PLAN.md
+PLAN.md
+Issues.md
+/graphify-out/
+.prefect-home/
+.prefect-home-runtime/
 #scripts
-
+src/fraud_detection/graphify-out/cache/ast
 C:\Users\PC\Documents\Fraud Detection\scripts\bootstrap_rolling_store.py
 C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_feature_separation.py
 C:\Users\PC\Documents\Fraud Detection\scripts\diagnose_fraud_label_matching.py

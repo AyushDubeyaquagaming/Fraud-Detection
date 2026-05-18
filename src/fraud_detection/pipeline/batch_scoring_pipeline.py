@@ -15,12 +15,14 @@ from fraud_detection.logger import get_logger
 from fraud_detection.serving.live_scoring.draw_scorer import DrawScorer
 from fraud_detection.utils.common import load_joblib, read_json, read_yaml, write_json
 from fraud_detection.utils.mongodb import MONGO_PROJECTION, get_serving_mongo_collection
+from fraud_detection.utils.per_draw_recall import build_batch_false_negative_report
 
 logger = get_logger(__name__)
 
 PARQUET_SUMMARY_BATCH_SIZE = 250_000
 BATCH_SCORING_STREAM_BATCH_SIZE = 100_000
 BATCH_SCORING_OUTPUT_BATCH_SIZE = 1_000
+MONGO_BATCH_SCORING_CHUNK_DAYS = 1
 
 
 def _resolve_repo_path(value: str | Path) -> Path:
@@ -67,6 +69,29 @@ def _resolve_live_window_bounds(
     if start_ts > end_ts:
         raise ValueError(f"Invalid batch scoring window: start {start_ts} is after end {end_ts}")
     return timestamp_field, start_ts, end_ts
+
+
+def _diagnostic_window_bounds(
+    *,
+    batch_source: str,
+    window: dict[str, object],
+    source_cfg: dict[str, object],
+    now: datetime,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    if batch_source == "mongodb":
+        _, start_ts, end_ts = _resolve_live_window_bounds(window, now=now)
+        return start_ts, end_ts
+    if batch_source == "candidate_store":
+        if not window.get("start_date") or not window.get("end_date"):
+            return None
+        return pd.Timestamp(window["start_date"], tz="UTC"), pd.Timestamp(window["end_date"], tz="UTC")
+    if source_cfg.get("source") == "parquet":
+        timestamp_field = str(window.get("timestamp_field", "trans_date"))
+        min_ts, max_ts = _timestamp_bounds(_resolve_repo_path(str(source_cfg["parquet_path"])), timestamp_field)
+        if max_ts is None:
+            return None
+        return _resolve_window_bounds(window, min_ts or max_ts, max_ts)
+    return None
 
 
 def _to_filter_bound(value: pd.Timestamp, arrow_type: pa.DataType) -> object:
@@ -128,39 +153,57 @@ def _iter_mongo_draw_groups(
     now: datetime | None = None,
 ):
     timestamp_field, start_ts, end_ts = _resolve_live_window_bounds(window, now=now)
+    chunk_days = max(1, int(window.get("chunk_days", MONGO_BATCH_SCORING_CHUNK_DAYS)))
     logger.info(
-        "Batch scoring mongo window: %s in [%s, %s)",
+        "Batch scoring mongo window: %s in [%s, %s) chunk_days=%s",
         timestamp_field,
         start_ts.isoformat(),
         end_ts.isoformat(),
+        chunk_days,
     )
     collection = get_serving_mongo_collection(
         str(mongo_config.get("uri_env_var", "MONGODB_URI")),
         str(mongo_config.get("database_env_var", "MONGODB_DATABASE")),
         str(mongo_config.get("collection_env_var", "MONGODB_COLLECTION_ROULETTE_REPORT")),
     )
-    query = {timestamp_field: {"$gte": start_ts.to_pydatetime(), "$lt": end_ts.to_pydatetime()}}
-    cursor = (
-        collection.find(query, MONGO_PROJECTION)
-        .sort([("draw_id", 1), (timestamp_field, 1)])
-        .batch_size(BATCH_SCORING_STREAM_BATCH_SIZE)
-    )
     current_draw_id = None
     pending_rows: list[dict] = []
     row_count = 0
-    for row in cursor:
-        draw_id = pd.to_numeric(row.get("draw_id"), errors="coerce")
-        if pd.isna(draw_id):
-            continue
-        draw_id = int(draw_id)
-        if current_draw_id is None:
-            current_draw_id = draw_id
-        if draw_id != current_draw_id:
-            yield pd.DataFrame(pending_rows)
-            pending_rows = []
-            current_draw_id = draw_id
-        pending_rows.append(row)
-        row_count += 1
+
+    slice_start = start_ts
+    while slice_start < end_ts:
+        slice_end = min(slice_start + pd.Timedelta(days=chunk_days), end_ts)
+        query = {
+            timestamp_field: {
+                "$gte": slice_start.to_pydatetime(),
+                "$lt": slice_end.to_pydatetime(),
+            }
+        }
+        logger.info(
+            "Batch scoring mongo chunk: %s in [%s, %s)",
+            timestamp_field,
+            slice_start.isoformat(),
+            slice_end.isoformat(),
+        )
+        cursor = (
+            collection.find(query, MONGO_PROJECTION)
+            .sort([(timestamp_field, 1), ("draw_id", 1)])
+            .batch_size(BATCH_SCORING_STREAM_BATCH_SIZE)
+        )
+        for row in cursor:
+            draw_id = pd.to_numeric(row.get("draw_id"), errors="coerce")
+            if pd.isna(draw_id):
+                continue
+            draw_id = int(draw_id)
+            if current_draw_id is None:
+                current_draw_id = draw_id
+            if draw_id != current_draw_id:
+                yield pd.DataFrame(pending_rows)
+                pending_rows = []
+                current_draw_id = draw_id
+            pending_rows.append(row)
+            row_count += 1
+        slice_start = slice_end
     if pending_rows:
         yield pd.DataFrame(pending_rows)
     if row_count == 0:
@@ -329,7 +372,37 @@ class BatchScoringPipeline:
                 "model_version": bundle.get("model_version", "partnership_v1"),
                 "source": batch_source,
                 "window": window,
+                "filter_parity": (
+                    "raw_rows are converted through DrawScorer._raw_draw_to_candidate_row before pair scanning"
+                    if score_mode == "raw_rows"
+                    else "candidate_store rows are scored directly through the pair scanner"
+                ),
             }
+            try:
+                fraud_csv_path = _resolve_repo_path(
+                    str((config.get("data_validation", {}) or {}).get("fraud_csv_path", "ROULET CHEATING DATA.csv"))
+                )
+                diagnostic_bounds = _diagnostic_window_bounds(
+                    batch_source=batch_source,
+                    window=window,
+                    source_cfg=source_cfg,
+                    now=datetime.now(timezone.utc),
+                )
+                if fraud_csv_path.exists() and diagnostic_bounds is not None:
+                    false_negative_report = build_batch_false_negative_report(
+                        fraud_csv_path=fraud_csv_path,
+                        scored_predictions_path=output_path,
+                        window_start=diagnostic_bounds[0],
+                        window_end=diagnostic_bounds[1],
+                        output_path=current_dir / "batch_false_negative_report.json",
+                    )
+                    report["false_negative_report_path"] = str(current_dir / "batch_false_negative_report.json")
+                    report["false_negative_draws"] = false_negative_report.get("false_negative_draws", 0)
+                else:
+                    report["false_negative_report_status"] = "skipped"
+            except Exception as diag_exc:
+                logger.warning("Batch false-negative diagnostics failed: %s", diag_exc)
+                report["false_negative_report_status"] = f"failed: {diag_exc}"
             write_json(report, current_dir / "batch_scoring_report.json")
             return current_dir
         except Exception as exc:

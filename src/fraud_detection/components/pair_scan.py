@@ -11,6 +11,8 @@ import pandas as pd
 class PairRuleConfig:
     board_size: int = 38
     strict_min_ratio_similarity: float = 0.80
+    strict_min_stake_ratio: float = 0.90
+    strict_max_overlap_count: int = 2
     strict_min_pair_net_per_stake: float = -0.10
     nearmiss_min_union: int = 36
     nearmiss_max_overlap: int = 2
@@ -18,7 +20,9 @@ class PairRuleConfig:
     nearmiss_min_pair_net_per_stake: float = -0.10
     nearmiss_require_different_ccs: bool = True
     min_total_bet_amount: float = 1000.0
+    min_pair_total_bet_amount: float = 0.0
     stage1_flag_threshold: float = 0.70
+    strict_inference_filter: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -40,6 +44,11 @@ PAIR_FEATURE_COLUMNS = [
     "win_points_a",
     "win_points_b",
     "pair_different_ccs",
+    "bet_amount_ratio_within_10pct",
+    "is_full_board_pair",
+    "is_min_overlap_pair",
+    "is_strict_collusion_pattern",
+    "rule_confidence",
     "is_strict_match",
     "is_nearmiss",
 ]
@@ -149,6 +158,13 @@ def emit_pair_rows(
     ratio = metrics["ratio_similarity"][upper_i, upper_j]
     pair_net = metrics["pair_net"][upper_i, upper_j]
     pair_stake = total_bets[upper_i] + total_bets[upper_j]
+    stake_ratio = np.divide(
+        np.minimum(total_bets[upper_i], total_bets[upper_j]),
+        np.maximum(total_bets[upper_i], total_bets[upper_j]),
+        out=np.zeros_like(pair_stake, dtype=np.float64),
+        where=np.maximum(total_bets[upper_i], total_bets[upper_j]) > 0,
+    )
+    pair_total_ok = pair_stake >= float(cfg.min_pair_total_bet_amount)
     pair_net_per_stake = np.divide(
         pair_net,
         pair_stake,
@@ -158,11 +174,23 @@ def emit_pair_rows(
     ccs_i = np.array([ccs_ids[int(idx)] for idx in upper_i], dtype=object)
     ccs_j = np.array([ccs_ids[int(idx)] for idx in upper_j], dtype=object)
     pair_different_ccs = (ccs_i != None) & (ccs_j != None) & (ccs_i != ccs_j)  # noqa: E711
+    is_full_board_pair = union_count == cfg.board_size
+    is_min_overlap_pair = overlap_count <= cfg.strict_max_overlap_count
+    bet_amount_ratio_within_10pct = stake_ratio >= cfg.strict_min_stake_ratio
+    ratio_ok = ratio >= cfg.strict_min_ratio_similarity
+    rule_confidence = (
+        0.25 * is_full_board_pair.astype(float)
+        + 0.25 * is_min_overlap_pair.astype(float)
+        + 0.25 * bet_amount_ratio_within_10pct.astype(float)
+        + 0.25 * np.clip(ratio / max(cfg.strict_min_ratio_similarity, 1e-9), 0.0, 1.0)
+    )
     strict = (
         both_staked
-        & (union_count == cfg.board_size)
-        & (overlap_count == 0)
-        & (ratio >= cfg.strict_min_ratio_similarity)
+        & pair_total_ok
+        & is_full_board_pair
+        & is_min_overlap_pair
+        & bet_amount_ratio_within_10pct
+        & ratio_ok
         & (pair_net_per_stake >= cfg.strict_min_pair_net_per_stake)
     )
     nearmiss = (
@@ -170,12 +198,13 @@ def emit_pair_rows(
         & ~strict
         & (union_count >= cfg.nearmiss_min_union)
         & (overlap_count <= cfg.nearmiss_max_overlap)
+        & bet_amount_ratio_within_10pct
         & (ratio >= cfg.nearmiss_min_ratio_similarity)
         & (pair_net_per_stake >= cfg.nearmiss_min_pair_net_per_stake)
     )
     if cfg.nearmiss_require_different_ccs:
         nearmiss = nearmiss & pair_different_ccs
-    emit_mask = strict | nearmiss
+    emit_mask = strict if (mode == "inference" and cfg.strict_inference_filter) else (strict | nearmiss)
     sampled_negative = np.zeros_like(emit_mask, dtype=bool)
     if mode == "training" and ordinary_negative_sample > 0:
         ordinary_idx = np.flatnonzero(both_staked & ~strict & ~nearmiss)
@@ -192,7 +221,6 @@ def emit_pair_rows(
         i = int(upper_i[idx])
         j = int(upper_j[idx])
         row_pair_stake = float(total_bets[i] + total_bets[j])
-        stake_ratio = float(min(total_bets[i], total_bets[j]) / max(total_bets[i], total_bets[j])) if row_pair_stake > 0 else 0.0
         rows.append(
             {
                 "draw_id": draw_id,
@@ -212,10 +240,15 @@ def emit_pair_rows(
                 "pair_net_per_stake": float(pair_net_per_stake[idx]),
                 "stake_a": float(total_bets[i]),
                 "stake_b": float(total_bets[j]),
-                "stake_ratio": stake_ratio,
+                "stake_ratio": float(stake_ratio[idx]),
                 "win_points_a": float(wins[i]),
                 "win_points_b": float(wins[j]),
                 "pair_different_ccs": int(pair_different_ccs[idx]),
+                "bet_amount_ratio_within_10pct": int(bet_amount_ratio_within_10pct[idx]),
+                "is_full_board_pair": int(is_full_board_pair[idx]),
+                "is_min_overlap_pair": int(is_min_overlap_pair[idx]),
+                "is_strict_collusion_pattern": int(strict[idx]),
+                "rule_confidence": float(rule_confidence[idx]),
                 "is_strict_match": int(strict[idx]),
                 "is_nearmiss": int(nearmiss[idx]),
                 "sampled_negative": int(sampled_negative[idx]),

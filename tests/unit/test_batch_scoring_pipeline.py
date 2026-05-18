@@ -97,8 +97,10 @@ def test_iter_mongo_draw_groups_uses_lookback_window_and_groups_by_draw(monkeypa
     class FakeCursor:
         def __init__(self, docs):
             self.docs = docs
+            self.sort_fields = None
 
-        def sort(self, _fields):
+        def sort(self, fields):
+            self.sort_fields = fields
             return self
 
         def batch_size(self, _size):
@@ -109,18 +111,29 @@ def test_iter_mongo_draw_groups_uses_lookback_window_and_groups_by_draw(monkeypa
 
     class FakeCollection:
         def __init__(self):
-            self.query = None
+            self.queries = []
+            self.sort_fields = []
+            self.docs = [
+                {"draw_id": 1, "member_id": "A", "trans_date": datetime(2026, 5, 10, tzinfo=timezone.utc)},
+                {"draw_id": 1, "member_id": "B", "trans_date": datetime(2026, 5, 10, tzinfo=timezone.utc)},
+                {"draw_id": 2, "member_id": "C", "trans_date": datetime(2026, 5, 11, tzinfo=timezone.utc)},
+            ]
 
         def find(self, query, projection):
-            self.query = query
+            self.queries.append(query)
             assert projection["draw_id"] == 1
-            return FakeCursor(
-                [
-                    {"draw_id": 1, "member_id": "A", "trans_date": datetime(2026, 5, 10, tzinfo=timezone.utc)},
-                    {"draw_id": 1, "member_id": "B", "trans_date": datetime(2026, 5, 10, tzinfo=timezone.utc)},
-                    {"draw_id": 2, "member_id": "C", "trans_date": datetime(2026, 5, 11, tzinfo=timezone.utc)},
-                ]
-            )
+            lower = query["trans_date"]["$gte"]
+            upper = query["trans_date"]["$lt"]
+            docs = [doc for doc in self.docs if lower <= doc["trans_date"] < upper]
+            cursor = FakeCursor(docs)
+            original_sort = cursor.sort
+
+            def record_sort(fields):
+                self.sort_fields.append(fields)
+                return original_sort(fields)
+
+            cursor.sort = record_sort
+            return cursor
 
     fake_collection = FakeCollection()
     monkeypatch.setattr(batch_scoring_pipeline, "get_serving_mongo_collection", lambda *args: fake_collection)
@@ -132,7 +145,7 @@ def test_iter_mongo_draw_groups_uses_lookback_window_and_groups_by_draw(monkeypa
                 "database_env_var": "MONGODB_DATABASE",
                 "collection_env_var": "MONGODB_COLLECTION_ROULETTE_REPORT",
             },
-            window={"timestamp_field": "trans_date", "lookback_days": 7},
+            window={"timestamp_field": "trans_date", "lookback_days": 7, "chunk_days": 1},
             now=datetime(2026, 5, 12, tzinfo=timezone.utc),
         )
     )
@@ -140,5 +153,6 @@ def test_iter_mongo_draw_groups_uses_lookback_window_and_groups_by_draw(monkeypa
     assert len(groups) == 2
     assert groups[0]["draw_id"].tolist() == [1, 1]
     assert groups[1]["draw_id"].tolist() == [2]
-    assert fake_collection.query["trans_date"]["$gte"].isoformat() == "2026-05-05T00:00:00+00:00"
-    assert fake_collection.query["trans_date"]["$lt"].isoformat() == "2026-05-12T00:00:00+00:00"
+    assert fake_collection.queries[0]["trans_date"]["$gte"].isoformat() == "2026-05-05T00:00:00+00:00"
+    assert fake_collection.queries[-1]["trans_date"]["$lt"].isoformat() == "2026-05-12T00:00:00+00:00"
+    assert fake_collection.sort_fields[0] == [("trans_date", 1), ("draw_id", 1)]

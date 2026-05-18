@@ -46,6 +46,9 @@ class ModelInfoResponse(BaseModel):
     snapshot_reason: str | None = None
     snapshot_lookback_days: int | None = None
     total_holdout_members: int = 0
+    total_evaluation_members: int = 0
+    validation_status: str | None = None
+    promotion_decision: str | None = None
     stage2_alert_threshold: float | None = None
     artifacts_loaded_at: str
 
@@ -68,6 +71,7 @@ class ReloadResponse(BaseModel):
     current_run_id: str
     reloaded_at: str
     total_holdout_members: int
+    total_evaluation_members: int = 0
 
 
 class ErrorResponse(BaseModel):
@@ -110,6 +114,7 @@ class PartnershipMatch(BaseModel):
     union_coverage: float
     jaccard: float
     per_position_ratio: float
+    total_stake_ratio: float | None = None
     combined_bet_cv: float
     pair_net: float
     is_section_a: bool = False

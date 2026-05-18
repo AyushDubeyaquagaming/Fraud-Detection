@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ import pyarrow.parquet as pq
 
 from fraud_detection.components.ccs_features import attach_ccs_concentration_features
 from fraud_detection.components.analyst_label_overlay import apply_pair_label_overrides
+from fraud_detection.components.clique_scan import CliqueRuleConfig
 from fraud_detection.components.pair_scan import PairRuleConfig
 from fraud_detection.components.partnership_features import (
     STAGE1_FEATURE_COLUMNS,
@@ -26,6 +29,7 @@ from fraud_detection.entity.config_entity import FeatureEngineeringConfig
 from fraud_detection.exception import FraudDetectionException
 from fraud_detection.logger import get_logger
 from fraud_detection.utils.common import ensure_dir, save_parquet, write_json
+from fraud_detection.utils.time_utils import TIMESTAMP_CANDIDATES, coerce_mongo_datetime, normalize_event_timestamp
 
 logger = get_logger(__name__)
 
@@ -40,16 +44,6 @@ FEATURE_ENGINEERING_RAW_COLUMNS = [
     "createdAt",
     "updatedAt",
     "trans_date",
-]
-TIMESTAMP_CANDIDATES = [
-    "createdAt.$date",
-    "createdat.$date",
-    "trans_date.$date",
-    "updatedAt.$date",
-    "ts",
-    "createdAt",
-    "trans_date",
-    "updatedAt",
 ]
 PARTNERSHIP_STREAM_BATCH_SIZE = 100_000
 PARTNERSHIP_REQUIRED_COLUMNS = [
@@ -113,19 +107,11 @@ def normalize_bet_position(value: object) -> str | None:
 
 
 def _coerce_datetime(value: Any):
-    if isinstance(value, dict) and "$date" in value:
-        return value["$date"]
-    return value
+    return coerce_mongo_datetime(value)
 
 
 def _normalize_timestamp(df: pd.DataFrame) -> pd.Series:
-    ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
-    for col in TIMESTAMP_CANDIDATES:
-        if col not in df.columns:
-            continue
-        series = pd.to_datetime(df[col].map(_coerce_datetime), utc=True, errors="coerce")
-        ts = ts.fillna(series)
-    return ts
+    return normalize_event_timestamp(df, TIMESTAMP_CANDIDATES)
 
 
 class FeatureEngineering:
@@ -136,7 +122,11 @@ class FeatureEngineering:
         self.ingestion_artifact = ingestion_artifact
         analyst_cfg = self.config.partnership.get("analyst_label_overlay", {}) or {}
         self._analyst_label_overlay_enabled = bool(analyst_cfg.get("enabled", False))
+        self._analyst_any_member_clique_override = bool(analyst_cfg.get("any_member_clique_override", False))
         self._analyst_label_overlay_unavailable = False
+        self._synthetic_positives_from_strict_pattern = bool(
+            self.config.partnership.get("synthetic_positives_from_strict_pattern", False)
+        )
 
     def initiate_feature_engineering(self) -> FeatureEngineeringArtifact:
         logger.info("PartnershipFeatureEngineering: starting")
@@ -191,7 +181,11 @@ class FeatureEngineering:
             raise FraudDetectionException(exc, sys) from exc
 
     def _initiate_candidate_store_feature_engineering(self) -> FeatureEngineeringArtifact:
-        pair_rules = PairRuleConfig(**dict(self.config.partnership.get("pair_rules", {})))
+        pair_rule_values = dict(self.config.partnership.get("pair_rules", {}))
+        if "strict_inference_filter" in self.config.partnership:
+            pair_rule_values["strict_inference_filter"] = self.config.partnership["strict_inference_filter"]
+        pair_rules = PairRuleConfig(**pair_rule_values)
+        clique_rules = CliqueRuleConfig(**dict(self.config.partnership.get("clique_rules", {})))
         paths = {
             "stage1_features": self.config.output_dir / "stage1_features.parquet",
             "stage1_labels": self.config.output_dir / "stage1_labels.parquet",
@@ -213,11 +207,27 @@ class FeatureEngineering:
         analyst_positive_overrides = 0
         analyst_negative_overrides = 0
         try:
-            for candidate_chunk in self._iter_candidate_store_batches():
+            for batch_number, candidate_chunk in enumerate(self._iter_candidate_store_batches(), start=1):
+                batch_started = time.perf_counter()
+                candidate_players = int(
+                    pd.to_numeric(
+                        candidate_chunk.get("qualifying_player_count", pd.Series(dtype=float)),
+                        errors="coerce",
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+                logger.info(
+                    "FeatureEngineering candidate batch %d: candidate_draw_rows=%d qualifying_players=%d",
+                    batch_number,
+                    len(candidate_chunk),
+                    candidate_players,
+                )
                 candidate_draw_rows += len(candidate_chunk)
                 stage1_chunk, pair_chunk, _ = compute_partnership_features_from_candidates(
                     candidate_chunk,
                     rule_config=pair_rules,
+                    clique_rule_config=clique_rules,
                     mode="training",
                     ordinary_negative_sample=int(self.config.partnership.get("emit_negatives_sample", 5)),
                     rolling_context=False,
@@ -239,6 +249,16 @@ class FeatureEngineering:
                 fraud_pairs += int(pd.to_numeric(labeled_chunk.get("label_gold"), errors="coerce").fillna(0).sum())
                 analyst_positive_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("derived_pair_analyst").sum())
                 analyst_negative_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("analyst_not_fraud_pair").sum())
+                logger.info(
+                    "FeatureEngineering candidate batch %d complete: pair_rows=%d stage1_rows=%d elapsed=%.2fs",
+                    batch_number,
+                    len(pair_chunk),
+                    len(stage1_chunk),
+                    time.perf_counter() - batch_started,
+                )
+                del candidate_chunk, stage1_chunk, pair_chunk, labeled_chunk
+                gc.collect()
+                pa.default_memory_pool().release_unused()
         finally:
             stage1_writer.close()
             stage1_labels_writer.close()
@@ -350,7 +370,24 @@ class FeatureEngineering:
             analyst_labels = self._read_analyst_labels(
                 draw_ids=labeled.get("draw_id", pd.Series(dtype=object)).dropna().tolist()
             )
-        labeled, _ = apply_pair_label_overrides(labeled, analyst_labels)
+        if self._synthetic_positives_from_strict_pattern:
+            strict_signal = pd.to_numeric(
+                labeled.get("is_strict_collusion_pattern", labeled.get("is_strict_match", 0)),
+                errors="coerce",
+            ).fillna(0).astype(int)
+            pair_net_per_stake = pd.to_numeric(labeled.get("pair_net_per_stake"), errors="coerce").fillna(-1.0)
+            synthetic_mask = strict_signal.eq(1) & pair_net_per_stake.ge(
+                float(self.config.partnership.get("synthetic_positive_min_pair_net_per_stake", 0.0))
+            )
+            labeled.loc[synthetic_mask, "label_stage1"] = 1
+            labeled.loc[synthetic_mask, "label_gold"] = 1
+            labeled.loc[synthetic_mask, "label_source"] = "synthetic_strict_pattern"
+            labeled.loc[synthetic_mask, "sample_weight"] = 1.0
+        labeled, _ = apply_pair_label_overrides(
+            labeled,
+            analyst_labels,
+            any_member_clique_override=self._analyst_any_member_clique_override,
+        )
         return labeled
 
     def _read_analyst_labels(self, draw_ids: list[int] | None = None) -> list[dict[str, Any]]:

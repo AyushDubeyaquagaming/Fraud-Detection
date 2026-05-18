@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from fraud_detection.components.data_ingestion import DataIngestion
@@ -30,6 +31,10 @@ from fraud_detection.entity.config_entity import (
 from fraud_detection.exception import FraudDetectionException
 from fraud_detection.logger import get_logger
 from fraud_detection.utils.common import ensure_dir, read_yaml, write_json
+from fraud_detection.utils.per_draw_recall import (
+    build_available_keys_from_candidate_store,
+    build_per_draw_recall_report,
+)
 
 logger = get_logger(__name__)
 
@@ -41,6 +46,55 @@ def _make_run_id() -> str:
 def _resolve_repo_path(path_value: str | Path) -> Path:
     path = Path(path_value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _write_training_diagnostics(
+    *,
+    fraud_csv_path: Path,
+    ingestion_artifact: DataIngestionArtifact,
+    fe_artifact,
+    training_artifact,
+    eval_report_path: Path,
+    partnership_cfg: dict,
+) -> dict[str, object]:
+    if not fraud_csv_path.exists():
+        return {"status": "skipped", "reason": f"fraud csv not found: {fraud_csv_path}"}
+    if fe_artifact.stage1_labels_path is None or training_artifact.stage1_oof_predictions_path is None:
+        return {"status": "skipped", "reason": "stage1 label or prediction artifacts missing"}
+
+    if ingestion_artifact.source_type == "candidate_store":
+        fraud_csv = pd.read_csv(fraud_csv_path)
+        fraud_csv.columns = [str(column).strip().lower() for column in fraud_csv.columns]
+        fraud_members = set(fraud_csv.get("member_id", pd.Series(dtype=object)).astype(str).str.strip().str.upper())
+        available_keys = build_available_keys_from_candidate_store(
+            ingestion_artifact.raw_data_path,
+            member_ids=fraud_members,
+        )
+    else:
+        labels = pd.read_parquet(fe_artifact.stage1_labels_path)
+        available_keys = labels[[col for col in ["member_id", "draw_id", "draw_date"] if col in labels.columns]].copy()
+
+    stage1_predictions = pd.read_parquet(training_artifact.stage1_oof_predictions_path)
+    stage2_predictions_path = training_artifact.stage1_oof_predictions_path.parent / "stage2_predictions.parquet"
+    stage2_predictions = pd.read_parquet(stage2_predictions_path) if stage2_predictions_path.exists() else pd.DataFrame()
+    pair_rules = partnership_cfg.get("pair_rules", {}) or {}
+    diagnostics_dir = eval_report_path.parent / "diagnostics"
+    result = build_per_draw_recall_report(
+        fraud_csv_path=fraud_csv_path,
+        available_keys_df=available_keys,
+        stage1_predictions=stage1_predictions,
+        stage2_predictions=stage2_predictions,
+        stage1_threshold=float(pair_rules.get("stage1_flag_threshold", partnership_cfg.get("stage1_flag_threshold", 0.70))),
+        stage2_threshold=float(partnership_cfg.get("stage2_alert_threshold", 0.65)),
+        output_dir=diagnostics_dir,
+    )
+
+    eval_report = json.loads(eval_report_path.read_text(encoding="utf-8"))
+    eval_report["fraud_label_coverage_report_path"] = result["fraud_label_coverage_report_path"]
+    eval_report["per_draw_recall_report_path"] = result["per_draw_recall_report_path"]
+    eval_report["fraud_label_coverage_summary_path"] = result["fraud_label_coverage_summary_path"]
+    eval_report_path.write_text(json.dumps(eval_report, indent=2, default=str), encoding="utf-8")
+    return {"status": "completed", **result}
 
 
 class TrainingPipeline:
@@ -257,20 +311,67 @@ class TrainingPipeline:
                 model_evaluation_config, training_artifact
             ).initiate_model_evaluation()
 
+            diagnostics_result = {"status": "skipped", "reason": "not attempted"}
+            try:
+                diagnostics_result = _write_training_diagnostics(
+                    fraud_csv_path=_resolve_repo_path(val_cfg["fraud_csv_path"]),
+                    ingestion_artifact=ingestion_artifact,
+                    fe_artifact=fe_artifact,
+                    training_artifact=training_artifact,
+                    eval_report_path=eval_artifact.evaluation_report_path,
+                    partnership_cfg=partnership_cfg,
+                )
+            except Exception as diag_exc:
+                logger.warning("Training diagnostics failed: %s", diag_exc)
+                diagnostics_result = {"status": "failed", "reason": str(diag_exc)}
+
             if mlflow_active:
                 with open(eval_artifact.evaluation_report_path) as f:
                     eval_report = json.load(f)
                 mlflow.set_tag("label_status", str(eval_report.get("label_status", "unknown")))
                 mlflow.set_tag("gate_reason", str(eval_report.get("gate_reason", "unknown")))
+                mlflow.set_tag("validation_status", str(eval_report.get("validation_status", "unknown")))
+                mlflow.set_tag("promotion_decision", str(eval_report.get("promotion_decision", "unknown")))
                 log_metrics_safe({
                     "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
                     "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,
                     "stage2_top_50_captured": eval_artifact.stage2_top_50_captured,
                     "gate_passed": int(eval_artifact.gate_passed),
                 })
+                if diagnostics_result.get("status") == "completed":
+                    summary_path = diagnostics_result.get("fraud_label_coverage_summary_path")
+                    if summary_path:
+                        with open(str(summary_path), encoding="utf-8") as f:
+                            coverage_summary = json.load(f)
+                        event_counts = coverage_summary.get("event_status_counts", {})
+                        log_metrics_safe({
+                            "fraud_label_events_matched": int(event_counts.get("MATCHED", 0)),
+                            "fraud_label_events_dropped": int(
+                                sum(int(v) for k, v in event_counts.items() if str(k) != "MATCHED")
+                            ),
+                        })
+                    for path_key in [
+                        "fraud_label_coverage_report_path",
+                        "per_draw_recall_report_path",
+                        "fraud_label_coverage_summary_path",
+                    ]:
+                        path_value = diagnostics_result.get(path_key)
+                        if path_value:
+                            log_artifact_safe(str(path_value))
                 log_artifact_safe(str(eval_artifact.evaluation_report_path))
                 plots_dir = eval_artifact.evaluation_report_path.parent / "plots"
                 if plots_dir.exists():
+                    plot_summary_path = plots_dir / "plot_summary.json"
+                    if plot_summary_path.exists():
+                        with open(plot_summary_path, encoding="utf-8") as f:
+                            plot_summary = json.load(f)
+                        skipped = plot_summary.get("skipped", [])
+                        mlflow.set_tag("plot_skipped_count", str(len(skipped)))
+                        for item in skipped[:10]:
+                            mlflow.set_tag(
+                                f"plot_skipped_{str(item.get('plot', 'unknown')).replace('.', '_')}",
+                                str(item.get("reason", "unknown"))[:250],
+                            )
                     log_artifacts_safe(str(plots_dir))
 
             # --- Step 6: Monitoring (non-blocking) ---
