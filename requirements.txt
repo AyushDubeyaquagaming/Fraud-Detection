@@ -2,6 +2,8 @@ pandas>=2.0
 numpy>=1.24
 scikit-learn>=1.3
 scipy>=1.11
+# MLflow 2.10 imports pkg_resources, which is no longer available in newer setuptools releases.
+setuptools>=68,<81
 pymongo[srv]>=4.5
 python-dotenv>=1.0
 pyyaml>=6.0

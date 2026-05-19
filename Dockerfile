@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt pyproject.toml ./
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+RUN pip install --no-cache-dir --upgrade pip wheel "setuptools>=68,<81" && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir --no-deps -e .
 
