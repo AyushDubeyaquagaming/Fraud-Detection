@@ -33,7 +33,6 @@ COPY configs/ ./configs/
 COPY streamlit_partnership_demo.py ./
 COPY pyproject.toml ./
 COPY README.md ./
-COPY ["ROULET CHEATING DATA.csv", "./"]
 
 # Register the local package against /app/src.
 RUN pip install --no-cache-dir --no-deps -e .
