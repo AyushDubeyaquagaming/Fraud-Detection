@@ -11,11 +11,12 @@ from fraud_detection.pipeline import batch_scoring_pipeline
 
 
 class _Result:
-    def __init__(self, draw_id: int):
+    def __init__(self, draw_id: int, doc: dict | None = None):
         self.draw_id = draw_id
+        self.doc = doc
 
     def to_mongo_doc(self) -> dict:
-        return {"draw_id": self.draw_id}
+        return self.doc or {"draw_id": self.draw_id}
 
 
 def test_candidate_store_batch_scoring_defaults_to_weekly_mongodb_source(monkeypatch, tmp_path: Path):
@@ -81,7 +82,11 @@ def test_candidate_store_batch_scoring_defaults_to_weekly_mongodb_source(monkeyp
         "_iter_candidate_store_batches",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("candidate store path should not be used")),
     )
-    monkeypatch.setattr(batch_scoring_pipeline, "load_joblib", lambda _path: {"use_candidate_store": True, "model_version": "partnership_v1"})
+    monkeypatch.setattr(
+        batch_scoring_pipeline,
+        "load_joblib",
+        lambda _path: {"use_candidate_store": True, "model_version": "partnership_v1"},
+    )
     monkeypatch.setattr(batch_scoring_pipeline, "DrawScorer", FakeScorer)
 
     output_dir = batch_scoring_pipeline.BatchScoringPipeline(config_path=config_path).run()
@@ -156,3 +161,92 @@ def test_iter_mongo_draw_groups_uses_lookback_window_and_groups_by_draw(monkeypa
     assert fake_collection.queries[0]["trans_date"]["$gte"].isoformat() == "2026-05-05T00:00:00+00:00"
     assert fake_collection.queries[-1]["trans_date"]["$lt"].isoformat() == "2026-05-12T00:00:00+00:00"
     assert fake_collection.sort_fields[0] == [("trans_date", 1), ("draw_id", 1)]
+
+
+def test_batch_scoring_syncs_native_feedback_via_api(monkeypatch, tmp_path: Path):
+    current_dir = tmp_path / "current"
+    current_dir.mkdir(parents=True)
+    (current_dir / "model_bundle.joblib").write_text("bundle")
+    config_path = tmp_path / "batch_scoring.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "pipeline": {"current_dir": str(current_dir)},
+                "data_ingestion": {
+                    "source": "parquet",
+                    "parquet_path": str(tmp_path / "unused.parquet"),
+                    "mongodb": {
+                        "uri_env_var": "MONGODB_URI",
+                        "database_env_var": "MONGODB_DATABASE",
+                        "collection_env_var": "MONGODB_COLLECTION_ROULETTE_REPORT",
+                    },
+                },
+                "batch_scoring": {
+                    "source": "mongodb",
+                    "window": {"timestamp_field": "trans_date", "lookback_days": 7},
+                },
+                "native_feedback": {
+                    "enabled": True,
+                    "api_base_url": "https://backend.example",
+                    "suspicious_bulk_path": "/gk-users/suspicious/bulk",
+                },
+                "partnership": {"use_candidate_store": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_iter_mongo_draw_groups(*, mongo_config, window, now=None):
+        yield pd.DataFrame(
+            [
+                {
+                    "draw_id": 101,
+                    "member_id": "A",
+                    "ccs_id": "C1",
+                    "total_bet_amount": 1000.0,
+                    "win_points": 1200.0,
+                    "bets": [],
+                    "trans_date": pd.Timestamp("2026-05-12T00:00:00Z"),
+                }
+            ]
+        )
+
+    class FakeScorer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def score_draw(self, draw_rows: pd.DataFrame):
+            return _Result(
+                int(draw_rows["draw_id"].iloc[0]),
+                {
+                    "draw_id": 101,
+                    "requires_review": True,
+                    "flagged_members": [{"member_id": "A"}],
+                    "partnerships": [],
+                },
+            )
+
+    sync_calls = {}
+
+    def fake_sync(events, config):
+        sync_calls["events"] = events
+        sync_calls["config"] = config
+        return {"enabled": True, "events": len(events), "payloads": 1, "status": "sent"}
+
+    monkeypatch.setattr(batch_scoring_pipeline, "_iter_mongo_draw_groups", fake_iter_mongo_draw_groups)
+    monkeypatch.setattr(
+        batch_scoring_pipeline,
+        "load_joblib",
+        lambda _path: {"use_candidate_store": True, "model_version": "partnership_v1"},
+    )
+    monkeypatch.setattr(batch_scoring_pipeline, "DrawScorer", FakeScorer)
+    monkeypatch.setattr(batch_scoring_pipeline, "sync_native_suspected_feedback", fake_sync)
+
+    output_dir = batch_scoring_pipeline.BatchScoringPipeline(config_path=config_path).run()
+
+    report = json.loads((output_dir / "batch_scoring_report.json").read_text(encoding="utf-8"))
+    assert report["native_feedback"] == {"enabled": True, "events": 1, "payloads": 1, "status": "sent"}
+    assert sync_calls["config"]["api_base_url"] == "https://backend.example"
+    assert [(event.member_id, event.ccs_id, event.alert_date.isoformat()) for event in sync_calls["events"]] == [
+        ("A", "C1", "2026-05-12")
+    ]

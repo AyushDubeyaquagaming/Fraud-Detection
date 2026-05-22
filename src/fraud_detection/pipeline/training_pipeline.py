@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -17,7 +16,12 @@ from fraud_detection.components.model_evaluation import ModelEvaluation
 from fraud_detection.components.model_pusher import ModelPusher
 from fraud_detection.components.model_training import ModelTraining
 from fraud_detection.components.monitoring import Monitoring
-from fraud_detection.constants.constants import BATCH_SCORING_CONFIG_FILE_PATH, CONFIG_FILE_PATH, REPO_ROOT
+from fraud_detection.constants.constants import (
+    BATCH_SCORING_CONFIG_FILE_PATH,
+    CONFIG_FILE_PATH,
+    MODEL_BUNDLE_FILE,
+    REPO_ROOT,
+)
 from fraud_detection.entity.artifact_entity import DataIngestionArtifact
 from fraud_detection.entity.config_entity import (
     DataIngestionConfig,
@@ -48,6 +52,15 @@ def _resolve_repo_path(path_value: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def _batch_model_bundle_exists(batch_config_path: Path) -> bool:
+    try:
+        batch_config = read_yaml(batch_config_path)
+    except Exception:
+        return False
+    current_dir = _resolve_repo_path((batch_config.get("pipeline", {}) or {}).get("current_dir", "artifacts/current"))
+    return (current_dir / MODEL_BUNDLE_FILE).exists()
+
+
 def _write_training_diagnostics(
     *,
     fraud_csv_path: Path,
@@ -76,7 +89,9 @@ def _write_training_diagnostics(
 
     stage1_predictions = pd.read_parquet(training_artifact.stage1_oof_predictions_path)
     stage2_predictions_path = training_artifact.stage1_oof_predictions_path.parent / "stage2_predictions.parquet"
-    stage2_predictions = pd.read_parquet(stage2_predictions_path) if stage2_predictions_path.exists() else pd.DataFrame()
+    stage2_predictions = (
+        pd.read_parquet(stage2_predictions_path) if stage2_predictions_path.exists() else pd.DataFrame()
+    )
     pair_rules = partnership_cfg.get("pair_rules", {}) or {}
     diagnostics_dir = eval_report_path.parent / "diagnostics"
     result = build_per_draw_recall_report(
@@ -84,7 +99,9 @@ def _write_training_diagnostics(
         available_keys_df=available_keys,
         stage1_predictions=stage1_predictions,
         stage2_predictions=stage2_predictions,
-        stage1_threshold=float(pair_rules.get("stage1_flag_threshold", partnership_cfg.get("stage1_flag_threshold", 0.70))),
+        stage1_threshold=float(
+            pair_rules.get("stage1_flag_threshold", partnership_cfg.get("stage1_flag_threshold", 0.70))
+        ),
         stage2_threshold=float(partnership_cfg.get("stage2_alert_threshold", 0.65)),
         output_dir=diagnostics_dir,
     )
@@ -176,13 +193,9 @@ class TrainingPipeline:
             min_capture_rate_top_5pct=float(eval_cfg.get("min_capture_rate_top_5pct", 0.40)),
             min_lift_top_5pct=float(eval_cfg.get("min_lift_top_5pct", 5.0)),
             register_on_promotion=bool(mlflow_cfg_raw.get("register_on_promotion", True)),
-            registered_model_name=str(
-                mlflow_cfg_raw.get("registered_model_name", "fraud_detection_partnership_v1")
-            ),
+            registered_model_name=str(mlflow_cfg_raw.get("registered_model_name", "fraud_detection_partnership_v1")),
             archive_existing_staging=bool(mlflow_cfg_raw.get("archive_existing_staging", True)),
-            auto_promote_to_production=bool(
-                mlflow_cfg_raw.get("auto_promote_to_production", False)
-            ),
+            auto_promote_to_production=bool(mlflow_cfg_raw.get("auto_promote_to_production", False)),
         )
 
         mon_cfg_raw = config_dict.get("monitoring", {})
@@ -238,7 +251,9 @@ class TrainingPipeline:
             # --- Step 1: Data Ingestion ---
             if use_candidate_store:
                 logger.info("[1/7] DataIngestion skipped (candidate_store mode)")
-                candidate_store_path = _resolve_repo_path(partnership_cfg.get("candidate_store_path", "data_store/candidate_draws"))
+                candidate_store_path = _resolve_repo_path(
+                    partnership_cfg.get("candidate_store_path", "data_store/candidate_draws")
+                )
                 if not candidate_store_path.exists():
                     window = partnership_cfg.get("candidate_window", {})
                     raise ValueError(
@@ -280,36 +295,36 @@ class TrainingPipeline:
             ).initiate_feature_engineering()
 
             if mlflow_active:
-                log_params_safe({
-                    "source": ing_cfg["source"],
-                    "random_seed": random_seed,
-                    "fraud_player_count": fe_artifact.fraud_player_count,
-                    "dropped_positive_count": fe_artifact.dropped_positive_count,
-                    "feature_count": len(fe_artifact.feature_columns),
-                    "model_version": "partnership_v1",
-                })
+                log_params_safe(
+                    {
+                        "source": ing_cfg["source"],
+                        "random_seed": random_seed,
+                        "fraud_player_count": fe_artifact.fraud_player_count,
+                        "dropped_positive_count": fe_artifact.dropped_positive_count,
+                        "feature_count": len(fe_artifact.feature_columns),
+                        "model_version": "partnership_v1",
+                    }
+                )
 
             # --- Step 4: Model Training ---
             logger.info("[4/7] ModelTraining")
-            training_artifact = ModelTraining(
-                model_training_config, fe_artifact
-            ).initiate_model_training()
+            training_artifact = ModelTraining(model_training_config, fe_artifact).initiate_model_training()
 
             if mlflow_active:
                 with open(training_artifact.training_report_path) as f:
                     tr = json.load(f)
-                log_metrics_safe({
-                    "stage1_pr_auc": (tr.get("stage1") or {}).get("pr_auc") or 0,
-                    "stage2_pr_auc": (tr.get("stage2") or {}).get("pr_auc") or 0,
-                    "fraud_player_count": tr.get("fraud_members", 0),
-                })
+                log_metrics_safe(
+                    {
+                        "stage1_pr_auc": (tr.get("stage1") or {}).get("pr_auc") or 0,
+                        "stage2_pr_auc": (tr.get("stage2") or {}).get("pr_auc") or 0,
+                        "fraud_player_count": tr.get("fraud_members", 0),
+                    }
+                )
                 log_artifact_safe(str(training_artifact.training_report_path))
 
             # --- Step 5: Model Evaluation ---
             logger.info("[5/7] ModelEvaluation")
-            eval_artifact = ModelEvaluation(
-                model_evaluation_config, training_artifact
-            ).initiate_model_evaluation()
+            eval_artifact = ModelEvaluation(model_evaluation_config, training_artifact).initiate_model_evaluation()
 
             diagnostics_result = {"status": "skipped", "reason": "not attempted"}
             try:
@@ -332,24 +347,28 @@ class TrainingPipeline:
                 mlflow.set_tag("gate_reason", str(eval_report.get("gate_reason", "unknown")))
                 mlflow.set_tag("validation_status", str(eval_report.get("validation_status", "unknown")))
                 mlflow.set_tag("promotion_decision", str(eval_report.get("promotion_decision", "unknown")))
-                log_metrics_safe({
-                    "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
-                    "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,
-                    "stage2_top_50_captured": eval_artifact.stage2_top_50_captured,
-                    "gate_passed": int(eval_artifact.gate_passed),
-                })
+                log_metrics_safe(
+                    {
+                        "stage2_capture_rate_top_5pct": eval_artifact.stage2_capture_rate_top_5pct,
+                        "stage2_lift_top_5pct": eval_artifact.stage2_lift_top_5pct,
+                        "stage2_top_50_captured": eval_artifact.stage2_top_50_captured,
+                        "gate_passed": int(eval_artifact.gate_passed),
+                    }
+                )
                 if diagnostics_result.get("status") == "completed":
                     summary_path = diagnostics_result.get("fraud_label_coverage_summary_path")
                     if summary_path:
                         with open(str(summary_path), encoding="utf-8") as f:
                             coverage_summary = json.load(f)
                         event_counts = coverage_summary.get("event_status_counts", {})
-                        log_metrics_safe({
-                            "fraud_label_events_matched": int(event_counts.get("MATCHED", 0)),
-                            "fraud_label_events_dropped": int(
-                                sum(int(v) for k, v in event_counts.items() if str(k) != "MATCHED")
-                            ),
-                        })
+                        log_metrics_safe(
+                            {
+                                "fraud_label_events_matched": int(event_counts.get("MATCHED", 0)),
+                                "fraud_label_events_dropped": int(
+                                    sum(int(v) for k, v in event_counts.items() if str(k) != "MATCHED")
+                                ),
+                            }
+                        )
                     for path_key in [
                         "fraud_label_coverage_report_path",
                         "per_draw_recall_report_path",
@@ -388,26 +407,33 @@ class TrainingPipeline:
 
             if mlflow_active and monitoring_artifact.monitoring_completed and monitoring_artifact.reports_dir:
                 from fraud_detection.utils.mlflow_utils import log_artifacts_safe, log_artifact_safe
+
                 log_artifacts_safe(str(monitoring_artifact.reports_dir))
                 if monitoring_artifact.drift_summary_path:
                     log_artifact_safe(str(monitoring_artifact.drift_summary_path))
 
             # --- Step 7: Model Pusher ---
             logger.info("[7/8] ModelPusher")
-            pusher_artifact = ModelPusher(
-                model_pusher_config, training_artifact, eval_artifact
-            ).initiate_model_pusher()
+            pusher_artifact = ModelPusher(model_pusher_config, training_artifact, eval_artifact).initiate_model_pusher()
 
             # --- Step 8: Weekly Serving Snapshot ---
-            if pusher_artifact.promoted and self.run_batch_scoring_on_promotion:
+            if self.run_batch_scoring_on_promotion:
                 logger.info("[8/8] WeeklyServingSnapshot")
                 from fraud_detection.pipeline.batch_scoring_pipeline import BatchScoringPipeline
 
-                BatchScoringPipeline(config_path=batch_scoring_config_path).run()
+                if _batch_model_bundle_exists(batch_scoring_config_path):
+                    BatchScoringPipeline(config_path=batch_scoring_config_path).run()
+                else:
+                    logger.warning(
+                        "[8/8] WeeklyServingSnapshot skipped because no current model bundle exists for %s",
+                        batch_scoring_config_path,
+                    )
             elif pusher_artifact.promoted:
                 logger.info("[8/8] WeeklyServingSnapshot skipped by caller configuration")
             else:
-                logger.info("[8/8] WeeklyServingSnapshot skipped because promotion gate did not pass")
+                logger.info(
+                    "[8/8] WeeklyServingSnapshot skipped by caller configuration and promotion gate did not pass"
+                )
 
             if mlflow_active:
                 mlflow.set_tag("promoted", "true" if pusher_artifact.promoted else "false")
@@ -443,6 +469,7 @@ class TrainingPipeline:
 
         logger.info(
             "TrainingPipeline: complete — run_id=%s, promoted=%s",
-            run_id, pusher_artifact.promoted if pusher_artifact else False,
+            run_id,
+            pusher_artifact.promoted if pusher_artifact else False,
         )
         return run_dir

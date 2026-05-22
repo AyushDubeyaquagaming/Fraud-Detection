@@ -119,9 +119,27 @@ def test_candidate_only_stage1_excludes_non_candidates():
 def test_stage2_training_frame_excludes_padding_columns():
     preds = pd.DataFrame(
         [
-            {"member_id": "A", "draw_id": 1, "draw_date": pd.Timestamp("2026-04-21"), "stage1_score": 0.9, "best_partner_member_id": "B"},
-            {"member_id": "A", "draw_id": 2, "draw_date": pd.Timestamp("2026-04-22"), "stage1_score": 0.1, "best_partner_member_id": None},
-            {"member_id": "C", "draw_id": 3, "draw_date": pd.Timestamp("2026-04-22"), "stage1_score": 0.0, "best_partner_member_id": None},
+            {
+                "member_id": "A",
+                "draw_id": 1,
+                "draw_date": pd.Timestamp("2026-04-21"),
+                "stage1_score": 0.9,
+                "best_partner_member_id": "B",
+            },
+            {
+                "member_id": "A",
+                "draw_id": 2,
+                "draw_date": pd.Timestamp("2026-04-22"),
+                "stage1_score": 0.1,
+                "best_partner_member_id": None,
+            },
+            {
+                "member_id": "C",
+                "draw_id": 3,
+                "draw_date": pd.Timestamp("2026-04-22"),
+                "stage1_score": 0.0,
+                "best_partner_member_id": None,
+            },
         ]
     )
 
@@ -238,20 +256,27 @@ def test_feature_engineering_streams_candidate_only_stage1_rows(tmp_path: Path):
     assert set(stage1_labeled["member_id"]) == {"A", "B"}
 
 
-def test_candidate_store_feature_engineering_disables_analyst_overlay_after_first_failure(tmp_path: Path, monkeypatch) -> None:
+def test_candidate_store_feature_engineering_applies_native_feedback_weights(tmp_path: Path, monkeypatch) -> None:
     store = tmp_path / "candidate_draws" / "year=2026" / "month=04" / "week=18"
     store.mkdir(parents=True)
     pq.write_table(pa.Table.from_pylist([_candidate_row(1), _candidate_row(2)]), store / "draws.parquet")
 
-    calls = {"count": 0}
-
-    def fail_read_analyst_labels_for_draws(draw_ids=None):
-        calls["count"] += 1
-        raise RuntimeError("analyst labels backend unavailable")
+    def fake_read_native_feedback(candidate_chunk, config):
+        draw_id = int(candidate_chunk["draw_id"].iloc[0])
+        if draw_id == 1:
+            label = "fraud"
+            weight = float(config["confirmed_fraud_weight"])
+        else:
+            label = "not_fraud"
+            weight = float(config["confirmed_not_fraud_weight"])
+        return [
+            {"draw_id": draw_id, "member_id": f"A{draw_id}", "label": label, "sample_weight": weight},
+            {"draw_id": draw_id, "member_id": f"B{draw_id}", "label": label, "sample_weight": weight},
+        ]
 
     monkeypatch.setattr(
-        "fraud_detection.utils.mongo_predictions.read_analyst_labels_for_draws",
-        fail_read_analyst_labels_for_draws,
+        "fraud_detection.utils.native_feedback.read_native_feedback_labels_for_candidate_rows",
+        fake_read_native_feedback,
     )
 
     artifact = FeatureEngineering(
@@ -265,7 +290,11 @@ def test_candidate_store_feature_engineering_disables_analyst_overlay_after_firs
                 "candidate_window": {"start_date": "2026-04-27", "end_date": "2026-04-28"},
                 "emit_negatives_sample": 0,
                 "stream_batch_size": 1,
-                "analyst_label_overlay": {"enabled": True},
+                "native_feedback": {
+                    "enabled": True,
+                    "confirmed_fraud_weight": 4.0,
+                    "confirmed_not_fraud_weight": 3.0,
+                },
             },
         ),
         DataIngestionArtifact(
@@ -278,5 +307,9 @@ def test_candidate_store_feature_engineering_disables_analyst_overlay_after_firs
     ).initiate_feature_engineering()
 
     assert artifact.stage1_labels_path.exists()
-    assert pd.read_parquet(artifact.stage1_labels_path).shape[0] == 2
-    assert calls["count"] == 1
+    labels = pd.read_parquet(artifact.stage1_labels_path).sort_values("draw_id")
+    assert labels["draw_id"].tolist() == [1, 2]
+    assert labels["label_gold"].tolist() == [1, 0]
+    assert labels["label_source"].tolist() == ["native_gk_users", "native_gk_users"]
+    assert labels["sample_weight"].tolist() == [4.0, 3.0]
+    assert labels["native_member_a_label"].tolist() == ["fraud", "not_fraud"]

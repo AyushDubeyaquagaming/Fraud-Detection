@@ -13,7 +13,6 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from fraud_detection.components.ccs_features import attach_ccs_concentration_features
-from fraud_detection.components.analyst_label_overlay import apply_pair_label_overrides
 from fraud_detection.components.clique_scan import CliqueRuleConfig
 from fraud_detection.components.pair_scan import PairRuleConfig
 from fraud_detection.components.partnership_features import (
@@ -120,10 +119,6 @@ class FeatureEngineering:
     def __init__(self, config: FeatureEngineeringConfig, ingestion_artifact: DataIngestionArtifact):
         self.config = config
         self.ingestion_artifact = ingestion_artifact
-        analyst_cfg = self.config.partnership.get("analyst_label_overlay", {}) or {}
-        self._analyst_label_overlay_enabled = bool(analyst_cfg.get("enabled", False))
-        self._analyst_any_member_clique_override = bool(analyst_cfg.get("any_member_clique_override", False))
-        self._analyst_label_overlay_unavailable = False
         self._synthetic_positives_from_strict_pattern = bool(
             self.config.partnership.get("synthetic_positives_from_strict_pattern", False)
         )
@@ -132,6 +127,8 @@ class FeatureEngineering:
         logger.info("PartnershipFeatureEngineering: starting")
         try:
             ensure_dir(self.config.output_dir)
+            self._native_feedback_cfg = self.config.partnership.get("native_feedback", {}) or {}
+            self._native_feedback_unavailable = False
             if self.config.partnership.get("use_candidate_store", False):
                 return self._initiate_candidate_store_feature_engineering()
             thresholds = PartnershipThresholds(**dict(self.config.partnership.get("candidate_thresholds", {})))
@@ -139,7 +136,9 @@ class FeatureEngineering:
                 self.ingestion_artifact.raw_data_path,
                 thresholds,
             )
-            stage1_features = add_rolling_context(stage1_base, partnership_table) if not stage1_base.empty else stage1_base
+            stage1_features = (
+                add_rolling_context(stage1_base, partnership_table) if not stage1_base.empty else stage1_base
+            )
             stage1_features = ensure_stage1_schema(stage1_features)
             stage1_labeled = self._attach_labels(stage1_features)
 
@@ -204,8 +203,9 @@ class FeatureEngineering:
         sampled_negative_pairs = 0
         stage1_rows = 0
         fraud_pairs = 0
-        analyst_positive_overrides = 0
-        analyst_negative_overrides = 0
+        native_positive_overrides = 0
+        native_negative_overrides = 0
+        native_conflicts = 0
         try:
             for batch_number, candidate_chunk in enumerate(self._iter_candidate_store_batches(), start=1):
                 batch_started = time.perf_counter()
@@ -234,21 +234,24 @@ class FeatureEngineering:
                     random_seed=int(self.config.partnership.get("random_seed", 42)),
                 )
                 stage1_chunk = self._attach_ccs_features(stage1_chunk)
-                analyst_labels = self._read_analyst_labels(
-                    draw_ids=pair_chunk.get("draw_id", pd.Series(dtype=object)).dropna().tolist()
-                )
-                labeled_chunk = self._attach_pair_labels(pair_chunk, analyst_labels=analyst_labels)
+                native_labels = self._read_native_feedback_labels(candidate_chunk)
+                labeled_chunk, native_stats = self._attach_pair_labels(pair_chunk, native_labels=native_labels)
                 stage1_writer.write(stage1_chunk)
                 stage1_labels_writer.write(labeled_chunk)
                 pair_events_writer.write(pair_chunk)
                 pair_rows += int(len(pair_chunk))
-                strict_pairs += int(pd.to_numeric(labeled_chunk.get("is_strict_match"), errors="coerce").fillna(0).sum())
+                strict_pairs += int(
+                    pd.to_numeric(labeled_chunk.get("is_strict_match"), errors="coerce").fillna(0).sum()
+                )
                 nearmiss_pairs += int(pd.to_numeric(labeled_chunk.get("is_nearmiss"), errors="coerce").fillna(0).sum())
-                sampled_negative_pairs += int(pd.to_numeric(labeled_chunk.get("sampled_negative"), errors="coerce").fillna(0).sum())
+                sampled_negative_pairs += int(
+                    pd.to_numeric(labeled_chunk.get("sampled_negative"), errors="coerce").fillna(0).sum()
+                )
                 stage1_rows += int(len(stage1_chunk))
                 fraud_pairs += int(pd.to_numeric(labeled_chunk.get("label_gold"), errors="coerce").fillna(0).sum())
-                analyst_positive_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("derived_pair_analyst").sum())
-                analyst_negative_overrides += int(labeled_chunk.get("label_source", pd.Series(dtype=object)).eq("analyst_not_fraud_pair").sum())
+                native_positive_overrides += int(native_stats.get("positive_overrides", 0))
+                native_negative_overrides += int(native_stats.get("negative_overrides", 0))
+                native_conflicts += int(native_stats.get("conflicts", 0))
                 logger.info(
                     "FeatureEngineering candidate batch %d complete: pair_rows=%d stage1_rows=%d elapsed=%.2fs",
                     batch_number,
@@ -284,8 +287,9 @@ class FeatureEngineering:
             "sampled_negative_pairs": int(sampled_negative_pairs),
             "stage1_rows": int(stage1_rows),
             "fraud_pairs": int(fraud_pairs),
-            "analyst_positive_pair_overrides": int(analyst_positive_overrides),
-            "analyst_negative_pair_overrides": int(analyst_negative_overrides),
+            "native_feedback_positive_pair_overrides": int(native_positive_overrides),
+            "native_feedback_negative_pair_overrides": int(native_negative_overrides),
+            "native_feedback_pair_conflicts": int(native_conflicts),
             "feature_columns": STAGE1_FEATURE_COLUMNS,
             "approach": "partnership_v1_candidate_store",
         }
@@ -357,24 +361,30 @@ class FeatureEngineering:
         self,
         pair_df: pd.DataFrame,
         *,
-        analyst_labels: list[dict[str, Any]] | pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
+        native_labels: list[dict[str, Any]] | pd.DataFrame | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
         labeled = pair_df.copy()
-        labeled["label_stage1"] = pd.to_numeric(labeled.get("is_strict_match", 0), errors="coerce").fillna(0).astype(int)
+        labeled["label_stage1"] = (
+            pd.to_numeric(labeled.get("is_strict_match", 0), errors="coerce").fillna(0).astype(int)
+        )
         labeled["label_gold"] = 0
         labeled["label_source"] = "strict_rule"
         labeled["sample_weight"] = 1.0
+        labeled["native_member_a_label"] = None
+        labeled["native_member_b_label"] = None
+        labeled["native_member_a_weight"] = 1.0
+        labeled["native_member_b_weight"] = 1.0
         labeled.loc[labeled["is_nearmiss"].eq(1), "label_source"] = "nearmiss_negative"
         labeled.loc[labeled["sampled_negative"].eq(1), "label_source"] = "sampled_negative"
-        if analyst_labels is None:
-            analyst_labels = self._read_analyst_labels(
-                draw_ids=labeled.get("draw_id", pd.Series(dtype=object)).dropna().tolist()
-            )
         if self._synthetic_positives_from_strict_pattern:
-            strict_signal = pd.to_numeric(
-                labeled.get("is_strict_collusion_pattern", labeled.get("is_strict_match", 0)),
-                errors="coerce",
-            ).fillna(0).astype(int)
+            strict_signal = (
+                pd.to_numeric(
+                    labeled.get("is_strict_collusion_pattern", labeled.get("is_strict_match", 0)),
+                    errors="coerce",
+                )
+                .fillna(0)
+                .astype(int)
+            )
             pair_net_per_stake = pd.to_numeric(labeled.get("pair_net_per_stake"), errors="coerce").fillna(-1.0)
             synthetic_mask = strict_signal.eq(1) & pair_net_per_stake.ge(
                 float(self.config.partnership.get("synthetic_positive_min_pair_net_per_stake", 0.0))
@@ -383,27 +393,98 @@ class FeatureEngineering:
             labeled.loc[synthetic_mask, "label_gold"] = 1
             labeled.loc[synthetic_mask, "label_source"] = "synthetic_strict_pattern"
             labeled.loc[synthetic_mask, "sample_weight"] = 1.0
-        labeled, _ = apply_pair_label_overrides(
-            labeled,
-            analyst_labels,
-            any_member_clique_override=self._analyst_any_member_clique_override,
-        )
-        return labeled
+        labeled, native_stats = self._apply_native_feedback_labels(labeled, native_labels or [])
+        return labeled, native_stats
 
-    def _read_analyst_labels(self, draw_ids: list[int] | None = None) -> list[dict[str, Any]]:
-        if not self._analyst_label_overlay_enabled or self._analyst_label_overlay_unavailable:
+    def _read_native_feedback_labels(self, candidate_chunk: pd.DataFrame) -> list[dict[str, Any]]:
+        native_enabled = bool(self._native_feedback_cfg.get("enabled", False))
+        if not native_enabled or self._native_feedback_unavailable:
             return []
         try:
-            from fraud_detection.utils.mongo_predictions import read_analyst_labels_for_draws
+            from fraud_detection.utils.native_feedback import read_native_feedback_labels_for_candidate_rows
 
-            return read_analyst_labels_for_draws(draw_ids=draw_ids)
+            return read_native_feedback_labels_for_candidate_rows(candidate_chunk, self._native_feedback_cfg)
         except Exception as exc:
-            self._analyst_label_overlay_unavailable = True
+            self._native_feedback_unavailable = True
             logger.warning(
-                "Analyst labels unavailable during candidate pair labeling; proceeding without analyst label overlay for the rest of this feature engineering run: %s",
+                "Native gk_users feedback unavailable during candidate pair labeling; proceeding without native feedback for the rest of this feature engineering run: %s",
                 exc,
             )
             return []
+
+    def _apply_native_feedback_labels(
+        self,
+        labeled: pd.DataFrame,
+        native_labels: list[dict[str, Any]] | pd.DataFrame,
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
+        decisions = self._latest_native_feedback_decisions(native_labels)
+        if not decisions or labeled.empty:
+            return labeled, {"positive_overrides": 0, "negative_overrides": 0, "conflicts": 0}
+
+        positive = 0
+        negative = 0
+        conflicts = 0
+        draw_ids = pd.to_numeric(labeled["draw_id"], errors="coerce").astype("Int64")
+        for idx, draw_id in zip(labeled.index, draw_ids):
+            if pd.isna(draw_id):
+                continue
+            member_a = str(labeled.at[idx, "member_a"]).strip().upper()
+            member_b = str(labeled.at[idx, "member_b"]).strip().upper()
+            feedback = []
+            for member_col, label_col, weight_col, member_id in [
+                ("member_a", "native_member_a_label", "native_member_a_weight", member_a),
+                ("member_b", "native_member_b_label", "native_member_b_weight", member_b),
+            ]:
+                decision = decisions.get((int(draw_id), member_id))
+                if decision is None:
+                    continue
+                labeled.at[idx, label_col] = decision["label"]
+                labeled.at[idx, weight_col] = decision["sample_weight"]
+                feedback.append(decision)
+            if not feedback:
+                continue
+            labels = {item["label"] for item in feedback}
+            weight = max(float(item["sample_weight"]) for item in feedback)
+            if labels == {"fraud"}:
+                labeled.at[idx, "label_stage1"] = 1
+                labeled.at[idx, "label_gold"] = 1
+                labeled.at[idx, "label_source"] = "native_gk_users"
+                labeled.at[idx, "sample_weight"] = weight
+                positive += 1
+            elif labels == {"not_fraud"}:
+                labeled.at[idx, "label_stage1"] = 0
+                labeled.at[idx, "label_gold"] = 0
+                labeled.at[idx, "label_source"] = "native_gk_users"
+                labeled.at[idx, "sample_weight"] = weight
+                negative += 1
+            else:
+                conflicts += 1
+        return labeled, {"positive_overrides": positive, "negative_overrides": negative, "conflicts": conflicts}
+
+    @staticmethod
+    def _latest_native_feedback_decisions(
+        labels: list[dict[str, Any]] | pd.DataFrame,
+    ) -> dict[tuple[int, str], dict[str, Any]]:
+        frame = pd.DataFrame(labels)
+        if frame.empty or not {"draw_id", "member_id", "label"}.issubset(frame.columns):
+            return {}
+        frame = frame.loc[frame["label"].isin(["fraud", "not_fraud"])].copy()
+        frame["draw_id"] = pd.to_numeric(frame["draw_id"], errors="coerce").astype("Int64")
+        frame["member_id"] = frame["member_id"].astype(str).str.strip().str.upper()
+        if "sample_weight" not in frame.columns:
+            frame["sample_weight"] = 2.0
+        frame["sample_weight"] = pd.to_numeric(frame["sample_weight"], errors="coerce").fillna(2.0)
+        if "decided_at" in frame.columns:
+            frame["decided_at"] = pd.to_datetime(frame["decided_at"], errors="coerce", utc=True)
+            frame = frame.sort_values("decided_at")
+        frame = frame.dropna(subset=["draw_id"]).drop_duplicates(["draw_id", "member_id"], keep="last")
+        return {
+            (int(row.draw_id), str(row.member_id)): {
+                "label": str(row.label),
+                "sample_weight": float(row.sample_weight),
+            }
+            for row in frame[["draw_id", "member_id", "label", "sample_weight"]].itertuples(index=False)
+        }
 
     def _build_stage1_base_from_parquet(
         self,
@@ -461,7 +542,9 @@ class FeatureEngineering:
             stage1_writer.close()
             pair_events_writer.close()
 
-        stage1_base = pd.read_parquet(stage1_base_path) if stage1_base_path.exists() else ensure_stage1_schema(pd.DataFrame())
+        stage1_base = (
+            pd.read_parquet(stage1_base_path) if stage1_base_path.exists() else ensure_stage1_schema(pd.DataFrame())
+        )
         pair_events = pd.read_parquet(pair_events_path) if pair_events_path.exists() else pd.DataFrame()
         return stage1_base, pair_events, pd.DataFrame()
 
@@ -494,48 +577,5 @@ class FeatureEngineering:
             | labeled["is_exact_complementary_pair_in_draw"].eq(1)
             | ((labeled["best_partner_union_coverage"] >= 0.95) & (labeled["best_partner_jaccard"] <= 0.10))
         ).astype(int)
-        labeled = self._apply_analyst_labels(labeled)
         labeled["sample_weight"] = 1.0
-        labeled.loc[labeled["label_tier"].eq("gold_analyst"), "sample_weight"] = 1.0
-        return labeled
-
-    def _apply_analyst_labels(self, labeled: pd.DataFrame) -> pd.DataFrame:
-        try:
-            from fraud_detection.utils.mongo_predictions import get_analyst_labels_collection
-
-            docs = list(get_analyst_labels_collection().find({}, {"_id": 0}))
-        except Exception as exc:
-            logger.info("Analyst labels unavailable during feature engineering: %s", exc)
-            return labeled
-        if not docs:
-            return labeled
-
-        latest = pd.DataFrame(docs)
-        required = {"draw_id", "member_id", "label"}
-        if not required.issubset(latest.columns):
-            return labeled
-        latest["member_id"] = latest["member_id"].astype(str).str.strip().str.upper()
-        latest["draw_id"] = pd.to_numeric(latest["draw_id"], errors="coerce").astype("Int64")
-        if "decided_at" in latest.columns:
-            latest["decided_at"] = pd.to_datetime(latest["decided_at"], errors="coerce", utc=True)
-            latest = latest.sort_values("decided_at")
-        latest = latest.dropna(subset=["draw_id"]).drop_duplicates(["member_id", "draw_id"], keep="last")
-        decisions = {
-            (row.member_id, row.draw_id): row.label
-            for row in latest[["member_id", "draw_id", "label"]].itertuples(index=False)
-        }
-        draw_ids = pd.to_numeric(labeled["draw_id"], errors="coerce").astype("Int64")
-        keys = list(zip(labeled["member_id"].astype(str).str.upper(), draw_ids))
-        for idx, key in zip(labeled.index, keys):
-            decision = decisions.get(key)
-            if decision == "fraud":
-                labeled.at[idx, "label_gold"] = 1
-                labeled.at[idx, "label_stage1"] = 1
-                labeled.at[idx, "label_source"] = "analyst"
-                labeled.at[idx, "label_tier"] = "gold_analyst"
-            elif decision == "not_fraud":
-                labeled.at[idx, "label_gold"] = 0
-                labeled.at[idx, "label_stage1"] = 0
-                labeled.at[idx, "label_source"] = "analyst"
-                labeled.at[idx, "label_tier"] = "gold_analyst"
         return labeled

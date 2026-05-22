@@ -15,6 +15,7 @@ from fraud_detection.logger import get_logger
 from fraud_detection.serving.live_scoring.draw_scorer import DrawScorer
 from fraud_detection.utils.common import load_joblib, read_json, read_yaml, write_json
 from fraud_detection.utils.mongodb import MONGO_PROJECTION, get_serving_mongo_collection
+from fraud_detection.utils.native_feedback import extract_native_feedback_events, sync_native_suspected_feedback
 from fraud_detection.utils.per_draw_recall import build_batch_false_negative_report
 
 logger = get_logger(__name__)
@@ -30,7 +31,9 @@ def _resolve_repo_path(value: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _resolve_window_bounds(window: dict[str, object], timestamp_min: pd.Timestamp, timestamp_max: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+def _resolve_window_bounds(
+    window: dict[str, object], timestamp_min: pd.Timestamp, timestamp_max: pd.Timestamp
+) -> tuple[pd.Timestamp, pd.Timestamp]:
     start_date = window.get("start_date")
     end_date = window.get("end_date")
     lookback_days = window.get("lookback_days")
@@ -65,7 +68,9 @@ def _resolve_live_window_bounds(
     elif lookback_days is not None:
         start_ts = end_ts - pd.Timedelta(days=int(lookback_days))
     else:
-        raise ValueError("Mongo-backed batch scoring requires start_date/end_date or lookback_days in batch_scoring.window")
+        raise ValueError(
+            "Mongo-backed batch scoring requires start_date/end_date or lookback_days in batch_scoring.window"
+        )
     if start_ts > end_ts:
         raise ValueError(f"Invalid batch scoring window: start {start_ts} is after end {end_ts}")
     return timestamp_field, start_ts, end_ts
@@ -221,9 +226,8 @@ def _iter_parquet_draw_groups(parquet_path: Path, *, window: dict[str, object], 
 
     start_ts, end_ts = _resolve_window_bounds(window, min_ts or max_ts, max_ts)
     arrow_type = dataset.schema.field(timestamp_field).type
-    filter_expr = (
-        (ds.field(timestamp_field) >= _to_filter_bound(start_ts, arrow_type))
-        & (ds.field(timestamp_field) < _to_filter_bound(end_ts, arrow_type))
+    filter_expr = (ds.field(timestamp_field) >= _to_filter_bound(start_ts, arrow_type)) & (
+        ds.field(timestamp_field) < _to_filter_bound(end_ts, arrow_type)
     )
     logger.info(
         "Batch scoring parquet window: %s in [%s, %s) from %s",
@@ -300,9 +304,13 @@ class BatchScoringPipeline:
             bundle = load_joblib(bundle_path)
             batch_cfg = config.get("batch_scoring", {}) or {}
             partnership_cfg = config.get("partnership", {})
-            use_candidate_store = bool(partnership_cfg.get("use_candidate_store", bundle.get("use_candidate_store", False)))
+            use_candidate_store = bool(
+                partnership_cfg.get("use_candidate_store", bundle.get("use_candidate_store", False))
+            )
             source_cfg = config["data_ingestion"]
-            batch_source = str(batch_cfg.get("source", "mongodb" if use_candidate_store else source_cfg.get("source", "parquet"))).lower()
+            batch_source = str(
+                batch_cfg.get("source", "mongodb" if use_candidate_store else source_cfg.get("source", "parquet"))
+            ).lower()
             window = batch_cfg.get("window", {}) or {}
             if batch_source == "candidate_store":
                 iterator = _iter_candidate_store_batches(
@@ -329,9 +337,15 @@ class BatchScoringPipeline:
 
             manifest_path = current_dir / str(config.get("serving", {}).get("manifest_file", "serving_manifest.json"))
             manifest = read_json(manifest_path) if manifest_path.exists() else {}
-            partnership_table_path = current_dir / str(manifest.get("partnership_table_file", "partnership_table.parquet"))
-            partnership_table = pd.read_parquet(partnership_table_path) if partnership_table_path.exists() else pd.DataFrame()
-            ccs_table_path = current_dir / str(manifest.get("ccs_concentration_table_file", "ccs_concentration_table.parquet"))
+            partnership_table_path = current_dir / str(
+                manifest.get("partnership_table_file", "partnership_table.parquet")
+            )
+            partnership_table = (
+                pd.read_parquet(partnership_table_path) if partnership_table_path.exists() else pd.DataFrame()
+            )
+            ccs_table_path = current_dir / str(
+                manifest.get("ccs_concentration_table_file", "ccs_concentration_table.parquet")
+            )
             ccs_table = pd.read_parquet(ccs_table_path) if ccs_table_path.exists() else pd.DataFrame()
             scorer = DrawScorer(
                 bundle,
@@ -342,12 +356,29 @@ class BatchScoringPipeline:
             output_path = current_dir / "live_predictions_backfill.parquet"
             writer = _ParquetDocWriter(output_path)
             pending_docs: list[dict] = []
+            native_feedback_events = []
             draw_count = 0
             try:
                 for item in iterator:
                     try:
-                        results = scorer.score_candidate_batch(item) if score_mode == "candidate_store" else [scorer.score_draw(item)]
-                        pending_docs.extend(result.to_mongo_doc() for result in results)
+                        results = (
+                            scorer.score_candidate_batch(item)
+                            if score_mode == "candidate_store"
+                            else [scorer.score_draw(item)]
+                        )
+                        docs = [result.to_mongo_doc() for result in results]
+                        pending_docs.extend(docs)
+                        for doc in docs:
+                            if score_mode == "candidate_store":
+                                draw_id = pd.to_numeric(doc.get("draw_id"), errors="coerce")
+                                source = item
+                                if not pd.isna(draw_id) and "draw_id" in item.columns:
+                                    matches = item.loc[pd.to_numeric(item["draw_id"], errors="coerce").eq(int(draw_id))]
+                                    if not matches.empty:
+                                        source = matches.iloc[0]
+                                native_feedback_events.extend(extract_native_feedback_events(doc, source))
+                            else:
+                                native_feedback_events.extend(extract_native_feedback_events(doc, item))
                         draw_count += len(results)
                         if len(pending_docs) >= BATCH_SCORING_OUTPUT_BATCH_SIZE:
                             writer.write(pending_docs)
@@ -378,6 +409,9 @@ class BatchScoringPipeline:
                     else "candidate_store rows are scored directly through the pair scanner"
                 ),
             }
+            native_feedback_cfg = config.get("native_feedback", {}) or batch_cfg.get("native_feedback", {}) or {}
+            if native_feedback_cfg:
+                report["native_feedback"] = sync_native_suspected_feedback(native_feedback_events, native_feedback_cfg)
             try:
                 fraud_csv_path = _resolve_repo_path(
                     str((config.get("data_validation", {}) or {}).get("fraud_csv_path", "ROULET CHEATING DATA.csv"))

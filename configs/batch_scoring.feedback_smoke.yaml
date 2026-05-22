@@ -1,0 +1,37 @@
+pipeline:
+  current_dir: "artifacts/current_feedback_smoke"
+
+data_ingestion:
+  source: "parquet"
+  parquet_path: "artifacts/runs/run_20260427_175142/data_ingestion/raw_data.parquet"
+  mongodb:
+    uri_env_var: "MONGODB_URI"
+    database_env_var: "MONGODB_DATABASE"
+    collection_env_var: "MONGODB_COLLECTION_ROULETTE_REPORT"
+
+data_validation:
+  fraud_csv_path: "ROULET CHEATING DATA.csv"
+
+batch_scoring:
+  source: "mongodb"
+  mode: "operational"
+  require_labels: false
+  window:
+    timestamp_field: "trans_date"
+    lookback_days: null
+    chunk_days: 1
+    start_date: "2026-05-21T06:00:00+00:00"
+    end_date: "2026-05-21T07:30:00+00:00"
+
+native_feedback:
+  enabled: true
+  api_base_url_env_var: "GK_BACKEND_API_BASE_URL"
+  suspicious_bulk_path: "/gk-users/suspicious/bulk"
+  request_timeout_seconds: 30
+  uri_env_var: "MONGODB_URI"
+  database_env_var: "MONGODB_DATABASE"
+  users_collection_env_var: "MONGODB_COLLECTION_USERS"
+  users_suspected_field: "suspected_fraud"
+  confirmed_field: "confirmed_fraud"
+  confirmed_fraud_weight: 2.0
+  confirmed_not_fraud_weight: 2.0

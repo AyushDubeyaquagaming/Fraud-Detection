@@ -4,6 +4,7 @@ This flow keeps upstream data refreshes explicit while producing one MLflow
 lineage run for extraction, CCS profit refresh, training, promotion, and batch
 scoring.
 """
+
 from __future__ import annotations
 
 import copy
@@ -30,6 +31,7 @@ except ImportError:
 from fraud_detection.constants.constants import (
     BATCH_SCORING_CONFIG_FILE_PATH,
     CONFIG_FILE_PATH,
+    MODEL_BUNDLE_FILE,
     RUN_METADATA_FILE,
 )
 from fraud_detection.extraction.candidate_extractor import (
@@ -105,7 +107,7 @@ def _ccs_end_date_for_candidate_window(end_dt: datetime):
 
 
 def _ccs_start_date_for_candidate_window(start_dt: datetime, config: dict[str, Any]) -> date:
-    ccs_cfg = ((config.get("partnership", {}) or {}).get("ccs_features", {}) or {})
+    ccs_cfg = (config.get("partnership", {}) or {}).get("ccs_features", {}) or {}
     raw_windows = ccs_cfg.get("windows_days", [1, 7])
     if isinstance(raw_windows, (str, int, float)):
         raw_windows = [raw_windows]
@@ -176,6 +178,15 @@ def _write_resolved_training_config(
     return config_path
 
 
+def _batch_model_bundle_exists(batch_config_path: Path) -> bool:
+    try:
+        batch_config = read_yaml(batch_config_path)
+    except Exception:
+        return False
+    current_dir = _resolve_repo_path((batch_config.get("pipeline", {}) or {}).get("current_dir", "artifacts/current"))
+    return (current_dir / MODEL_BUNDLE_FILE).exists()
+
+
 def run_full_cycle(
     *,
     config_path: str | Path = CONFIG_FILE_PATH,
@@ -214,7 +225,10 @@ def run_full_cycle(
             mlflow_started = True
             mlflow.set_tag("run_id", full_cycle_id)
             mlflow.set_tag("source", "full_cycle")
-            mlflow.set_tag("candidate_store_mode", str(bool((config.get("partnership", {}) or {}).get("use_candidate_store", False))).lower())
+            mlflow.set_tag(
+                "candidate_store_mode",
+                str(bool((config.get("partnership", {}) or {}).get("use_candidate_store", False))).lower(),
+            )
             mlflow.set_tag("candidate_window_start", start_dt.date().isoformat())
             mlflow.set_tag("candidate_window_end", end_dt.date().isoformat())
             _log_params_if_active(
@@ -228,7 +242,7 @@ def run_full_cycle(
                     "window_mode": window_mode,
                     "force_candidates": force_candidates,
                     "force_ccs": force_ccs,
-                }
+                },
             )
         except Exception as exc:
             result["mlflow_warning"] = str(exc)
@@ -251,7 +265,7 @@ def run_full_cycle(
                 "candidate_chunks_skipped": candidate_summary.skipped,
                 "candidate_rows_written": candidate_summary.total_rows,
                 "candidate_elapsed_seconds": candidate_summary.elapsed_seconds,
-            }
+            },
         )
         if candidate_summary.exit_code:
             raise RuntimeError(f"Candidate extraction failed for {candidate_summary.failed} chunk(s).")
@@ -287,7 +301,7 @@ def run_full_cycle(
                 "ccs_days_skipped": ccs_summary.skipped_days,
                 "ccs_rows_written": ccs_summary.rows_written,
                 "ccs_elapsed_seconds": ccs_summary.elapsed_seconds,
-            }
+            },
         )
 
         training_config_path = _write_resolved_training_config(
@@ -313,17 +327,22 @@ def run_full_cycle(
         if _mlflow_active(mlflow):
             mlflow.set_tag("promoted", str(promoted).lower())
 
-        batch_result = None
-        if promoted:
-            batch_path = _resolve_repo_path(
-                batch_config_path
-                or config.get("pipeline", {}).get("weekly_serving_snapshot_config", BATCH_SCORING_CONFIG_FILE_PATH)
-            )
+        batch_path = _resolve_repo_path(
+            batch_config_path
+            or config.get("pipeline", {}).get("weekly_serving_snapshot_config", BATCH_SCORING_CONFIG_FILE_PATH)
+        )
+        if _batch_model_bundle_exists(batch_path):
             output_dir = BatchScoringPipeline(config_path=batch_path).run()
             report_path = output_dir / "batch_scoring_report.json"
             batch_result = read_json(report_path) if report_path.exists() else {"output_dir": str(output_dir)}
             _log_artifact_if_active(mlflow, report_path)
             _log_metrics_if_active(mlflow, {"batch_draws_scored": int(batch_result.get("draws_scored", 0) or 0)})
+        else:
+            batch_result = {
+                "status": "SKIPPED_NO_CURRENT_MODEL",
+                "reason": f"No model bundle found for batch config {batch_path}",
+                "config_path": str(batch_path),
+            }
         result["batch_scoring"] = batch_result
         result["status"] = "FINISHED"
         write_json(result, full_cycle_dir / "full_cycle_summary.json")

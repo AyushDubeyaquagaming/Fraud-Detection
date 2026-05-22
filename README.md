@@ -1,6 +1,6 @@
 # BetBlitz Fraud Detection - MLOps Pipeline
 
-Roulette partnership collusion detection system built around the candidate-draw store, Stage 1 pair scoring, Stage 2 member scoring, CCS profit context, and analyst feedback labels.
+Roulette partnership collusion detection system built around the candidate-draw store, Stage 1 pair scoring, Stage 2 member scoring, CCS profit context, and reviewed native feedback labels.
 
 ## Quick Start
 
@@ -34,7 +34,10 @@ The supported production path is candidate-store based:
 4. Promote the latest successfully trained model bundle.
 5. Run batch scoring after promotion.
 
-Analyst labels are optional feedback. Missing labels are logged as unavailable and do not block training or promotion.
+Native feedback is optional. Batch scoring sends ML-suspicious user periods to the backend
+`/gk-users/suspicious/bulk` endpoint, and the next training cycle reads reviewed
+`gk_users.confirmed_fraud` values. Missing reviewed feedback is logged as unavailable and
+does not block training or promotion.
 
 ## Project Structure
 

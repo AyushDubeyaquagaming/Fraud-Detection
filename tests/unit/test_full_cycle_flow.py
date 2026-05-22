@@ -60,7 +60,7 @@ class _FakeMlflow:
         self.ended_status = status
 
 
-def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
+def test_full_cycle_runs_batch_after_training(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     ccs_config_path = tmp_path / "ccs.yaml"
     batch_config_path = tmp_path / "batch.yaml"
@@ -78,6 +78,9 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
         },
         "mlflow": {"experiment_name": "test"},
     }
+    current_dir = tmp_path / "current"
+    current_dir.mkdir(parents=True)
+    (current_dir / "model_bundle.joblib").write_text("bundle", encoding="utf-8")
     ccs_config = {
         "output": {"base_path": str(tmp_path / "ccs_profit"), "parquet_compression": "zstd"},
         "mongo": {},
@@ -85,7 +88,7 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
     }
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     ccs_config_path.write_text(yaml.safe_dump(ccs_config), encoding="utf-8")
-    batch_config_path.write_text("{}", encoding="utf-8")
+    batch_config_path.write_text(yaml.safe_dump({"pipeline": {"current_dir": str(current_dir)}}), encoding="utf-8")
     candidate_config_path.write_text("{}", encoding="utf-8")
 
     class FakeExtractor:
@@ -164,6 +167,137 @@ def test_full_cycle_runs_batch_only_after_promotion(monkeypatch, tmp_path):
     assert fake_mlflow.ended_status == "FINISHED"
     summary = read_json(Path(result["full_cycle_dir"]) / "full_cycle_summary.json")
     assert summary["status"] == "FINISHED"
+
+
+def test_full_cycle_runs_batch_when_training_not_promoted(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    ccs_config_path = tmp_path / "ccs.yaml"
+    batch_config_path = tmp_path / "batch.yaml"
+    candidate_config_path = tmp_path / "candidate.yaml"
+    current_dir = tmp_path / "current"
+    current_dir.mkdir(parents=True)
+    (current_dir / "model_bundle.joblib").write_text("previous bundle", encoding="utf-8")
+    config = {
+        "pipeline": {
+            "artifact_root": str(tmp_path / "artifacts"),
+            "current_dir": str(current_dir),
+            "weekly_serving_snapshot_config": str(batch_config_path),
+        },
+        "partnership": {
+            "use_candidate_store": True,
+            "candidate_window": {"start_date": "2026-01-01", "end_date": "2026-01-08"},
+            "ccs_features": {"enabled": False},
+        },
+        "mlflow": {"experiment_name": "test"},
+    }
+    ccs_config_path.write_text(yaml.safe_dump({"output": {}, "mongo": {}, "extraction": {}}), encoding="utf-8")
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    batch_config_path.write_text(yaml.safe_dump({"pipeline": {"current_dir": str(current_dir)}}), encoding="utf-8")
+    candidate_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeExtractor:
+        def __init__(self, _config):
+            pass
+
+        def run(self, *, start_date, end_date, force=False):
+            return _CandidateSummary()
+
+    class FakeTrainingPipeline:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self):
+            run_dir = tmp_path / "artifacts" / "runs" / "run_test"
+            write_json({"run_id": "run_test", "status": "FINISHED", "promoted": False}, run_dir / "run_metadata.json")
+            return run_dir
+
+    class FakeBatchScoringPipeline:
+        def __init__(self, *, config_path):
+            assert Path(config_path) == batch_config_path
+
+        def run(self):
+            output_dir = tmp_path / "batch_output"
+            write_json({"draws_scored": 7}, output_dir / "batch_scoring_report.json")
+            return output_dir
+
+    fake_mlflow = _FakeMlflow()
+    monkeypatch.setattr(full_cycle_flow, "_start_mlflow_run", lambda *_args, **_kwargs: fake_mlflow)
+    monkeypatch.setattr(full_cycle_flow, "load_candidate_extraction_config", lambda _path: {})
+    monkeypatch.setattr(full_cycle_flow, "CandidateDrawExtractor", FakeExtractor)
+    monkeypatch.setattr(full_cycle_flow, "build_ccs_daily_profit", lambda *_args, **_kwargs: _CcsSummary())
+    monkeypatch.setattr(full_cycle_flow, "TrainingPipeline", FakeTrainingPipeline)
+    monkeypatch.setattr(full_cycle_flow, "BatchScoringPipeline", FakeBatchScoringPipeline)
+
+    result = full_cycle_flow.run_full_cycle(
+        config_path=config_path,
+        candidate_config_path=candidate_config_path,
+        ccs_config_path=ccs_config_path,
+        batch_config_path=batch_config_path,
+    )
+
+    assert result["training"]["promoted"] is False
+    assert result["batch_scoring"]["draws_scored"] == 7
+
+
+def test_full_cycle_skips_batch_when_no_current_model(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    ccs_config_path = tmp_path / "ccs.yaml"
+    batch_config_path = tmp_path / "batch.yaml"
+    candidate_config_path = tmp_path / "candidate.yaml"
+    current_dir = tmp_path / "current"
+    config = {
+        "pipeline": {
+            "artifact_root": str(tmp_path / "artifacts"),
+            "current_dir": str(current_dir),
+            "weekly_serving_snapshot_config": str(batch_config_path),
+        },
+        "partnership": {
+            "use_candidate_store": True,
+            "candidate_window": {"start_date": "2026-01-01", "end_date": "2026-01-08"},
+            "ccs_features": {"enabled": False},
+        },
+        "mlflow": {"experiment_name": "test"},
+    }
+    ccs_config_path.write_text(yaml.safe_dump({"output": {}, "mongo": {}, "extraction": {}}), encoding="utf-8")
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    batch_config_path.write_text(yaml.safe_dump({"pipeline": {"current_dir": str(current_dir)}}), encoding="utf-8")
+    candidate_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeExtractor:
+        def __init__(self, _config):
+            pass
+
+        def run(self, *, start_date, end_date, force=False):
+            return _CandidateSummary()
+
+    class FakeTrainingPipeline:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self):
+            run_dir = tmp_path / "artifacts" / "runs" / "run_test"
+            write_json({"run_id": "run_test", "status": "FINISHED", "promoted": False}, run_dir / "run_metadata.json")
+            return run_dir
+
+    class FailBatchScoringPipeline:
+        def __init__(self, **_kwargs):
+            raise AssertionError("batch scoring should be skipped without a current model")
+
+    monkeypatch.setattr(full_cycle_flow, "_start_mlflow_run", lambda *_args, **_kwargs: _FakeMlflow())
+    monkeypatch.setattr(full_cycle_flow, "load_candidate_extraction_config", lambda _path: {})
+    monkeypatch.setattr(full_cycle_flow, "CandidateDrawExtractor", FakeExtractor)
+    monkeypatch.setattr(full_cycle_flow, "build_ccs_daily_profit", lambda *_args, **_kwargs: _CcsSummary())
+    monkeypatch.setattr(full_cycle_flow, "TrainingPipeline", FakeTrainingPipeline)
+    monkeypatch.setattr(full_cycle_flow, "BatchScoringPipeline", FailBatchScoringPipeline)
+
+    result = full_cycle_flow.run_full_cycle(
+        config_path=config_path,
+        candidate_config_path=candidate_config_path,
+        ccs_config_path=ccs_config_path,
+        batch_config_path=batch_config_path,
+    )
+
+    assert result["batch_scoring"]["status"] == "SKIPPED_NO_CURRENT_MODEL"
 
 
 def test_resolve_window_uses_rolling_only_when_requested():

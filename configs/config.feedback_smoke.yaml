@@ -1,5 +1,8 @@
 pipeline:
-  current_dir: "artifacts/current"
+  artifact_root: "artifacts"
+  current_dir: "artifacts/current_feedback_smoke"
+  random_seed: 42
+  weekly_serving_snapshot_config: "configs/batch_scoring.feedback_smoke.yaml"
 
 data_ingestion:
   source: "parquet"
@@ -11,24 +14,40 @@ data_ingestion:
     strategy: "date_window"
     strategy_params:
       timestamp_field: "trans_date"
-      lookback_days: 7
+      lookback_days: 1
       start_date: null
       end_date: null
       confirm_full_pull: false
 
 data_validation:
+  required_columns:
+    - member_id
+    - draw_id
+    - total_bet_amount
+    - win_points
+    - bets
+  min_row_count: 1
   fraud_csv_path: "ROULET CHEATING DATA.csv"
 
-batch_scoring:
-  source: "mongodb"
-  mode: "operational"
-  require_labels: false
-  window:
-    timestamp_field: "trans_date"
-    lookback_days: 7
-    chunk_days: 1
-    start_date: null
-    end_date: null
+model_evaluation:
+  min_capture_rate_top_5pct: 0.0
+  min_lift_top_5pct: 0.0
+
+mlflow:
+  tracking_uri_env_var: "MLFLOW_TRACKING_URI"
+  experiment_name: "fraud_detection_partnership_v1"
+  registered_model_name: "fraud_detection_partnership_v1"
+  register_on_promotion: false
+  archive_existing_staging: false
+  auto_promote_to_production: false
+
+serving:
+  artifact_provider: "local_disk"
+  current_dir: "artifacts/current_feedback_smoke"
+  manifest_file: "serving_manifest.json"
+  model_version: "partnership_v1"
+  host: "127.0.0.1"
+  port: 8000
 
 partnership:
   use_candidate_store: true
@@ -37,8 +56,9 @@ partnership:
   synthetic_positives_from_strict_pattern: false
   strict_inference_filter: false
   candidate_window:
-    start_date: 2026-02-25
-    end_date: 2026-05-05
+    start_date: 2026-05-21
+    end_date: 2026-05-22
+  emit_negatives_sample: 5
   pair_rules:
     strict_min_ratio_similarity: 0.80
     strict_min_stake_ratio: 0.90
@@ -79,26 +99,35 @@ partnership:
     profit_path: "data_store/ccs_daily_profit"
     windows_days: [1, 7]
     concentration_threshold: 0.70
-partnership_scoring:
-  stage2_alert_threshold: 0.65
-  backfill_lookback_days: 30
+  native_feedback:
+    enabled: true
+    uri_env_var: "MONGODB_URI"
+    database_env_var: "MONGODB_DATABASE"
+    users_collection_env_var: "MONGODB_COLLECTION_USERS"
+    users_suspected_field: "suspected_fraud"
+    confirmed_field: "confirmed_fraud"
+    confirmed_fraud_weight: 2.0
+    confirmed_not_fraud_weight: 2.0
+  stage1_flag_threshold: 0.70
+  stream_batch_size: 2000
+  candidate_thresholds:
+    min_position_count: 4
+    max_position_count: 34
+    max_candidates_per_draw: 80
+    max_jaccard: 0.10
+    expandable_pair_min_coverage: 0.50
+  rolling_window_days: 7
+  label_tier_weights: { gold: 1.0, silver: 1.0, bronze: 0.5, gold_analyst: 1.0 }
+  section_a_min_recurrence: 3
+  section_b_min_stake: 1000.0
+  section_b_min_per_position_ratio: 0.80
+  section_b_max_combined_bet_cv: 0.35
+  section_b_min_pair_net: 0.0
 
-live_predictions_mongo:
-  uri_env_var: "MONGODB_URI"
-  database_env_var: "MONGODB_DATABASE"
-  live_predictions_collection_env_var: "LIVE_PREDICTIONS_COLLECTION"
-  analyst_labels_collection_env_var: "ANALYST_LABELS_COLLECTION"
-  live_scoring_state_collection_env_var: "LIVE_SCORING_STATE_COLLECTION"
-
-native_feedback:
-  enabled: true
-  api_base_url_env_var: "GK_BACKEND_API_BASE_URL"
-  suspicious_bulk_path: "/gk-users/suspicious/bulk"
-  request_timeout_seconds: 30
-  uri_env_var: "MONGODB_URI"
-  database_env_var: "MONGODB_DATABASE"
-  users_collection_env_var: "MONGODB_COLLECTION_USERS"
-  users_suspected_field: "suspected_fraud"
-  confirmed_field: "confirmed_fraud"
-  confirmed_fraud_weight: 2.0
-  confirmed_not_fraud_weight: 2.0
+monitoring:
+  enabled: false
+  reports_dir: "monitoring"
+  sample_size: 50000
+  reference_from_current_metadata: true
+  monitored_features: []
+  drift_threshold: 0.3

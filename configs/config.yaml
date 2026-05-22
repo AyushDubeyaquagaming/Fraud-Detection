@@ -109,11 +109,15 @@ partnership:
     profit_path: "data_store/ccs_daily_profit"
     windows_days: [1, 7]
     concentration_threshold: 0.70
-  analyst_label_overlay:
+  native_feedback:
     enabled: true
-    require_both_members_for_pair_override: true
-    any_member_clique_override: false
-    conflict_policy: "no_override"
+    uri_env_var: "MONGODB_URI"
+    database_env_var: "MONGODB_DATABASE"
+    users_collection_env_var: "MONGODB_COLLECTION_USERS"
+    users_suspected_field: "suspected_fraud"
+    confirmed_field: "confirmed_fraud"
+    confirmed_fraud_weight: 2.0
+    confirmed_not_fraud_weight: 2.0
   stage1_flag_threshold: 0.70
   stream_batch_size: 500
   candidate_thresholds:

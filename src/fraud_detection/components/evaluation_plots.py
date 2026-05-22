@@ -61,7 +61,7 @@ def generate_evaluation_plots(
             "capture_curve.png",
         ]:
             summary["skipped"].append({"plot": name, "reason": "label_status_unavailable"})
-        logger.info("Skipping label-dependent evaluation plots because no positive analyst labels are available.")
+        logger.info("Skipping label-dependent evaluation plots because no positive reviewed labels are available.")
     else:
         threshold = float(training_report.get("stage2_alert_threshold", 0.65) or 0.65)
         _safe_plot(summary, "confusion_matrix.png", output_dir, _plot_confusion_matrix, scored, labels, threshold)
