@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, datetime
 from typing import Any
 
 import requests
-
-from fraud_detection.constants.constants import CONFIG_FILE_PATH
-from fraud_detection.utils.common import read_yaml
 
 DEFAULT_PREFECT_API_URL = "http://localhost:4200/api"
 FULL_CYCLE_DEPLOYMENT = "fraud-detection-full-cycle/full-cycle-weekly"
@@ -36,28 +32,10 @@ def prefect_ui_url() -> str:
     return api_url[:-4] if api_url.endswith("/api") else api_url
 
 
-def read_candidate_window(config_path: str | Path = CONFIG_FILE_PATH) -> tuple[date, date]:
-    config = read_yaml(Path(config_path))
-    window = ((config.get("partnership", {}) or {}).get("candidate_window", {}) or {})
-    if not window.get("start_date") or not window.get("end_date"):
-        raise ValueError("partnership.candidate_window.start_date and end_date are required")
-    return _to_date(window["start_date"]), _to_date(window["end_date"])
-
-
-def widen_candidate_window_for_label(
-    *,
-    labeled_draw_date: date | datetime | str,
-    config_path: str | Path = CONFIG_FILE_PATH,
-) -> tuple[date, date]:
-    base_start, base_end = read_candidate_window(config_path)
-    label_date = _to_date(labeled_draw_date)
-    return min(base_start, label_date), max(base_end, label_date + timedelta(days=1))
-
-
 def trigger_full_cycle_flow(
     *,
-    start_date: date | datetime | str,
-    end_date: date | datetime | str,
+    start_date: date | datetime | str | None = None,
+    end_date: date | datetime | str | None = None,
     config_path: str = "configs/config.yaml",
     candidate_config_path: str = "configs/candidate_extraction.yaml",
     ccs_config_path: str = "configs/ccs_profit.yaml",
@@ -65,17 +43,19 @@ def trigger_full_cycle_flow(
 ) -> PrefectFlowRun:
     deployment = _get_deployment_by_name(deployment_name)
     deployment_id = deployment["id"]
+    parameters = {
+        "config_path": config_path,
+        "candidate_config_path": candidate_config_path,
+        "ccs_config_path": ccs_config_path,
+    }
+    if bool(start_date) != bool(end_date):
+        raise ValueError("start_date and end_date must be provided together")
+    if start_date and end_date:
+        parameters["start_date"] = _to_date(start_date).isoformat()
+        parameters["end_date"] = _to_date(end_date).isoformat()
     response = requests.post(
         f"{prefect_api_url()}/deployments/{deployment_id}/create_flow_run",
-        json={
-            "parameters": {
-                "config_path": config_path,
-                "candidate_config_path": candidate_config_path,
-                "ccs_config_path": ccs_config_path,
-                "start_date": _to_date(start_date).isoformat(),
-                "end_date": _to_date(end_date).isoformat(),
-            }
-        },
+        json={"parameters": parameters},
         timeout=20,
     )
     _raise_for_prefect(response)

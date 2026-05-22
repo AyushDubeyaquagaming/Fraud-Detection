@@ -220,3 +220,35 @@ def test_read_native_feedback_labels_accepts_boolean_suspected_flag(monkeypatch)
 
     assert labels[0]["label"] == "fraud"
     assert labels[0]["sample_weight"] == 5.0
+
+
+def test_read_native_feedback_labels_accepts_top_level_ml_suspected_flag(monkeypatch):
+    users_collection = _FakeCollection(
+        [
+            {"member_id": "A", "confirmed_fraud": False, "is_suspected_by_ml": True},
+        ]
+    )
+
+    monkeypatch.setattr(
+        native_feedback,
+        "get_serving_mongo_collection",
+        lambda _uri, _db, collection_env_var: users_collection,
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "draw_id": 1,
+                "member_ids": ["A"],
+                "ccs_ids": ["CA"],
+                "trans_date_min": pd.Timestamp("2026-05-01T12:00:00Z"),
+            }
+        ]
+    )
+
+    labels = native_feedback.read_native_feedback_labels_for_candidate_rows(
+        rows,
+        {"enabled": True, "confirmed_not_fraud_weight": 4.0},
+    )
+
+    assert labels[0]["label"] == "not_fraud"
+    assert labels[0]["sample_weight"] == 4.0

@@ -88,7 +88,7 @@ class ModelEvaluation:
             if validation_status == "not_evaluated_no_labels":
                 gate_passed = True
                 promotion_decision = "promoted_with_warning"
-                gate_reason = "no_analyst_labels_available_promoted_with_warning"
+                gate_reason = "no_reviewed_feedback_labels_available_promoted_with_warning"
             elif validation_status == "evaluated_oof":
                 gate_passed = bool(
                     float(top5["capture_rate"]) >= float(self.config.min_capture_rate_top_5pct)

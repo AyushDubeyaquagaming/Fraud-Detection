@@ -411,7 +411,21 @@ class BatchScoringPipeline:
             }
             native_feedback_cfg = config.get("native_feedback", {}) or batch_cfg.get("native_feedback", {}) or {}
             if native_feedback_cfg:
-                report["native_feedback"] = sync_native_suspected_feedback(native_feedback_events, native_feedback_cfg)
+                try:
+                    report["native_feedback"] = sync_native_suspected_feedback(native_feedback_events, native_feedback_cfg)
+                except Exception as feedback_exc:
+                    logger.warning(
+                        "Native feedback suspicious API sync failed after batch scoring completed; "
+                        "continuing with scored predictions available: %s",
+                        feedback_exc,
+                    )
+                    report["native_feedback"] = {
+                        "enabled": True,
+                        "events": int(len(native_feedback_events)),
+                        "members": int(len({event.member_id for event in native_feedback_events})),
+                        "status": "failed",
+                        "error": str(feedback_exc),
+                    }
             try:
                 fraud_csv_path = _resolve_repo_path(
                     str((config.get("data_validation", {}) or {}).get("fraud_csv_path", "ROULET CHEATING DATA.csv"))

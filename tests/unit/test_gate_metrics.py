@@ -57,7 +57,7 @@ def test_model_evaluation_promotes_when_labels_are_unavailable(tmp_path):
     assert report["label_status"] == "unavailable"
     assert report["validation_status"] == "not_evaluated_no_labels"
     assert report["promotion_decision"] == "promoted_with_warning"
-    assert report["gate_reason"] == "no_analyst_labels_available_promoted_with_warning"
+    assert report["gate_reason"] == "no_reviewed_feedback_labels_available_promoted_with_warning"
     assert report["total_evaluation_members"] == 0
 
 

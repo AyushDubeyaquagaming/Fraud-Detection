@@ -29,7 +29,7 @@ def main() -> int:
 
     try:
         output_dir = BatchScoringPipeline(config_path=args.config).run()
-        print(f"\nBatch scoring completed successfully.")
+        print("\nBatch scoring completed successfully.")
         print(f"Outputs in: {output_dir}")
         return 0
     except Exception as exc:

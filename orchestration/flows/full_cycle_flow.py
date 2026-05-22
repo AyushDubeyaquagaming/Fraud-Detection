@@ -195,7 +195,7 @@ def run_full_cycle(
     batch_config_path: str | Path | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
-    window_mode: str = "fixed",
+    window_mode: str = "rolling",
     force_candidates: bool = False,
     force_ccs: bool = False,
 ) -> dict[str, Any]:
@@ -373,7 +373,7 @@ if _PREFECT_AVAILABLE:
         batch_config_path: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
-        window_mode: str = "fixed",
+        window_mode: str = "rolling",
         force_candidates: bool = False,
         force_ccs: bool = False,
     ) -> dict[str, Any]:
@@ -412,7 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-config", default=None)
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
-    parser.add_argument("--window-mode", choices=["fixed", "rolling"], default="fixed")
+    parser.add_argument("--window-mode", choices=["fixed", "rolling"], default="rolling")
     parser.add_argument("--force-candidates", action="store_true")
     parser.add_argument("--force-ccs", action="store_true")
     args = parser.parse_args()

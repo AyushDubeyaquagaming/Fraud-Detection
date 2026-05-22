@@ -169,13 +169,20 @@ def test_score_alerts_applies_window_and_max_draws_before_risk_sort(monkeypatch)
         ccs_concentration_table=None,
         evaluation_metadata={"label_status": "available"},
     )
+    candidate_calls = {}
+
+    def fake_candidate_rows_for_window(**kwargs):
+        candidate_calls["max_draws"] = kwargs["max_draws"]
+        return pd.DataFrame([rows[3]])
+
     monkeypatch.setattr(live_scoring, "_prediction_backfill_docs", lambda *_args, **_kwargs: docs)
-    monkeypatch.setattr(live_scoring, "_candidate_row_for_doc", lambda draw_id, _context: rows[int(draw_id)])
+    monkeypatch.setattr(live_scoring, "_candidate_rows_for_window", fake_candidate_rows_for_window)
 
     response = live_scoring.score_alerts(lookback_days=7, max_draws=1, limit=10, context=context)
 
     assert response.draws_scanned == 1
     assert [alert.draw_id for alert in response.alerts] == [3]
+    assert candidate_calls["max_draws"] == 1
 
 
 def test_score_ccs_groups_alert_queue_from_backfill(monkeypatch):
@@ -225,7 +232,7 @@ def test_score_ccs_groups_alert_queue_from_backfill(monkeypatch):
     assert response.ccs_scores[0].evidence[0]["draw_id"] == 7
 
 
-def test_score_ccs_filters_requested_ccs_before_max_draw_limit(monkeypatch):
+def test_score_ccs_applies_max_draw_limit_before_requested_ccs_filter(monkeypatch):
     now = pd.Timestamp.now(tz="UTC")
     docs = [
         {
@@ -254,8 +261,14 @@ def test_score_ccs_filters_requested_ccs_before_max_draw_limit(monkeypatch):
         ccs_concentration_table=None,
         evaluation_metadata={"label_status": "available"},
     )
+    candidate_calls = {}
+
+    def fake_candidate_rows_for_window(**kwargs):
+        candidate_calls["max_draws"] = kwargs["max_draws"]
+        return pd.DataFrame([rows[1]])
+
     monkeypatch.setattr(live_scoring, "_prediction_backfill_docs", lambda *_args, **_kwargs: docs)
-    monkeypatch.setattr(live_scoring, "_candidate_row_for_doc", lambda draw_id, _context: rows[int(draw_id)])
+    monkeypatch.setattr(live_scoring, "_candidate_rows_for_window", fake_candidate_rows_for_window)
 
     response = live_scoring.score_ccs(
         live_scoring.CcsScoreRequest(ccs_ids=["TARGET"], lookback_days=7, max_draws=1),
@@ -264,5 +277,6 @@ def test_score_ccs_filters_requested_ccs_before_max_draw_limit(monkeypatch):
 
     assert response.draws_scanned == 1
     assert response.ccs_scores[0].ccs_id == "TARGET"
-    assert response.ccs_scores[0].risk_tier == "HIGH"
-    assert response.ccs_scores[0].evidence_draw_ids == [2]
+    assert response.ccs_scores[0].risk_tier == "LOW"
+    assert response.ccs_scores[0].evidence_draw_ids == []
+    assert candidate_calls["max_draws"] == 1

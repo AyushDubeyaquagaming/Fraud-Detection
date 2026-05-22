@@ -87,7 +87,6 @@ live_predictions_mongo:
   uri_env_var: "MONGODB_URI"
   database_env_var: "MONGODB_DATABASE"
   live_predictions_collection_env_var: "LIVE_PREDICTIONS_COLLECTION"
-  analyst_labels_collection_env_var: "ANALYST_LABELS_COLLECTION"
   live_scoring_state_collection_env_var: "LIVE_SCORING_STATE_COLLECTION"
 
 native_feedback:

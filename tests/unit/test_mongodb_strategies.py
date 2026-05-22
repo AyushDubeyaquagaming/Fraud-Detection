@@ -5,9 +5,7 @@ query-building logic in fraud_detection.utils.mongodb.
 """
 from __future__ import annotations
 
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import pytest

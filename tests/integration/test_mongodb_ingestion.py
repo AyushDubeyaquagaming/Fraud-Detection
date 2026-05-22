@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
@@ -28,8 +26,8 @@ pytestmark = pytest.mark.skipif(
 # Helpers
 # ---------------------------------------------------------------------------
 
-from fraud_detection.constants.constants import REPO_ROOT
-from fraud_detection.utils.mongodb import (
+from fraud_detection.constants.constants import REPO_ROOT  # noqa: E402
+from fraud_detection.utils.mongodb import (  # noqa: E402
     build_query_batches_from_strategy,
     pull_query_batches_to_dataframe,
     stream_query_batches_to_parquet,
@@ -160,7 +158,6 @@ def test_full_collection_raises_without_confirm():
 
 def test_ingestion_report_includes_strategy_metadata(tmp_path):
     """DataIngestion artifact must include strategy_used and query_count."""
-    from dataclasses import fields as dc_fields
     from fraud_detection.entity.config_entity import DataIngestionConfig
     from fraud_detection.components.data_ingestion import DataIngestion
 

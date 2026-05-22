@@ -30,7 +30,7 @@ def main() -> int:
 
     try:
         run_dir = TrainingPipeline(config_path=args.config).run()
-        print(f"\nTraining pipeline completed successfully.")
+        print("\nTraining pipeline completed successfully.")
         print(f"Run directory: {run_dir}")
         return 0
     except Exception as exc:

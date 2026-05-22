@@ -220,7 +220,6 @@ def emit_pair_rows(
     for idx in np.flatnonzero(emit_mask):
         i = int(upper_i[idx])
         j = int(upper_j[idx])
-        row_pair_stake = float(total_bets[i] + total_bets[j])
         rows.append(
             {
                 "draw_id": draw_id,

@@ -17,9 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from fraud_detection.orchestration_client import (
     get_flow_run_status,
     trigger_full_cycle_flow,
-    widen_candidate_window_for_label,
 )
-from fraud_detection.utils.mongo_predictions import read_recent_analyst_labels, upsert_analyst_label
 
 
 load_dotenv()
@@ -65,31 +63,6 @@ def get_json(path: str, params: dict | None = None) -> dict:
         raise RuntimeError(f"{response.status_code}: {response.text}")
     response.raise_for_status()
     return response.json()
-
-
-def current_model_version() -> str:
-    try:
-        return str(get_json("/model-info").get("model_version") or "partnership_v1")
-    except Exception:
-        return "partnership_v1"
-
-
-@st.cache_data(show_spinner=False, ttl=20)
-def load_recent_labels(limit: int = 25) -> pd.DataFrame:
-    try:
-        return pd.DataFrame(read_recent_analyst_labels(limit=limit))
-    except Exception:
-        return pd.DataFrame()
-
-
-def clear_recent_label_cache() -> None:
-    load_recent_labels.clear()
-
-
-def append_label_audit_csv(row: dict) -> None:
-    path = Path("ROULET CHEATING DATA.csv")
-    audit_row = pd.DataFrame([row])
-    audit_row.to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
 st.set_page_config(page_title="Partnership Collusion Demo", layout="wide")
@@ -268,95 +241,21 @@ with tab_alerts:
                 st.dataframe(members, use_container_width=True)
 
 with tab_retrain:
-    st.subheader("Add confirmed fraud feedback")
-    st.caption("Labels are written to the Mongo feedback collection used by candidate-store training.")
-    with st.form("confirmed_fraud_label_form"):
-        label_date = st.date_input("DATE")
-        label_draw_id = st.number_input("DRAW_ID", min_value=0, step=1, format="%d")
-        label_member_id = st.text_input("MEMBER_ID", placeholder="GK00236424")
-        label_ccs_id = st.text_input("CCS_ID", placeholder="CCS015695")
-        mirror_csv = st.checkbox("Also append to legacy CSV audit mirror", value=False)
-        submitted = st.form_submit_button("Save confirmed fraud label", type="primary")
-
-    if submitted:
-        normalized_member = label_member_id.strip().upper()
-        normalized_ccs = label_ccs_id.strip().upper()
-        if int(label_draw_id) <= 0 or not normalized_member or not normalized_ccs:
-            st.error("DATE, DRAW_ID, MEMBER_ID, and CCS_ID are required.")
-        else:
-            try:
-                label_dt = datetime.combine(label_date, datetime.min.time(), tzinfo=timezone.utc)
-                label_id, created = upsert_analyst_label(
-                    draw_id=int(label_draw_id),
-                    member_id=normalized_member,
-                    label="fraud",
-                    model_version=current_model_version(),
-                    draw_date=label_dt,
-                    ccs_id=normalized_ccs,
-                )
-                if mirror_csv:
-                    append_label_audit_csv(
-                        {
-                            "DATE": label_date.isoformat(),
-                            "DRAW_ID": int(label_draw_id),
-                            "MEMBER_ID": normalized_member,
-                            "CCS_ID": normalized_ccs,
-                            "label": "fraud",
-                            "mongo_label_id": str(label_id),
-                        }
-                    )
-                st.session_state["latest_label_draw_date"] = label_date.isoformat()
-                st.session_state["latest_label_draw_id"] = int(label_draw_id)
-                st.session_state["latest_label_member_id"] = normalized_member
-                clear_recent_label_cache()
-                st.success(
-                    "Created new confirmed-fraud label."
-                    if created
-                    else "Updated existing confirmed-fraud label."
-                )
-            except Exception as exc:
-                st.error(f"Label write failed: {exc}")
-
-    st.subheader("Recent labels")
-    recent_labels = load_recent_labels(limit=25)
-    if recent_labels.empty:
-        st.info("No feedback labels found, or Mongo is unavailable.")
-    else:
-        columns = ["decided_at", "draw_date", "draw_id", "member_id", "ccs_id", "label"]
-        visible_columns = [column for column in columns if column in recent_labels.columns]
-        st.dataframe(recent_labels[visible_columns], use_container_width=True)
-
     st.subheader("Trigger retrain and rescore")
     st.caption(
-        "Submits an on-demand full cycle that refreshes candidate data for the needed window, "
-        "retrains, evaluates, promotes if gates pass, and batch-scores the promoted model."
+        "Submits an on-demand rolling full cycle. Reviewed feedback is read from gk_users.confirmed_fraud during training."
     )
-    has_session_label = "latest_label_draw_date" in st.session_state
-    manual_confirm = st.checkbox("Allow manual trigger without a label written in this session", value=False)
     active_run_id = st.session_state.get("full_cycle_flow_run_id")
     active_state = st.session_state.get("full_cycle_state_type")
     trigger_disabled = bool(active_run_id and str(active_state or "").upper() in ACTIVE_PREFECT_STATES)
 
-    if not has_session_label and not manual_confirm:
-        st.info(
-            "Save a confirmed-fraud label in this session before triggering the full cycle, "
-            "or enable manual trigger."
-        )
-
     if st.button(
         "Trigger full-cycle retrain and rescore",
         type="primary",
-        disabled=trigger_disabled or (not has_session_label and not manual_confirm),
+        disabled=trigger_disabled,
     ):
         try:
-            draw_date_for_window = st.session_state.get("latest_label_draw_date") or label_date.isoformat()
-            start_window, end_window = widen_candidate_window_for_label(
-                labeled_draw_date=draw_date_for_window,
-                config_path="configs/config.yaml",
-            )
             run = trigger_full_cycle_flow(
-                start_date=start_window,
-                end_date=end_window,
                 config_path="configs/config.yaml",
                 candidate_config_path="configs/candidate_extraction.yaml",
                 ccs_config_path="configs/ccs_profit.yaml",
@@ -365,8 +264,7 @@ with tab_retrain:
             st.session_state["full_cycle_state_type"] = run.state_type
             st.session_state["full_cycle_state_name"] = run.state_name
             st.session_state["full_cycle_ui_url"] = run.ui_url
-            st.session_state["full_cycle_start_date"] = start_window.isoformat()
-            st.session_state["full_cycle_end_date"] = end_window.isoformat()
+            st.session_state["full_cycle_window_mode"] = "rolling"
             st.success(f"Triggered full-cycle flow run: {run.flow_run_id}")
         except Exception as exc:
             st.error(
@@ -379,10 +277,7 @@ with tab_retrain:
         st.subheader("Run status")
         flow_run_id = st.session_state["full_cycle_flow_run_id"]
         st.write(f"Flow run ID: `{flow_run_id}`")
-        st.write(
-            f"Requested full-cycle window: `{st.session_state.get('full_cycle_start_date')}` "
-            f"to `{st.session_state.get('full_cycle_end_date')}`"
-        )
+        st.write(f"Requested full-cycle window mode: `{st.session_state.get('full_cycle_window_mode', 'rolling')}`")
         if st.session_state.get("full_cycle_ui_url"):
             st.link_button("Open Prefect flow run", st.session_state["full_cycle_ui_url"])
         try:
@@ -420,8 +315,7 @@ with tab_retrain:
                 "full_cycle_state_type",
                 "full_cycle_state_name",
                 "full_cycle_ui_url",
-                "full_cycle_start_date",
-                "full_cycle_end_date",
+                "full_cycle_window_mode",
             ]:
                 st.session_state.pop(key, None)
             st.rerun()

@@ -7,9 +7,9 @@ from typing import Any
 
 import pandas as pd
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from fraud_detection.components.ccs_features import CCS_FEATURE_COLUMNS
 from fraud_detection.constants.constants import ENV_MONGODB_COLLECTION, ENV_MONGODB_DATABASE, ENV_MONGODB_URI, REPO_ROOT, RUNS_DIR
 from fraud_detection.serving.dependencies import LiveScoringContext, get_live_scoring_context
 from fraud_detection.serving.live_scoring.draw_scorer import DrawScorer
@@ -306,6 +306,24 @@ def _prediction_backfill_frame(path_str: str, mtime_ns: int) -> pd.DataFrame:
     return pd.read_parquet(path_str)
 
 
+@lru_cache(maxsize=4)
+def _prediction_backfill_recent_frame(path_str: str, mtime_ns: int, limit: int) -> pd.DataFrame:
+    limit = max(1, int(limit))
+    parquet_file = pq.ParquetFile(path_str)
+    if parquet_file.metadata.num_rows <= limit:
+        return pd.read_parquet(path_str)
+
+    selected_groups: list[int] = []
+    rows_remaining = limit
+    for group_idx in range(parquet_file.num_row_groups - 1, -1, -1):
+        selected_groups.append(group_idx)
+        rows_remaining -= parquet_file.metadata.row_group(group_idx).num_rows
+        if rows_remaining <= 0:
+            break
+    table = parquet_file.read_row_groups(sorted(selected_groups))
+    return table.to_pandas().tail(limit)
+
+
 def _cached_prediction_docs(candidate_rows: pd.DataFrame, context: LiveScoringContext) -> dict[int, dict[str, Any]]:
     path = _prediction_backfill_path(context)
     if path is None or candidate_rows.empty or "draw_id" not in candidate_rows.columns:
@@ -325,11 +343,14 @@ def _cached_prediction_docs(candidate_rows: pd.DataFrame, context: LiveScoringCo
     return docs
 
 
-def _prediction_backfill_docs(context: LiveScoringContext) -> list[dict[str, Any]]:
+def _prediction_backfill_docs(context: LiveScoringContext, *, limit: int | None = None) -> list[dict[str, Any]]:
     path = _prediction_backfill_path(context)
     if path is None:
         return []
-    predictions = _prediction_backfill_frame(str(path), path.stat().st_mtime_ns)
+    if limit is not None:
+        predictions = _prediction_backfill_recent_frame(str(path), path.stat().st_mtime_ns, max(1, int(limit)))
+    else:
+        predictions = _prediction_backfill_frame(str(path), path.stat().st_mtime_ns)
     if predictions.empty:
         return []
     docs: list[dict[str, Any]] = []
@@ -370,7 +391,8 @@ def _build_alert_draws_from_backfill(
     min_bet_amount: float | None,
     ccs_ids: set[str] | None = None,
 ) -> tuple[list[AlertDraw], int]:
-    docs = _prediction_backfill_docs(context)
+    backend_limit = max(1, int(max_draws))
+    docs = _prediction_backfill_docs(context, limit=backend_limit)
     start, end = _alert_window_bounds(lookback_days)
     requested_ccs = {_member_key(value) for value in (ccs_ids or set()) if str(value).strip()}
     docs_by_draw_id: dict[int, dict[str, Any]] = {}
@@ -445,12 +467,12 @@ def _build_alert_draws_from_backfill(
         return True
 
     matched_candidate_docs = 0
+    scanned_docs = 0
     try:
-        candidate_scan_limit = 50_000 if requested_ccs or min_bet_amount is not None else max_draws
         candidate_rows = _candidate_rows_for_window(
             context=context,
             lookback_days=lookback_days,
-            max_draws=candidate_scan_limit,
+            max_draws=backend_limit,
         )
     except Exception:
         candidate_rows = pd.DataFrame()
@@ -463,16 +485,22 @@ def _build_alert_draws_from_backfill(
             if result_doc is None:
                 continue
             matched_candidate_docs += 1
+            scanned_docs += 1
             append_alert(result_doc, row)
+            if matched_candidate_docs >= backend_limit:
+                break
 
     if matched_candidate_docs == 0:
-        for result_doc in docs:
+        for result_doc in docs[:backend_limit]:
+            scanned_docs += 1
             draw_id = pd.to_numeric(result_doc.get("draw_id"), errors="coerce")
             row = None if pd.isna(draw_id) else _candidate_row_for_doc(int(draw_id), context)
             append_alert(result_doc, row)
+            if len(candidates) >= backend_limit:
+                break
 
     candidates.sort(key=lambda item: (item[0], item[1].draw_id), reverse=True)
-    alerts = [item[1] for item in candidates[: max(1, int(max_draws))]]
+    alerts = [item[1] for item in candidates[:backend_limit]]
     alerts.sort(
         key=lambda item: (
             item.high_amount_member_count,
@@ -483,7 +511,7 @@ def _build_alert_draws_from_backfill(
         ),
         reverse=True,
     )
-    return alerts[:limit], len(alerts)
+    return alerts[:limit], scanned_docs
 
 
 def _candidate_result_docs(

@@ -181,7 +181,7 @@ class TestMonitoringGeneratesReports:
         current_dir = tmp_path / "current"
         current_dir.mkdir()
 
-        ref_paths = _write_run_artifacts(ref_run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
+        _write_run_artifacts(ref_run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
         cur_paths = _write_run_artifacts(cur_run_dir, _make_raw_df(300), _make_feature_df(200), _make_scored_df(200))
 
         meta = {"gate_passed": True, "run_dir": str(ref_run_dir)}
@@ -296,7 +296,7 @@ class TestBoundedParquetSampling:
         current_dir = tmp_path / "current"
         current_dir.mkdir()
 
-        ref_paths = _write_run_artifacts(ref_run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
+        _write_run_artifacts(ref_run_dir, _make_raw_df(), _make_feature_df(), _make_scored_df())
         cur_paths = _write_run_artifacts(cur_run_dir, _make_raw_df(300), _make_feature_df(200), _make_scored_df(200))
 
         meta = {"gate_passed": True, "run_dir": str(ref_run_dir)}

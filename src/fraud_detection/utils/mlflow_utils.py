@@ -247,7 +247,7 @@ def register_model_to_staging(
                     version=mv.version,
                     description=description,
                 )
-            except Exception as exc:
+            except Exception:
                 logger.exception("update_model_version description failed (non-fatal)")
 
         client.transition_model_version_stage(

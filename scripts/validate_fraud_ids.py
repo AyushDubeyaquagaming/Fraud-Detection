@@ -272,7 +272,7 @@ def main() -> int:
     pd.DataFrame(report).to_csv(csv_path, index=False)
 
     logger.info("validate_fraud_ids: report written to %s", out_dir)
-    print(f"\n=== Verdict summary ===")
+    print("\n=== Verdict summary ===")
     for verdict, count in report_summary["verdict_counts"].items():
         print(f"  {verdict}: {count}")
     print(f"\nFull report: {json_path}\n")

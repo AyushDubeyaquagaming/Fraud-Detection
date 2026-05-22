@@ -276,7 +276,7 @@ class ModelTraining:
                     self.config.partnership.get("synthetic_positives_from_strict_pattern", False)
                 ),
                 "label_tier_weights": self.config.partnership.get(
-                    "label_tier_weights", {"gold": 1.0, "silver": 1.0, "bronze": 0.5, "gold_analyst": 1.0}
+                    "label_tier_weights", {"gold": 1.0, "silver": 1.0, "bronze": 0.5}
                 ),
                 "trained_at": datetime.now(timezone.utc).isoformat(),
                 "git_sha": _git_sha(),

@@ -11,8 +11,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from fraud_detection.constants.constants import CONFIG_FILE_PATH
-from orchestration.flows.full_cycle_flow import run_full_cycle
+from fraud_detection.constants.constants import CONFIG_FILE_PATH  # noqa: E402
+from orchestration.flows.full_cycle_flow import run_full_cycle  # noqa: E402
 
 
 def main() -> int:
@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--batch-config", type=Path, default=None)
     parser.add_argument("--start-date", default=None, help="Inclusive candidate window start. Defaults to partnership.candidate_window.start_date.")
     parser.add_argument("--end-date", default=None, help="Exclusive candidate window end. Defaults to partnership.candidate_window.end_date.")
-    parser.add_argument("--window-mode", choices=["fixed", "rolling"], default="fixed")
+    parser.add_argument("--window-mode", choices=["fixed", "rolling"], default="rolling")
     parser.add_argument("--force-candidates", action="store_true", help="Re-extract candidate partitions even if they exist.")
     parser.add_argument("--force-ccs", action="store_true", help="Rebuild CCS profit days even if they exist.")
     args = parser.parse_args()

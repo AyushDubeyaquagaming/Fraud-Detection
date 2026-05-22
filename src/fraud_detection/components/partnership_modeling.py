@@ -117,7 +117,6 @@ def train_stage2_model(
     model_frame = df[features] if features else pd.DataFrame({"bias": np.zeros(len(df))}, index=df.index)
 
     if y.nunique() < 2 or not features:
-        constant = int(y.iloc[0]) if len(y) else 0
         model = Pipeline([("model", DummyClassifier(strategy="constant", constant=int(y.iloc[0]) if len(y) else 0))])
         model.fit(model_frame, y)
         predictions["stage2_score"] = _predict_proba(model, model_frame)

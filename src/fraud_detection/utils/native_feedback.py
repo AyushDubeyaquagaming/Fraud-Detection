@@ -292,6 +292,8 @@ def _find_docs_by_members(collection, member_ids: set[str]) -> dict[str, dict[st
 
 def _suspected_periods(doc: dict[str, Any], field_name: str, member_id: str) -> list[tuple[date, date]]:
     value = doc.get(field_name)
+    if value is None and field_name != "is_suspected_by_ml":
+        value = _first_present(doc, "is_suspected_by_ml", "suspected_by_ml", "ml_suspected")
     suspected_flag = _coerce_bool(value)
     if suspected_flag is True:
         return [(date.min, date.max)]
@@ -349,6 +351,9 @@ def read_native_feedback_labels_for_candidate_rows(
                     "date": row_date,
                 }
             )
+
+    if not candidate_entries or not member_ids:
+        return []
 
     users_collection = _collection_from_cfg(cfg, "users_collection_env_var", ENV_USERS_COLLECTION)
     user_docs = _find_docs_by_members(users_collection, member_ids)
