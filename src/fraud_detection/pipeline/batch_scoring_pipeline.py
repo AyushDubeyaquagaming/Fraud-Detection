@@ -24,6 +24,87 @@ PARQUET_SUMMARY_BATCH_SIZE = 250_000
 BATCH_SCORING_STREAM_BATCH_SIZE = 100_000
 BATCH_SCORING_OUTPUT_BATCH_SIZE = 1_000
 MONGO_BATCH_SCORING_CHUNK_DAYS = 1
+CCS_OUTPUT_FEATURE_COLUMNS = (
+    "ccs_profit_share_1d",
+    "ccs_profit_share_7d",
+    "ccs_total_profit_1d",
+    "ccs_total_profit_7d",
+    "ccs_member_count_1d",
+    "ccs_member_count_7d",
+    "ccs_high_concentration_1d",
+    "ccs_high_concentration_7d",
+    "ccs_solo_member_1d",
+    "ccs_solo_member_7d",
+)
+
+BATCH_SCORING_OUTPUT_SCHEMA = pa.schema(
+    [
+        pa.field("draw_id", pa.int64()),
+        pa.field("scored_at", pa.string()),
+        pa.field("model_version", pa.string()),
+        pa.field("source_run_id", pa.string()),
+        pa.field("n_members_in_draw", pa.int64()),
+        pa.field("candidate_members", pa.list_(pa.string())),
+        pa.field(
+            "partnerships",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("member_ids", pa.list_(pa.string())),
+                        pa.field("stage1_score_max", pa.float64()),
+                        pa.field("stage1_score_mean", pa.float64()),
+                        pa.field("union_coverage", pa.float64()),
+                        pa.field("jaccard", pa.float64()),
+                        pa.field("per_position_ratio", pa.float64()),
+                        pa.field("total_stake_ratio", pa.float64()),
+                        pa.field("combined_bet_cv", pa.float64()),
+                        pa.field("pair_net", pa.float64()),
+                        pa.field("rule_confidence", pa.float64()),
+                        pa.field("is_section_a", pa.bool_()),
+                        pa.field("is_section_b", pa.bool_()),
+                    ]
+                )
+            ),
+        ),
+        pa.field(
+            "flagged_members",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("member_id", pa.string()),
+                        pa.field("stage1_score_in_draw", pa.float64()),
+                        pa.field("stage2_score", pa.float64()),
+                        pa.field("best_partner_member_id", pa.string()),
+                        *[pa.field(column, pa.float64()) for column in CCS_OUTPUT_FEATURE_COLUMNS],
+                        pa.field("bet_amount", pa.float64()),
+                        pa.field("win_amount", pa.float64()),
+                        pa.field("high_amount_flag", pa.bool_()),
+                        pa.field("high_amount_reason", pa.string()),
+                    ]
+                )
+            ),
+        ),
+        pa.field(
+            "member_scores",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("member_id", pa.string()),
+                        pa.field("draw_id", pa.int64()),
+                        pa.field("draw_date", pa.string()),
+                        pa.field("best_partner_member_id", pa.string()),
+                        pa.field("stage1_score", pa.float64()),
+                        pa.field("stage2_score", pa.float64()),
+                    ]
+                )
+            ),
+        ),
+        pa.field("max_stage1_score", pa.float64()),
+        pa.field("max_stage2_score", pa.float64()),
+        pa.field("requires_review", pa.bool_()),
+        pa.field("response_details", pa.list_(pa.string())),
+    ]
+)
 
 
 def _resolve_repo_path(value: str | Path) -> Path:
@@ -273,7 +354,7 @@ class _ParquetDocWriter:
     def write(self, docs: list[dict]) -> None:
         if not docs:
             return
-        table = pa.Table.from_pylist(docs)
+        table = pa.Table.from_pylist(docs, schema=BATCH_SCORING_OUTPUT_SCHEMA)
         if self.writer is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.schema = table.schema

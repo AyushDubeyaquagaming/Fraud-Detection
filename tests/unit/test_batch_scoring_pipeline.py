@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 
 from fraud_detection.pipeline import batch_scoring_pipeline
@@ -17,6 +18,89 @@ class _Result:
 
     def to_mongo_doc(self) -> dict:
         return self.doc or {"draw_id": self.draw_id}
+
+
+def test_parquet_doc_writer_handles_empty_then_populated_nested_lists(tmp_path: Path):
+    output_path = tmp_path / "live_predictions_backfill.parquet"
+    writer = batch_scoring_pipeline._ParquetDocWriter(output_path)
+    writer.write(
+        [
+            {
+                "draw_id": 1,
+                "scored_at": "2026-05-25T00:00:00+00:00",
+                "model_version": "partnership_v1",
+                "source_run_id": "run_a",
+                "n_members_in_draw": 0,
+                "candidate_members": [],
+                "partnerships": [],
+                "flagged_members": [],
+                "member_scores": [],
+                "max_stage1_score": 0.0,
+                "max_stage2_score": 0.0,
+                "requires_review": False,
+                "response_details": [],
+            }
+        ]
+    )
+    writer.write(
+        [
+            {
+                "draw_id": 2,
+                "scored_at": "2026-05-25T00:01:00+00:00",
+                "model_version": "partnership_v1",
+                "source_run_id": "run_a",
+                "n_members_in_draw": 2,
+                "candidate_members": ["A", "B"],
+                "partnerships": [
+                    {
+                        "member_ids": ["A", "B"],
+                        "stage1_score_max": 1.0,
+                        "stage1_score_mean": 1.0,
+                        "union_coverage": 1.0,
+                        "jaccard": 0.0,
+                        "per_position_ratio": 1.0,
+                        "total_stake_ratio": 1.0,
+                        "combined_bet_cv": 0.0,
+                        "pair_net": 100.0,
+                        "rule_confidence": 1.0,
+                        "is_section_a": False,
+                        "is_section_b": True,
+                    }
+                ],
+                "flagged_members": [
+                    {
+                        "member_id": "A",
+                        "stage1_score_in_draw": 1.0,
+                        "stage2_score": 0.0,
+                        "best_partner_member_id": "B",
+                        "bet_amount": 1000.0,
+                        "win_amount": 0.0,
+                        "high_amount_flag": False,
+                        "high_amount_reason": None,
+                    }
+                ],
+                "member_scores": [
+                    {
+                        "member_id": "A",
+                        "draw_id": 2,
+                        "draw_date": "2026-05-25T00:00:00+00:00",
+                        "best_partner_member_id": "B",
+                        "stage1_score": 1.0,
+                        "stage2_score": 0.0,
+                    }
+                ],
+                "max_stage1_score": 1.0,
+                "max_stage2_score": 0.0,
+                "requires_review": True,
+                "response_details": ["no_member_history"],
+            }
+        ]
+    )
+    writer.close()
+
+    table = pq.read_table(output_path)
+    assert table.num_rows == 2
+    assert table.schema.field("candidate_members").type.value_type == batch_scoring_pipeline.pa.string()
 
 
 def test_candidate_store_batch_scoring_defaults_to_weekly_mongodb_source(monkeypatch, tmp_path: Path):
