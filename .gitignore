@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environments and secrets
+.venv/
+.env
+!.env.example
+
+# Editors and OS files
+.vscode/*.local.json
+.DS_Store
+Thumbs.db
+
+
+#MD files
+AGENTS.md
+CLAUDE.md
+TASK1.md
