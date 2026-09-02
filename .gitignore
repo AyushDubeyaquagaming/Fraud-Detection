@@ -23,3 +23,11 @@ Thumbs.db
 AGENTS.md
 CLAUDE.md
 TASK1.md
+
+# Data files. Holds member and CCS identifiers for confirmed fraud accounts and
+# must never be committed. Reviewers and CI obtain it out of band -- see Q8 in
+# CLAUDE.md section 8. The labelled regression tests skip cleanly when absent.
+/data
+
+#graphify
+/graphify-out
